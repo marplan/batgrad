@@ -1,0 +1,48 @@
+services:
+  init-home:
+    image: ubuntu:24.04
+    command: >
+      sh -euc "mkdir -p /home/ubuntu
+      && chown ${HOST_UID:-1000}:${HOST_GID:-1000} /home/ubuntu"
+    volumes:
+      - dev-home:/home/ubuntu
+    restart: "no"
+
+  dev:
+    depends_on:
+      init-home:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+      args:
+        USER_UID: ${HOST_UID:-1000}
+        USER_GID: ${HOST_GID:-1000}
+    image: batgrad:dev
+    working_dir: /workspace/ubuntu/${PROJECT_KEY:-batgrad}
+    entrypoint: ["/usr/local/bin/container-init"]
+    command: ["sleep", "infinity"]
+    user: ubuntu
+    stdin_open: true
+    tty: true
+    init: true
+    env_file:
+      - .env
+    environment:
+      SSH_AUTH_SOCK: /ssh-agent
+    volumes:
+      - .:/workspace/ubuntu/${PROJECT_KEY:-batgrad}
+      - dev-home:/home/ubuntu
+      - ${HOST_DATA_ROOT:?Set HOST_DATA_ROOT in .env}:/data
+      - ${SSH_AUTH_SOCK_HOST:-/run/host-services/ssh-auth.sock}:/ssh-agent:ro
+    # ports:
+    #   - "2718:2718"
+    #   - "2719:2719"
+    #   - "3017:3017"
+    #   - "3023:3023"
+    #   - "5678:5678"
+    #   - "8000:8000"
+
+volumes:
+  dev-home:

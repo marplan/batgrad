@@ -47,6 +47,7 @@ environments = [
   "sys_platform == 'linux'",
   "sys_platform == 'darwin'",
 ]
+no-build-isolation-package = ["mamba-ssm"]
 
 [tool.uv.sources]
 torch = [
