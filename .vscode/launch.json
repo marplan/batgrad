@@ -1,0 +1,116 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "debugpy",
+      "request": "launch",
+      "name": "file and library code",
+      "program": "${file}",
+      "justMyCode": false,
+      "console": "integratedTerminal",
+      "redirectOutput": false,
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
+      "type": "debugpy",
+      "request": "launch",
+      "name": "file:args and library code",
+      "program": "${file}",
+      "justMyCode": false,
+      "args": "${input:programArgs}",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
+      "type": "debugpy",
+      "request": "launch",
+      "name": "marimo Debug: edit mode",
+      "module": "marimo",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "MARIMO_SCRIPT_EDIT": "1"
+      },
+      "justMyCode": false,
+      "args": [
+        "edit",
+        "${file}",
+        "--no-token",
+        "--watch",
+        "--host",
+        "0.0.0.0",
+        "port",
+        "2719",
+        "--proxy",
+        "0.0.0.0:2719"
+      ]
+    },
+    {
+      "type": "debugpy",
+      "request": "launch",
+      "name": "FastAPI Debug",
+      "justMyCode": false,
+      "console": "integratedTerminal",
+      "module": "uvicorn",
+      "args": [
+        "app.main:app",
+        "--reload",
+        "--host",
+        "0.0.0.0"
+      ]
+    },
+    {
+      "type": "debugpy",
+      "request": "launch",
+      "name": "Pytest Debug",
+      "justMyCode": false,
+      "console": "integratedTerminal",
+      "module": "pytest"
+    },
+    {
+      "type": "debugpy",
+      "request": "attach",
+      "name": "remote file (configure inputs below)",
+      "connect": {
+        "host": "localhost",
+        "port": "${input:remotePort}"
+      },
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "${input:remoteRoot}"
+        }
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "redirectOutput": true,
+      "preLaunchTask": "start-remote-debugpy"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "programArgs",
+      "type": "promptString",
+      "description": "Arguments to pass to the program",
+      "default": ""
+    },
+    {
+      "id": "remotePort",
+      "type": "promptString",
+      "description": "Remote debugpy port",
+      "default": "8069"
+    },
+    {
+      "id": "remoteRoot",
+      "type": "promptString",
+      "description": "Remote root path",
+      "default": "/home/ubuntu/workspace"
+    }
+  ]
+}

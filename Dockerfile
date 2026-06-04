@@ -18,6 +18,7 @@ if dpkg-divert --list /usr/bin/man >/dev/null 2>&1; then
 fi
 apt-get update
 apt-get install -y --no-install-recommends \
+    python3.12-dev \
     build-essential \
     ca-certificates \
     curl \

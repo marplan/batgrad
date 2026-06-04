@@ -76,75 +76,35 @@ exclude = [
   "notebooks/*.py",
 ]
 target-version = "py312"
-respect-gitignore = true
 line-length = 100
-preview = true
-unsafe-fixes = true
 
 [tool.ruff.lint]
-extend-select = ["ALL"]
+select = ["ALL"]
 ignore = [
-  "ISC001", # single-line-implicit-string-concatenation (conflicts with formatter)
-  "COM812", # missing-trailing-comma (conflicts with formatter)
-  "TD003", # Missing issue link for this TODO
-  "BLE001", # Do not catch blind exception
-  "PLR0915", # Too many statements
-  "PLR0904", # Too many public methods
-
-  "C901", # mccabe: complexity
-  "CPY001", # Missing copyright notice at top of file
-  "D100", # Missing docstring in public module
-  "D101", # Missing docstring in public class
+  "D10", # Missing docstring in public ...
   "D102", # Missing docstring in public method
-  "D104", # Missing docstring in public package
-  "D105", # Missing docstring in magic method
-  "D106", # Missing docstring in public nested class
-  "D107", # Missing docstring in `__init__`
-  "D203", # 1 blank line required before class docstring (conflicts with D211)
-  "D205", # 1 blank line required between summary line and description
-  "D212", # Multi-line docstring summary at first line (conflicts with D213)
-  "D400", # First line should end with a period
-  "D401", # First line should be in imperative mood
-  "D415", # First line should end with a period, question mark, or exclamation point
-  "DOC201", # `return` is not documented in docstring
-  "DOC402", # `yield` is not documented in docstring
-  "DOC502", # Raised exception is not explicitly raised
   "EM101", # Exception must not use a string literal, assign to variable first
   "EM102", # Exception must not use an f-string literal, assign to variable first
-  "FBT001", # Boolean-typed positional argument in function definition
-  "FBT002", # Boolean default positional argument in function definition
-  "FIX002", # Line contains TODO, consider resolving the issue
-  "PLR0912", # Too many branches
   "PLR0913", # Too many arguments in function definition
-  "PLR0914", # Too many local variables
-  "PLR0917", # Too many positional arguments
-  "PLR2004", # Magic value used in comparison
-  "TD002", # Missing author in TODO
   "TRY003", # Avoid specifying long messages outside the exception class
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"*.pyi" = ["A001", "A002", "N"] # we don't control names in 3rd party modules
-"{tests}/**/*.py" = [
-  "S", # none of these security focused rules are relevant for tests/build scripts
-  "T201",
-  "D103", # test function docstrings are optional
-  "PLR6301", # test methods don't use self but that's idiomatic for pytest classes
-  "PLC0415", # allow imports inside test functions for test isolation
-  "SLF001", # allow accessing private members in tests
-  "ARG002", # allow unused arguments in stub implementations
-  "ANN202", # allow missing return annotation in test stubs
-  "DTZ001", # allow naive datetimes in test fixtures
-  "NPY002", # allow legacy numpy seed for deterministic test setup
-  "TC001", # allow runtime imports in tests
-  "TC002", # allow runtime imports of test dependencies
-  "TC003", # allow stdlib imports used only for type annotations
+"tests/**/*.py" = [
+  "ARG", # unused-argument: pytest fixtures/mocks often use intentionally unused args.
+  "S101", # assert: allow plain assert statements in tests.
+  "SLF001", # private-member-access: tests often intentionally inspect internals.
 ]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
 required-imports = ["from __future__ import annotations"]
-split-on-trailing-comma = false
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.marimo]
 keymap = { preset = "vim" }

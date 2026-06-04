@@ -1,0 +1,12 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "start-remote-debugpy",
+            "type": "shell",
+            "command": "ssh ${input:sshHost} 'cd ${input:remoteRoot} && python -Xfrozen_modules=off -m debugpy --listen 0.0.0.0:${input:remotePort} --wait-for-client ${file}'",
+            "isBackground": true,
+            "problemMatcher": []
+        }
+    ]
+}

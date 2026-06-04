@@ -25,3 +25,4 @@ logs/
 site/
 *.db
 .Trash*
+_packages/
