@@ -85,7 +85,10 @@ ignore = [
   "D102", # Missing docstring in public method
   "EM101", # Exception must not use a string literal, assign to variable first
   "EM102", # Exception must not use an f-string literal, assign to variable first
+  "FIX0", # flake8-fixme (FIX)
   "PLR0913", # Too many arguments in function definition
+  "TD002", # Missing author in TODO
+  "TD003", # Missing issue link in TODO
   "TRY003", # Avoid specifying long messages outside the exception class
 ]
 
@@ -94,6 +97,7 @@ ignore = [
   "ARG", # unused-argument: pytest fixtures/mocks often use intentionally unused args.
   "S101", # assert: allow plain assert statements in tests.
   "SLF001", # private-member-access: tests often intentionally inspect internals.
+  "T201", # `print` found
 ]
 
 [tool.ruff.lint.isort]
