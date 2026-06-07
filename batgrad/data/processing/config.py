@@ -5,7 +5,7 @@ from enum import StrEnum
 
 
 class ProcessingStage(StrEnum):
-    RAW_TO_PARQUET = "raw_to_parquet"
+    TO_PARQUET = "raw_to_parquet"
     NORMALIZE = "normalize"
 
 
@@ -15,11 +15,35 @@ class FailureMode(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessingStageSpec:
+    stage: ProcessingStage
+    dataset_spec_attr: str
+    run_config_attr: str
+    dataset_method: str
+
+
+PROCESSING_STAGE_SPECS: dict[ProcessingStage, ProcessingStageSpec] = {
+    ProcessingStage.TO_PARQUET: ProcessingStageSpec(
+        stage=ProcessingStage.TO_PARQUET,
+        dataset_spec_attr="raw",
+        run_config_attr="raw",
+        dataset_method="raw_to_parquet",
+    ),
+    ProcessingStage.NORMALIZE: ProcessingStageSpec(
+        stage=ProcessingStage.NORMALIZE,
+        dataset_spec_attr="normalize",
+        run_config_attr="normalize",
+        dataset_method="normalize",
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
 class RawStageConfig:
     n_jobs: int = 1
     polars_max_threads: int | None = None
-    chunk_rows: int = 1_000_000
-    failure_mode: FailureMode = FailureMode.CONTINUE
+    chunk_rows: int = 256_000
+    failure_mode: FailureMode = FailureMode.STRICT
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,7 +51,7 @@ class NormalizeStageConfig:
     n_jobs: int = 1
     polars_max_threads: int | None = None
     chunk_rows: int = 200_000
-    failure_mode: FailureMode = FailureMode.CONTINUE
+    failure_mode: FailureMode = FailureMode.STRICT
     apply_scaling: bool = True
     apply_resampling: bool = True
     resampling_profile_id: str | None = None
