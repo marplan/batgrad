@@ -4,15 +4,56 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
+from decorator import contextmanager
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from batgrad.storage.store import TableWriter
+
+
+class LocalTableWriter:
+    def __init__(
+        self,
+        path: Path,
+        schema: pa.Schema,
+        compression: str,
+        *,
+        use_content_defined_chunking: bool,
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            raise FileExistsError(f"File exists: {path}")
+
+        self._writer = pq.ParquetWriter(
+            path,
+            schema,
+            compression=compression,
+            use_content_defined_chunking=use_content_defined_chunking,
+        )
+
+    def write_table(self, data: pl.DataFrame, row_group_size: int | None = None) -> None:
+        self._writer.write_table(data.to_arrow(), row_group_size=row_group_size)
+
+    def close(self, metadata: dict[str, str] | None = None) -> None:
+        if metadata is not None:
+            self._writer.add_key_value_metadata(metadata)
+        self._writer.close()
+
 
 class LocalDataStore:
     def __init__(self, root: str | Path) -> None:
-        self.root = str(Path(root).resolve())
+        root_path = Path(root)
+        if not root_path.is_absolute():
+            raise ValueError(f"Local data root must be an absolute path: {root_path}")
+        if not root_path.exists():
+            raise FileNotFoundError(f"Local data root does not exist: {root_path}")
+        if not root_path.is_dir():
+            raise NotADirectoryError(f"Local data root is not a directory: {root_path}")
+
+        self.root = str(root_path.resolve())
 
     def resolve(self, location: str | Path | None = None) -> str:
         if location is None:
@@ -73,6 +114,10 @@ class LocalDataStore:
         if isinstance(location, tuple):
             return [self.resolve(path) for path in location]
         return self.resolve(location)
+
+    @contextmanager
+    def local_file(self, location: str | Path) -> Iterator[Path]:
+        yield Path(self.resolve(location))
 
     def scan_table(
         self,
@@ -143,3 +188,24 @@ class LocalDataStore:
             return
 
         data.write_parquet(out_path, metadata=metadata, row_group_size=row_group_size)
+
+    def open_table_writer(
+        self,
+        location: str | Path,
+        schema: pa.Schema,
+        compression: str,
+        *,
+        use_content_defined_chunking: bool = False,
+    ) -> TableWriter:
+        return LocalTableWriter(
+            Path(self.resolve(location)),
+            schema,
+            compression,
+            use_content_defined_chunking=use_content_defined_chunking,
+        )
+
+    def table_size_bytes(self, location: str | Path) -> int | None:
+        path = Path(self.resolve(location))
+        if not path.exists():
+            return None
+        return path.stat().st_size

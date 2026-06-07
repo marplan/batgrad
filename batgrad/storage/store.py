@@ -4,9 +4,17 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from contextlib import AbstractContextManager
     from pathlib import Path
 
     import polars as pl
+    import pyarrow as pa
+
+
+class TableWriter(Protocol):
+    def write_table(self, data: pl.DataFrame, row_group_size: int | None = None) -> None: ...
+
+    def close(self, metadata: dict[str, str] | None = None) -> None: ...
 
 
 class DataStore(Protocol):
@@ -27,6 +35,8 @@ class DataStore(Protocol):
         location: str | Path | None = None,
         pattern: str = "*",
     ) -> tuple[str, ...]: ...
+
+    def local_file(self, location: str | Path) -> AbstractContextManager: ...
 
     def scan_table(
         self,
@@ -51,3 +61,14 @@ class DataStore(Protocol):
         metadata: dict[str, str] | None = None,
         row_group_size: int | None = None,
     ) -> None: ...
+
+    def open_table_writer(
+        self,
+        location: str | Path,
+        schema: pa.Schema,
+        compression: str,
+        *,
+        use_content_defined_chunking: bool = False,
+    ) -> TableWriter: ...
+
+    def table_size_bytes(self, location: str | Path) -> int | None: ...
