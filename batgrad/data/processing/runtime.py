@@ -3,6 +3,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import resource
+import signal
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
@@ -61,11 +62,12 @@ def read_peak_rss_mb() -> float:
 
 
 def init_process_worker(polars_max_threads: int | None) -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     if polars_max_threads is not None:
         os.environ["POLARS_MAX_THREADS"] = str(polars_max_threads)
 
 
-def iter_ordered_process_results[ArgT, ResultT](
+def iter_ordered_process_results[ArgT, ResultT](  # noqa: C901
     worker: Callable[[ArgT], ResultT],
     specs: Sequence[ProcessTaskSpec[ArgT]],
     *,
@@ -81,12 +83,14 @@ def iter_ordered_process_results[ArgT, ResultT](
     next_emit_index = specs[0].task_index
     buffered: dict[int, ProcessTaskResult[ResultT]] = {}
 
-    with ProcessPoolExecutor(
+    executor = ProcessPoolExecutor(
         max_workers=max_workers,
         mp_context=mp.get_context("spawn"),
         initializer=init_process_worker,
         initargs=(polars_max_threads,),
-    ) as executor:
+    )
+    aborted = False
+    try:
         future_to_spec = {}
         for _ in range(min(max_workers, len(specs))):
             spec = specs[next_submit_idx]
@@ -94,40 +98,57 @@ def iter_ordered_process_results[ArgT, ResultT](
             future_to_spec[future] = spec
             next_submit_idx += 1
 
-        try:
-            while future_to_spec or buffered:
-                if next_emit_index in buffered:
-                    result = buffered.pop(next_emit_index)
-                    next_emit_index += 1
-                    if next_submit_idx < len(specs):
-                        spec = specs[next_submit_idx]
-                        future = executor.submit(_run_process_task, worker, spec)
-                        future_to_spec[future] = spec
-                        next_submit_idx += 1
-                    yield result
-                    continue
+        while future_to_spec or buffered:
+            if next_emit_index in buffered:
+                result = buffered.pop(next_emit_index)
+                next_emit_index += 1
+                if next_submit_idx < len(specs):
+                    spec = specs[next_submit_idx]
+                    future = executor.submit(_run_process_task, worker, spec)
+                    future_to_spec[future] = spec
+                    next_submit_idx += 1
+                yield result
+                continue
 
-                done, _pending = wait(future_to_spec, return_when=FIRST_COMPLETED)
-                for future in done:
-                    spec = future_to_spec.pop(future)
-                    try:
-                        result = future.result()
-                    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
-                        result = _failed_process_result(spec, exc)
-                    buffered[result.task_index] = result
-        except (GeneratorExit, KeyboardInterrupt):
-            abort_process_pool(executor)
-            raise
+            done, _pending = wait(future_to_spec, return_when=FIRST_COMPLETED)
+            for future in done:
+                spec = future_to_spec.pop(future)
+                try:
+                    result = future.result()
+                except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                    result = _failed_process_result(spec, exc)
+                buffered[result.task_index] = result
+    except (GeneratorExit, KeyboardInterrupt):
+        aborted = True
+        abort_process_pool(executor)
+        raise
+    finally:
+        if not aborted:
+            executor.shutdown(wait=True)
 
 
 def abort_process_pool(executor: object) -> None:
+    process_map = getattr(executor, "_processes", {}) or {}
+    processes = (
+        tuple(process_map.values()) if hasattr(process_map, "values") else tuple(process_map)
+    )
     terminate_workers = getattr(executor, "terminate_workers", None)
     if callable(terminate_workers):
         terminate_workers()
         return
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    for process in processes:
+        process.join(timeout=1.0)
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+    for process in processes:
+        process.join(timeout=1.0)
     shutdown = getattr(executor, "shutdown", None)
     if callable(shutdown):
-        shutdown(wait=False, cancel_futures=True)
+        shutdown(wait=True, cancel_futures=True)
 
 
 def _run_process_task[ArgT, ResultT](

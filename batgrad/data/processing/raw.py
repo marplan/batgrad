@@ -218,7 +218,7 @@ class RawProcessor:
                     run_stats=run_stats,
                     last_update_at=last_update_at,
                 )
-        except Exception:
+        except BaseException:
             writer.close(manifest="skip")
             raise
         else:
