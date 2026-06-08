@@ -100,7 +100,6 @@ class MetadataLayout:
 
     parquet_footer: tuple[ColumnSpec, ...] = (
         BaseColumns.dataset_id,
-        MetadataColumns.schema_version,
         MetadataColumns.processing_stage,
         MetadataColumns.git_commit,
         MetadataColumns.git_dirty,
@@ -117,7 +116,6 @@ class MetadataLayout:
         MetadataColumns.protocol,
         BaseColumns.axis_kind,
         BaseColumns.axis_col,
-        MetadataColumns.schema_version,
         MetadataColumns.processing_stage,
         MetadataColumns.git_commit,
     )

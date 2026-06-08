@@ -17,7 +17,11 @@ from batgrad.contracts.metadata import (
 )
 
 if TYPE_CHECKING:
-    from batgrad.data.datasets.specs import DatasetSpec, RawIngestSpec
+    from collections.abc import Mapping
+
+    from batgrad.contracts.metadata import MetadataLayoutSpec
+    from batgrad.data.datasets.specs import DatasetSpec
+    from batgrad.data.processing.config import ProcessingStageSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,9 +40,11 @@ class ManifestRow:
     metadata: dict[ColumnSpec, object]
 
 
-def build_raw_footer_metadata(
+def build_stage_footer_metadata(
     spec: DatasetSpec,
-    raw_spec: RawIngestSpec,
+    stage_spec: ProcessingStageSpec,
+    footer_layout: MetadataLayoutSpec,
+    footer_metadata: Mapping[ColumnSpec, object],
     git_state: GitState,
     manifest_path: str,
     file_path: str,
@@ -48,8 +54,7 @@ def build_raw_footer_metadata(
 ) -> dict[str, str]:
     values: dict[ColumnSpec, object] = {
         BaseColumns.dataset_id: spec.dataset_id,
-        MetadataColumns.schema_version: raw_spec.schema_version,
-        MetadataColumns.processing_stage: raw_spec.processing_stage,
+        MetadataColumns.processing_stage: stage_spec.processing_stage,
         MetadataColumns.git_commit: git_state.commit,
         MetadataColumns.git_dirty: git_state.dirty,
         MetadataColumns.manifest_path: manifest_path,
@@ -57,30 +62,35 @@ def build_raw_footer_metadata(
         MetadataColumns.domains: sorted(domains),
         BaseColumns.row_count: row_count,
     }
-    values.update(raw_spec.footer_metadata)
+    values.update(footer_metadata)
     validate_layout_values(
         values,
-        raw_spec.footer_layout,
-        context=f"Raw parquet footer for {file_path}",
+        footer_layout,
+        context=f"{stage_spec.processing_stage} parquet footer for {file_path}",
     )
     validate_no_extra_layout_values(
         values,
-        raw_spec.footer_layout,
-        context=f"Raw parquet footer for {file_path}",
+        footer_layout,
+        context=f"{stage_spec.processing_stage} parquet footer for {file_path}",
     )
     return encode_footer_values(values)
 
 
-def build_raw_manifest(raw_spec: RawIngestSpec, rows: list[ManifestRow]) -> pl.DataFrame:
+def build_stage_manifest(
+    stage_spec: ProcessingStageSpec,
+    manifest_layout: MetadataLayoutSpec,
+    rows: list[ManifestRow],
+) -> pl.DataFrame:
     return pl.DataFrame(
-        [raw_manifest_row_values(raw_spec, row) for row in rows],
-        schema=schema_from_layout(raw_spec.manifest_layout),
+        [stage_manifest_row_values(stage_spec, manifest_layout, row) for row in rows],
+        schema=schema_from_layout(manifest_layout),
         orient="row",
     )
 
 
-def raw_manifest_row_values(
-    raw_spec: RawIngestSpec,
+def stage_manifest_row_values(
+    stage_spec: ProcessingStageSpec,
+    manifest_layout: MetadataLayoutSpec,
     row: ManifestRow,
 ) -> dict[ColumnSpec, object]:
     values: dict[ColumnSpec, object] = {
@@ -96,17 +106,17 @@ def raw_manifest_row_values(
         MetadataColumns.soc_pct: row.metadata.get(MetadataColumns.soc_pct),
     }
     values.update(row.metadata)
-    for column in raw_spec.manifest_layout.columns:
+    for column in manifest_layout.columns:
         values.setdefault(column, None)
     validate_layout_values(
         values,
-        raw_spec.manifest_layout,
-        context=f"Raw manifest row for {row.file_path}",
+        manifest_layout,
+        context=f"{stage_spec.processing_stage} manifest row for {row.file_path}",
     )
     validate_no_extra_layout_values(
         values,
-        raw_spec.manifest_layout,
-        context=f"Raw manifest row for {row.file_path}",
+        manifest_layout,
+        context=f"{stage_spec.processing_stage} manifest row for {row.file_path}",
     )
     return values
 
@@ -130,20 +140,23 @@ def encode_footer_values(values: dict[ColumnSpec, object]) -> dict[str, str]:
 def resolve_git_state() -> GitState:
     git = shutil.which("git")
     if git is None:
-        raise RuntimeError("git executable is required to write parquet footer metadata")
+        return GitState(commit="missing", dirty=False)
 
-    commit = subprocess.run(  # noqa: S603 - git path is resolved with shutil.which.
-        [git, "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    dirty = bool(
-        subprocess.run(  # noqa: S603 - git path is resolved with shutil.which.
-            [git, "status", "--porcelain"],
+    try:
+        commit = subprocess.run(  # noqa: S603 - git path is resolved with shutil.which.
+            [git, "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
-        ).stdout.strip(),
-    )
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(  # noqa: S603 - git path is resolved with shutil.which.
+                [git, "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return GitState(commit="missing", dirty=False)
     return GitState(commit=commit, dirty=dirty)

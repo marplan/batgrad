@@ -9,10 +9,10 @@ import fastexcel
 import polars as pl
 
 from batgrad import _loggers
-from batgrad.contracts.columns import BaseColumns, ColumnSpec, MetadataColumns, collect_column_specs
+from batgrad.contracts.columns import BaseColumns, ColumnSpec, MetadataColumns
 from batgrad.contracts.values import BaseValues
 from batgrad.data.datasets.pozzato_2022.specs import DATASET_SPEC
-from batgrad.data.processing.config import FailureMode
+from batgrad.data.processing.config import PROCESSING_STAGE_SPECS, FailureMode, ProcessingStage
 from batgrad.data.processing.raw import (
     RawBatch,
     RawIngestIssue,
@@ -66,7 +66,8 @@ class Pozzato2022RawAdapter:
         if raw_spec is None:
             raise ValueError(f"Dataset {self.spec.dataset_id!r} does not support raw ingestion")
 
-        raw_root = self.spec.location.source_root(raw_spec.input_source)
+        stage_spec = PROCESSING_STAGE_SPECS[ProcessingStage.TO_PARQUET]
+        raw_root = self.spec.location.source_root(stage_spec.input_source)
         paths: list[str] = []
 
         for suffix in raw_spec.file_suffixes:
@@ -108,15 +109,8 @@ class Pozzato2022RawAdapter:
             protocol_schema.dropped_columns,
             failure_mode,
         )
-        data = schema_result.data
-
-        if metadata[MetadataColumns.protocol] != BaseValues.eis_protocol:
-            current_col = collect_column_specs(self.spec.cols)["current"]
-            if current_col in data.columns:
-                data = data.with_columns((pl.col(current_col) * -1).alias(current_col))
-
         yield RawBatch(
-            data=data,
+            data=schema_result.data,
             stream_id=source_path,
             source_paths=(source_path,),
             metadata=metadata,

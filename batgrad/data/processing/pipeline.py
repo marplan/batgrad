@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from batgrad.data.datasets.registry import DatasetIds, get_dataset
-from batgrad.data.processing.config import PROCESSING_STAGE_SPECS, ProcessingStage
+from batgrad.data.processing.config import ProcessingStage
 
 if TYPE_CHECKING:
     from batgrad.data.datasets.specs import Dataset, DatasetSpec
@@ -55,25 +55,35 @@ class ProcessingRun:
 
     def validate_stages(self, stages: tuple[ProcessingStage, ...]) -> None:
         for stage in stages:
-            stage_spec = PROCESSING_STAGE_SPECS.get(stage)
-            if stage_spec is None:
+            if stage == ProcessingStage.TO_PARQUET:
+                if self.spec.raw is None:
+                    raise ValueError(
+                        f"Dataset {self.spec.dataset_id!r} does not support {stage.value}",
+                    )
+            elif stage == ProcessingStage.NORMALIZE:
+                if self.spec.normalize is None:
+                    raise ValueError(
+                        f"Dataset {self.spec.dataset_id!r} does not support {stage.value}",
+                    )
+            else:
                 raise ValueError(f"Unknown processing stage: {stage!r}")
 
-            if getattr(self.spec, stage_spec.dataset_spec_attr) is None:
-                raise ValueError(f"Dataset {self.spec.dataset_id!r} does not support {stage.value}")
-
     def run_stage(self, stage: ProcessingStage) -> None:
-        stage_spec = PROCESSING_STAGE_SPECS.get(stage)
-        if stage_spec is None:
-            raise ValueError(f"Unknown processing stage: {stage!r}")
-
-        stage_config = getattr(self.config, stage_spec.run_config_attr)
-        stage_method = getattr(self.dataset, stage_spec.dataset_method)
-        stage_method(
-            input_store=self.input_store,
-            output_store=self.output_store,
-            config=stage_config,
-        )
+        if stage == ProcessingStage.TO_PARQUET:
+            self.dataset.raw_to_parquet(
+                input_store=self.input_store,
+                output_store=self.output_store,
+                config=self.config.raw,
+            )
+            return
+        if stage == ProcessingStage.NORMALIZE:
+            self.dataset.normalize(
+                input_store=self.input_store,
+                output_store=self.output_store,
+                config=self.config.normalize,
+            )
+            return
+        raise ValueError(f"Unknown processing stage: {stage!r}")
 
     def run(self) -> None:
         stages = self.resolved_stages()

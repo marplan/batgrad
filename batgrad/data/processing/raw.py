@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field as dataclass_field
 from fnmatch import fnmatch
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 import polars as pl
 
@@ -14,7 +14,12 @@ from batgrad.contracts.columns import (
     MetadataColumns,
     collect_column_specs,
 )
-from batgrad.data.processing.config import FailureMode
+from batgrad.contracts.metadata import MetadataLayoutSpec
+from batgrad.data.processing.config import (
+    PROCESSING_STAGE_SPECS,
+    FailureMode,
+    ProcessingStage,
+)
 from batgrad.data.processing.runtime import (
     ProcessTaskResult,
     ProcessTaskSpec,
@@ -23,14 +28,25 @@ from batgrad.data.processing.runtime import (
     read_peak_rss_mb,
     resolve_process_count,
 )
-from batgrad.data.processing.sharding import RawProtocolShardWriter
+from batgrad.data.processing.schema import (
+    add_metadata_columns,
+    collect_frame,
+    select_and_cast_columns,
+    validate_required_metadata,
+)
+from batgrad.data.processing.sharding import ProtocolShardWriter
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Mapping
 
-    from batgrad.data.datasets.specs import DatasetSpec, RawIngestSpec, RawProtocolSchema
+    from batgrad.data.datasets.specs import DatasetSpec
     from batgrad.data.processing.config import RawStageConfig
+    from batgrad.data.processing.raw_spec import RawIngestSpec, RawProtocolSchema
     from batgrad.storage.store import DataStore
+
+    class _CurrentColumns(Protocol):
+        current: ColumnSpec
+
 
 logger = _loggers.get_logger(__name__)
 _PROGRESS_TIME_INTERVAL_S = 30.0
@@ -170,7 +186,16 @@ class RawProcessor:
         raw_spec = self._raw_spec()
         self._validate_run_config(config)
 
-        writer = RawProtocolShardWriter(output_store, self.adapter.spec, raw_spec)
+        stage_spec = PROCESSING_STAGE_SPECS[ProcessingStage.TO_PARQUET]
+        writer = ProtocolShardWriter(
+            output_store=output_store,
+            spec=self.adapter.spec,
+            stage_spec=stage_spec,
+            config=config,
+            manifest_layout=stage_spec.manifest_layout,
+            footer_layout=self._footer_layout(stage_spec.footer_layout, raw_spec.footer_metadata),
+            footer_metadata=raw_spec.footer_metadata,
+        )
         failed_any = False
         started_at = time.perf_counter()
         last_update_at = started_at
@@ -253,6 +278,12 @@ class RawProcessor:
     def _validate_run_config(config: RawStageConfig) -> None:
         if config.chunk_rows < 1:
             raise ValueError(f"chunk_rows must be >= 1, got {config.chunk_rows}")
+        if config.row_group_size < 1:
+            raise ValueError(f"row_group_size must be >= 1, got {config.row_group_size}")
+        if config.max_shard_size_bytes < 0:
+            raise ValueError(
+                f"max_shard_size_bytes must be >= 0, got {config.max_shard_size_bytes}",
+            )
         if config.n_jobs < -1:
             raise ValueError(f"n_jobs must be -1, 0, or >= 1, got {config.n_jobs}")
 
@@ -260,7 +291,7 @@ class RawProcessor:
         self,
         tasks: tuple[RawTask, ...],
         input_store: DataStore,
-        writer: RawProtocolShardWriter,
+        writer: ProtocolShardWriter,
         config: RawStageConfig,
         run_stats: RawRunStats,
         last_update_at: float,
@@ -349,7 +380,7 @@ class RawProcessor:
 
     def _consume_prepared_task_result(
         self,
-        writer: RawProtocolShardWriter,
+        writer: ProtocolShardWriter,
         result: PreparedRawTaskResult,
         chunk_rows: int,
         run_stats: RawRunStats,
@@ -431,7 +462,7 @@ class RawProcessor:
 
     def _append_prepared_batches(
         self,
-        writer: RawProtocolShardWriter,
+        writer: ProtocolShardWriter,
         batches: Iterator[PreparedRawBatch],
         chunk_rows: int,
     ) -> tuple[int, int, int]:
@@ -459,29 +490,11 @@ class RawProcessor:
         batch: RawBatch,
         failure_mode: FailureMode,
     ) -> tuple[pl.DataFrame, RawTaskStats]:
-        if isinstance(batch.data, pl.LazyFrame):
-            collected = batch.data.collect()
-            if not isinstance(collected, pl.DataFrame):
-                raise TypeError(
-                    "Expected LazyFrame.collect() to return DataFrame, "
-                    f"got {type(collected).__name__}",
-                )
-            data = collected
-        else:
-            data = batch.data
+        data = collect_frame(batch.data)
         protocol_schema = self._validate_protocol_metadata(batch.metadata)
-
-        exprs: list[pl.Expr] = []
-        for column, value in batch.metadata.items():
-            dtype = column.dtype
-            expr = pl.lit(value)
-            if dtype is not None:
-                expr = expr.cast(dtype, strict=False)
-            exprs.append(expr.alias(column))
-
-        if exprs:
-            data = data.with_columns(exprs)
-        return self._align_to_protocol_schema(data, protocol_schema, failure_mode, batch)
+        data = add_metadata_columns(data, batch.metadata)
+        data, stats = self._align_to_protocol_schema(data, protocol_schema, failure_mode, batch)
+        return self._apply_protocol_canonicalization(data, protocol_schema), stats
 
     def _validate_protocol_metadata(
         self,
@@ -500,16 +513,36 @@ class RawProcessor:
                 f"{self.adapter.spec.dataset_id!r}",
             ) from exc
 
-        missing = [column for column in protocol_schema.metadata if column not in metadata]
-        if missing:
-            raise ValueError(
-                f"Protocol {protocol_value!r} metadata is missing required columns: {missing}",
-            )
+        validate_required_metadata(
+            metadata,
+            protocol_schema.metadata,
+            context=f"Protocol {protocol_value!r}",
+        )
 
         if BaseColumns.cycle_index in metadata and metadata[BaseColumns.cycle_index] is None:
             raise ValueError(f"Protocol {protocol_value!r} metadata has null cycle_index")
 
         return protocol_schema
+
+    def _apply_protocol_canonicalization(
+        self,
+        data: pl.DataFrame,
+        protocol_schema: RawProtocolSchema,
+    ) -> pl.DataFrame:
+        if not protocol_schema.flip_current_sign:
+            return data
+
+        try:
+            current_col = cast("_CurrentColumns", self.adapter.spec.cols).current
+        except AttributeError as exc:
+            raise ValueError(
+                f"Protocol {protocol_schema.protocol!r} is configured to flip current sign, "
+                f"but dataset {self.adapter.spec.dataset_id!r} has no cols.current",
+            ) from exc
+
+        if current_col not in data.columns:
+            return data
+        return data.with_columns((pl.col(current_col) * -1).alias(current_col))
 
     def _align_to_protocol_schema(
         self,
@@ -549,15 +582,7 @@ class RawProcessor:
         else:
             stats = RawTaskStats()
 
-        exprs: list[pl.Expr] = []
-        for column in output_columns:
-            expr = pl.col(column) if column in data.columns else pl.lit(None)
-            if column.dtype is not None:
-                expr = expr.cast(column.dtype, strict=False)
-            exprs.append(expr.alias(column))
-        exprs.extend(pl.col(column) for column in extra_source_columns)
-
-        return data.select(exprs), stats
+        return select_and_cast_columns(data, output_columns, tuple(extra_source_columns)), stats
 
     @staticmethod
     def _merge_task_stats(left: RawTaskStats, right: RawTaskStats) -> RawTaskStats:
@@ -567,6 +592,24 @@ class RawProcessor:
             duplicate_columns=left.duplicate_columns + right.duplicate_columns,
             dropped_mapped_columns=left.dropped_mapped_columns + right.dropped_mapped_columns,
             issues=(*left.issues, *right.issues),
+        )
+
+    @staticmethod
+    def _footer_layout(
+        stage_footer_layout: MetadataLayoutSpec,
+        footer_metadata: Mapping[ColumnSpec, object],
+    ) -> MetadataLayoutSpec:
+        extra_columns = tuple(
+            column
+            for column in footer_metadata
+            if column not in stage_footer_layout.required
+            and column not in stage_footer_layout.optional
+        )
+        if not extra_columns:
+            return stage_footer_layout
+        return MetadataLayoutSpec(
+            required=stage_footer_layout.required,
+            optional=(*stage_footer_layout.optional, *extra_columns),
         )
 
     @staticmethod
