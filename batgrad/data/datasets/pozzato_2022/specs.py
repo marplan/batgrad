@@ -2,18 +2,16 @@ from __future__ import annotations
 
 from batgrad.contracts.columns import ColumnSpec, MetadataColumns
 from batgrad.contracts.domains import Domains
-from batgrad.contracts.metadata import MetadataLayout, MetadataLayoutSpec
+from batgrad.contracts.metadata import MetadataLayout
 from batgrad.contracts.values import BaseValues
 from batgrad.data.datasets.pozzato_2022.mapping import Pozzato2022Columns, Pozzato2022Values
 from batgrad.data.datasets.specs import (
     DatasetInfo,
     DatasetSpec,
-    NormalizeSpec,
-    ProtocolNormalizeSpec,
-    RawIngestSpec,
-    RawProtocolSchema,
 )
 from batgrad.data.locations import DatasetLocation
+from batgrad.data.processing.normalize_spec import NormalizeSpec, ProtocolNormalizeSpec
+from batgrad.data.processing.raw_spec import RawIngestSpec, RawProtocolSchema
 from batgrad.data.transforms.checks import MissingCheckSpec, TimeCheckSpec
 from batgrad.data.transforms.resampling import MinMaxLTTBResamplingSpec
 
@@ -71,12 +69,6 @@ RAW_EIS_COLUMNS = (
 RAW_INGEST_SPEC = RawIngestSpec(
     file_suffixes=(".xlsx",),
     excluded_file_patterns=("**/README.xlsx",),
-    row_group_size=256 * 1024,
-    max_shard_size_bytes=512 * 1024 * 1024,
-    footer_layout=MetadataLayoutSpec(
-        required=metadata.parquet_footer,
-        optional=(MetadataColumns.nom_capa,),
-    ),
     footer_metadata={MetadataColumns.nom_capa: 5.0},
     protocol_schemas=(
         RawProtocolSchema(
@@ -85,6 +77,7 @@ RAW_INGEST_SPEC = RawIngestSpec(
             metadata=metadata.cycling,
             columns=RAW_TIMESERIES_COLUMNS,
             dropped_columns=RAW_TIMESERIES_DROPPED_COLUMNS,
+            flip_current_sign=True,
         ),
         RawProtocolSchema(
             protocol=BaseValues.hppc_protocol,
@@ -92,6 +85,7 @@ RAW_INGEST_SPEC = RawIngestSpec(
             metadata=metadata.hppc,
             columns=RAW_TIMESERIES_COLUMNS,
             dropped_columns=RAW_TIMESERIES_DROPPED_COLUMNS,
+            flip_current_sign=True,
         ),
         RawProtocolSchema(
             protocol=BaseValues.rpt_protocol,
@@ -99,6 +93,7 @@ RAW_INGEST_SPEC = RawIngestSpec(
             metadata=metadata.rpt,
             columns=RAW_TIMESERIES_COLUMNS,
             dropped_columns=RAW_TIMESERIES_DROPPED_COLUMNS,
+            flip_current_sign=True,
         ),
         RawProtocolSchema(
             protocol=BaseValues.eis_protocol,
