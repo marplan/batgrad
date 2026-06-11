@@ -14,7 +14,7 @@ services:
         condition: service_completed_successfully
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile
       target: dev
       args:
         USER_UID: ${HOST_UID:-1000}
@@ -36,13 +36,13 @@ services:
       - dev-home:/home/ubuntu
       - ${HOST_DATA_ROOT:?Set HOST_DATA_ROOT in .env}:/data
       - ${SSH_AUTH_SOCK_HOST:-/run/host-services/ssh-auth.sock}:/ssh-agent:ro
-    # ports:
-    #   - "2718:2718"
-    #   - "2719:2719"
-    #   - "3017:3017"
-    #   - "3023:3023"
-    #   - "5678:5678"
-    #   - "8000:8000"
+    ports:
+      - "2718:2718" # marimo
+#   - "2719:2719"
+#   - "3017:3017"
+#   - "3023:3023"
+#   - "5678:5678"
+#   - "8000:8000"
 
 volumes:
   dev-home:
