@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from batgrad.contracts.domains import DomainSpec
     from batgrad.contracts.values import ValueSpec
     from batgrad.data.transforms.resampling import ResamplingSpecBase
+    from batgrad.data.transforms.transforms import TransformSpecBase
 
 DOMAIN_REQUIRED_CHECKS: dict[ValueSpec, frozenset[type[CheckSpecBase]]] = {
     Domains.time.domain_id: frozenset({TimeCheckSpec}),
@@ -24,6 +25,9 @@ DOMAIN_REQUIRED_CHECKS: dict[ValueSpec, frozenset[type[CheckSpecBase]]] = {
 class ProtocolNormalizeSpec:
     domain: DomainSpec
     columns: tuple[ColumnSpec, ...]
+    group_by: tuple[ColumnSpec, ...]
+    order_by: tuple[ColumnSpec, ...] = field(default_factory=tuple)
+    transforms: tuple[TransformSpecBase, ...] = field(default_factory=tuple)
     checks: tuple[CheckSpecBase, ...] = field(default_factory=tuple)
     resampling: ResamplingSpecBase | None = None
 

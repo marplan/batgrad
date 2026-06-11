@@ -32,12 +32,15 @@ class ValueSpec(str):
 
 class BaseValues:
     missing = ValueSpec("missing", dtype=pl.String, description="Missing data identifier")
+    col_min = ValueSpec("below column minimum", dtype=pl.String, description="Below column minimum")
+    col_max = ValueSpec("above column maximum", dtype=pl.String, description="Above column maximum")
     dup_time = ValueSpec(
         "duplicate time steps",
         dtype=pl.String,
         description="Duplicate time steps",
     )
     big_dt = ValueSpec("big time diff", dtype=pl.String, description="Big time difference")
+    domain_x_axis = ValueSpec("invalid domain x-axis", dtype=pl.String)
     train = ValueSpec("train", dtype=pl.String, description="Training split identifier")
     val = ValueSpec("val", dtype=pl.String, description="Validation split identifier")
 
