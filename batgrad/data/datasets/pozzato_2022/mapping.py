@@ -68,8 +68,7 @@ class Pozzato2022Columns:
     split = BaseColumns.split
     type_token = BaseColumns.type_token
     file_paths = BaseColumns.file_paths
-    mark = BaseColumns.mark
-    comment = BaseColumns.comment
+    annotations = BaseColumns.annotations
 
 
 class Pozzato2022Values(BaseValues):

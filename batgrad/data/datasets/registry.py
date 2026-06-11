@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal, overload
 
 from batgrad.data.datasets.pozzato_2022.pipeline import Pozzato2022Dataset
-from batgrad.data.processing.config import RawStageConfig
+from batgrad.data.processing.config import FailureMode, RawStageConfig
 
 if TYPE_CHECKING:
     from batgrad.data.datasets.specs import Dataset
@@ -59,14 +59,34 @@ if __name__ == "__main__":
     import sys
 
     from batgrad._loggers import configure
+    from batgrad.data.processing.config import NormalizeStageConfig
     from batgrad.storage.factory import get_storage
 
     configure("INFO")
 
     new_data_store = get_storage(root="/data/loc_datasets/", backend="local")
     pozzato_2022 = get_dataset("pozzato-2022")
-    pozzato_2022.raw_to_parquet(new_data_store, new_data_store, RawStageConfig(n_jobs=3))
+    pozzato_2022.raw_to_parquet(
+        new_data_store,
+        new_data_store,
+        RawStageConfig(
+            n_jobs=3,
+            worker_polars_max_threads=2,
+            failure_mode=FailureMode.CONTINUE,
+        ),
+    )
     sys.exit(0)
+    pozzato_2022.normalize(
+        new_data_store,
+        new_data_store,
+        NormalizeStageConfig(
+            max_batch_rows=500_000,
+            n_jobs=3,
+            worker_polars_max_threads=2,
+            failure_mode=FailureMode.CONTINUE,
+            apply_resampling=True,
+        ),
+    )
 
     t = 4
 

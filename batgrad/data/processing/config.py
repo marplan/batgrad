@@ -17,6 +17,7 @@ class ProcessingStage(StrEnum):
 
 class FailureMode(StrEnum):
     CONTINUE = "continue"
+    DRY_RUN = "dry_run"
     STRICT = "strict"
 
 
@@ -53,7 +54,7 @@ PROCESSING_STAGE_SPECS: dict[ProcessingStage, ProcessingStageSpec] = {
 @dataclass(frozen=True, slots=True)
 class RawStageConfig:
     n_jobs: int = 1
-    polars_max_threads: int | None = None
+    worker_polars_max_threads: int | None = -1
     chunk_rows: int = 256_000
     failure_mode: FailureMode = FailureMode.STRICT
     compression: str = "zstd"
@@ -65,16 +66,16 @@ class RawStageConfig:
 @dataclass(frozen=True, slots=True)
 class NormalizeStageConfig:
     n_jobs: int = 1
-    polars_max_threads: int | None = None
+    worker_polars_max_threads: int | None = -1
     chunk_rows: int = 200_000
+    max_batch_rows: int | None = 500_000
     failure_mode: FailureMode = FailureMode.STRICT
     compression: str = "zstd"
     use_content_defined_chunking: bool = True
     row_group_size: int = 256_000
     max_shard_size_bytes: int = 500 * 1024 * 1024
-    apply_scaling: bool = True
     apply_resampling: bool = True
-    resampling_profile_id: str | None = None
+    apply_physics_compensation: bool = True
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from batgrad.contracts.columns import ColumnSpec, MetadataColumns
+from batgrad.contracts.columns import BaseColumns, ColumnSpec, MetadataColumns
 from batgrad.contracts.domains import Domains
 from batgrad.contracts.metadata import MetadataLayout
 from batgrad.contracts.values import BaseValues
@@ -12,11 +12,19 @@ from batgrad.data.datasets.specs import (
 from batgrad.data.locations import DatasetLocation
 from batgrad.data.processing.normalize_spec import NormalizeSpec, ProtocolNormalizeSpec
 from batgrad.data.processing.raw_spec import RawIngestSpec, RawProtocolSchema
-from batgrad.data.transforms.checks import MissingCheckSpec, TimeCheckSpec
-from batgrad.data.transforms.resampling import MinMaxLTTBResamplingSpec
+from batgrad.data.transforms.checks import (
+    ColumnBoundsCheckSpec,
+    DomainAxisCheckSpec,
+    ImpedanceComponentsCheckSpec,
+    MissingCheckSpec,
+    TimeCheckSpec,
+)
+from batgrad.data.transforms.resampling import LinearResamplingSpec, MinMaxLTTBResamplingSpec
+from batgrad.data.transforms.transforms import CRateTransformSpec
 
 cols = Pozzato2022Columns
 metadata = MetadataLayout()
+normalized_temperature = cols.temperature.with_alias(cols.aux_temperature_2, cols.aux_temperature_1)
 
 RAW_TIMESERIES_COLUMNS = (
     cols.time,
@@ -108,17 +116,27 @@ RAW_INGEST_SPEC = RawIngestSpec(
 NORMALIZE_SPEC = NormalizeSpec(
     spec_id="pozzato-2022-normalized-v1",
     protocol_specs={
-        "Cycling": ProtocolNormalizeSpec(
+        BaseValues.cycling_protocol: ProtocolNormalizeSpec(
             domain=Domains.time,
+            group_by=(BaseColumns.cell_id, BaseColumns.cycle_index),
+            order_by=(cols.time,),
             columns=(
                 cols.dt,
                 cols.c_rate,
                 cols.voltage,
-                cols.temperature,
+                normalized_temperature,
+            ),
+            transforms=(
+                CRateTransformSpec(
+                    source_col=cols.current,
+                    target_col=cols.c_rate,
+                    nominal_capacity_ah=5.0,
+                ),
             ),
             checks=(
                 MissingCheckSpec(),
                 TimeCheckSpec(time_col=cols.time, dt_col=cols.dt),
+                ColumnBoundsCheckSpec(),
             ),
             resampling=MinMaxLTTBResamplingSpec(
                 x_col=cols.time,
@@ -126,22 +144,87 @@ NORMALIZE_SPEC = NormalizeSpec(
                 points_ratio=0.1,
             ),
         ),
-        "HPPC": ProtocolNormalizeSpec(
+        BaseValues.hppc_protocol: ProtocolNormalizeSpec(
             domain=Domains.time,
+            group_by=(BaseColumns.cell_id, BaseColumns.cycle_index),
+            order_by=(cols.time,),
             columns=(
                 cols.dt,
                 cols.c_rate,
                 cols.voltage,
-                cols.temperature,
+                normalized_temperature,
+            ),
+            transforms=(
+                CRateTransformSpec(
+                    source_col=cols.current,
+                    target_col=cols.c_rate,
+                    nominal_capacity_ah=5.0,
+                ),
             ),
             checks=(
                 MissingCheckSpec(),
                 TimeCheckSpec(time_col=cols.time, dt_col=cols.dt),
+                ColumnBoundsCheckSpec(),
             ),
             resampling=MinMaxLTTBResamplingSpec(
                 x_col=cols.time,
                 y_col=cols.voltage,
                 points=16_384,
+            ),
+        ),
+        BaseValues.rpt_protocol: ProtocolNormalizeSpec(
+            domain=Domains.time,
+            group_by=(BaseColumns.cell_id, BaseColumns.cycle_index),
+            order_by=(cols.time,),
+            columns=(
+                cols.dt,
+                cols.c_rate,
+                cols.voltage,
+                normalized_temperature,
+            ),
+            transforms=(
+                CRateTransformSpec(
+                    source_col=cols.current,
+                    target_col=cols.c_rate,
+                    nominal_capacity_ah=5.0,
+                ),
+            ),
+            checks=(
+                MissingCheckSpec(),
+                TimeCheckSpec(time_col=cols.time, dt_col=cols.dt),
+                ColumnBoundsCheckSpec(),
+            ),
+            resampling=MinMaxLTTBResamplingSpec(
+                x_col=cols.time,
+                y_col=cols.voltage,
+                points=4096,
+            ),
+        ),
+        BaseValues.eis_protocol: ProtocolNormalizeSpec(
+            domain=Domains.freq,
+            group_by=(BaseColumns.cell_id, BaseColumns.cycle_index),
+            order_by=(cols.freq,),
+            columns=(
+                cols.freq,
+                cols.z_mag,
+                cols.z_phase,
+                cols.z_real,
+                cols.z_imag,
+            ),
+            checks=(
+                ImpedanceComponentsCheckSpec(),
+                MissingCheckSpec(),
+                ColumnBoundsCheckSpec(),
+                DomainAxisCheckSpec(
+                    axis_col=cols.freq,
+                    zero_replacement=1e-7,
+                    enforce_positive=True,
+                ),
+            ),
+            resampling=LinearResamplingSpec(
+                x_col=cols.freq,
+                points=48,
+                scale="log",
             ),
         ),
     },

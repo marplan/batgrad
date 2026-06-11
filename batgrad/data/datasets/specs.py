@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING, Protocol
 from batgrad.data.processing.config import ProcessingStage
 
 if TYPE_CHECKING:
+    from batgrad.contracts.columns import ColumnSpec
     from batgrad.data.datasets.registry import DatasetIds
     from batgrad.data.locations import DatasetLocation
     from batgrad.data.processing.config import NormalizeStageConfig, RawStageConfig
+    from batgrad.data.processing.normalize import NormalizeInteractiveRun
     from batgrad.data.processing.normalize_spec import NormalizeSpec
     from batgrad.data.processing.raw_spec import RawIngestSpec
     from batgrad.storage.store import DataStore
@@ -61,3 +63,14 @@ class Dataset(Protocol):
         output_store: DataStore,
         config: NormalizeStageConfig,
     ) -> None: ...
+
+    def normalize_interactive(
+        self,
+        input_store: DataStore,
+        scratch_store: DataStore,
+        protocol: str,
+        group_values: dict[ColumnSpec, object],
+        config: NormalizeStageConfig,
+        *,
+        annotate: bool = True,
+    ) -> NormalizeInteractiveRun: ...
