@@ -9,6 +9,8 @@ class ColumnSpec(str):
     __slots__ = (
         "_alias_lookup",
         "alias",
+        "col_max",
+        "col_min",
         "description",
         "dtype",
     )
@@ -16,6 +18,8 @@ class ColumnSpec(str):
     alias: tuple[str, ...]
     dtype: pl.DataType | None
     description: str | None
+    col_min: float | None
+    col_max: float | None
     _alias_lookup: frozenset[str] | None
 
     def __new__(
@@ -24,11 +28,15 @@ class ColumnSpec(str):
         alias: tuple[str, ...] = (),
         dtype: type[pl.DataType] | pl.DataType | None = None,
         description: str | None = None,
+        col_min: float | None = None,
+        col_max: float | None = None,
     ) -> Self:
         instance = super().__new__(cls, name)
         instance.alias = (name, *tuple(alias for alias in alias if alias != name))
         instance.dtype = dtype
         instance.description = description
+        instance.col_min = col_min
+        instance.col_max = col_max
         instance._alias_lookup = None
         return instance
 
@@ -38,14 +46,24 @@ class ColumnSpec(str):
             alias=alias,
             dtype=self.dtype,
             description=self.description,
+            col_min=self.col_min,
+            col_max=self.col_max,
         )
+
+    def matching_name(self, columns: set[str] | tuple[str, ...] | list[str]) -> str | None:
+        available = {column.casefold(): column for column in columns}
+        for alias in self.alias:
+            match = available.get(alias.casefold())
+            if match is not None:
+                return match
+        return None
 
     def has_match(self, column: str | set[str]) -> bool:
         if self._alias_lookup is None:
             self._alias_lookup = frozenset(alias.casefold() for alias in self.alias)
 
         if isinstance(column, set):
-            return any(value.casefold() in self._alias_lookup for value in column)
+            return self.matching_name(column) is not None
         return column.casefold() in self._alias_lookup
 
 
@@ -64,8 +82,19 @@ class BaseColumns:
     split = ColumnSpec("split", dtype=pl.String)
     row_count = ColumnSpec("row count", dtype=pl.Int64)
     file_paths = ColumnSpec("file paths", dtype=pl.Struct)
-    mark = ColumnSpec("marked", dtype=pl.String)
-    comment = ColumnSpec("comments", dtype=pl.String)
+    annotations = ColumnSpec(
+        "annotations",
+        dtype=pl.List(
+            pl.Struct(
+                {
+                    "column": pl.String,
+                    "reason": pl.String,
+                },
+            ),
+        ),
+    )
+    annotation_columns = ColumnSpec("annotation columns", dtype=pl.String)
+    annotation_reasons = ColumnSpec("annotation reasons", dtype=pl.String)
 
     device_id = ColumnSpec("Device ID", dtype=pl.String, description="Device identifier")
     test_id = ColumnSpec("Test ID", dtype=pl.Int64, description="Test identifier")
@@ -84,7 +113,31 @@ class MetadataColumns:
     chem = ColumnSpec("chemistry", dtype=pl.String)
     nom_capa = ColumnSpec("Nominal capacity [Ah]", dtype=pl.Float64)
 
-    source_file_paths = ColumnSpec("source file paths", dtype=pl.List(pl.String))
+    raw_file_paths = ColumnSpec("raw file paths", dtype=pl.List(pl.String))
+    parquet_segments = ColumnSpec(
+        "parquet segments",
+        dtype=pl.List(
+            pl.Struct(
+                {
+                    "file path": pl.String,
+                    "row start": pl.Int64,
+                    "row count": pl.Int64,
+                },
+            ),
+        ),
+    )
+    normalized_segments = ColumnSpec(
+        "normalized segments",
+        dtype=pl.List(
+            pl.Struct(
+                {
+                    "file path": pl.String,
+                    "row start": pl.Int64,
+                    "row count": pl.Int64,
+                },
+            ),
+        ),
+    )
 
     domain_id = ColumnSpec("domain id", dtype=pl.String)
     protocol = ColumnSpec("protocol", dtype=pl.String)
@@ -100,6 +153,7 @@ class MetadataColumns:
 
     resampling_method = ColumnSpec("resampling method", dtype=pl.String)
     resampling_params = ColumnSpec("resampling params", dtype=pl.String)
+    time_convention = ColumnSpec("time convention", dtype=pl.String)
 
     schema_version = ColumnSpec("schema version", dtype=pl.String)
     processing_stage = ColumnSpec("processing stage", dtype=pl.String)
@@ -116,6 +170,8 @@ class BatteryColumns:
         "Time diff [s]",
         dtype=pl.Float64,
         description="Time difference in seconds",
+        col_min=0.0,
+        col_max=86_400.0,
     )
     date_time = ColumnSpec(
         "Date time",
@@ -127,31 +183,43 @@ class BatteryColumns:
         "Current [A]",
         dtype=pl.Float64,
         description="Current measurement in Amperes",
+        col_min=-30.0,
+        col_max=50.0,
     )
     c_rate = ColumnSpec(
         "Current [C-rate]",
         dtype=pl.Float64,
         description="Current normalized by nominal capacity",
+        col_min=-50.0,
+        col_max=50.0,
     )
     voltage = ColumnSpec(
         "Terminal voltage [V]",
         dtype=pl.Float64,
         description="Terminal voltage in Volts",
+        col_min=2.3,
+        col_max=4.6,
     )
     temperature = ColumnSpec(
         "Auxiliary temperature [degC]",
         dtype=pl.Float64,
         description="Auxiliary temperature in Celsius",
+        col_min=15.0,
+        col_max=55.0,
     )
     core_temperature = ColumnSpec(
         "Core temperature [degC]",
         dtype=pl.Float64,
         description="Core/cell temperature in Celsius",
+        col_min=15.0,
+        col_max=55.0,
     )
     surface_temperature = ColumnSpec(
         "Surface temperature [degC]",
         dtype=pl.Float64,
         description="Surface temperature in Celsius",
+        col_min=15.0,
+        col_max=55.0,
     )
 
     charge_capacity = ColumnSpec(
@@ -191,21 +259,29 @@ class BatteryColumns:
         "Impedance magnitude [Ohm]",
         dtype=pl.Float64,
         description="Impedance magnitude in Ohms",
+        col_min=-1000.0,
+        col_max=1000.0,
     )
     z_phase = ColumnSpec(
         "Impedance phase [deg]",
         dtype=pl.Float64,
         description="Impedance phase in degrees",
+        col_min=-1000.0,
+        col_max=1000.0,
     )
     z_real = ColumnSpec(
         "Impedance real [Ohm]",
         dtype=pl.Float64,
         description="Real part of impedance",
+        col_min=-1000.0,
+        col_max=1000.0,
     )
     z_imag = ColumnSpec(
         "Impedance imaginary [Ohm]",
         dtype=pl.Float64,
         description="Imaginary part of impedance",
+        col_min=-1000.0,
+        col_max=1000.0,
     )
 
 

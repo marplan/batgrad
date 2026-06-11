@@ -8,13 +8,21 @@ import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
 ArgT = TypeVar("ArgT")
 ResultT = TypeVar("ResultT")
+
+
+class StageRuntimeConfig(Protocol):
+    n_jobs: int
+    worker_polars_max_threads: int | None
+    chunk_rows: int
+    row_group_size: int
+    max_shard_size_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +62,77 @@ def resolve_process_count(n_jobs: int, task_count: int) -> int:
     return min(requested, task_count)
 
 
+def validate_stage_runtime_config(config: StageRuntimeConfig) -> None:
+    if config.chunk_rows < 1:
+        raise ValueError(f"chunk_rows must be >= 1, got {config.chunk_rows}")
+    if config.row_group_size < 1:
+        raise ValueError(f"row_group_size must be >= 1, got {config.row_group_size}")
+    if config.max_shard_size_bytes < 0:
+        raise ValueError(
+            f"max_shard_size_bytes must be >= 0, got {config.max_shard_size_bytes}",
+        )
+    if config.n_jobs < -1:
+        raise ValueError(f"n_jobs must be -1, 0, or >= 1, got {config.n_jobs}")
+    if (
+        config.worker_polars_max_threads is not None
+        and config.worker_polars_max_threads != -1
+        and config.worker_polars_max_threads < 1
+    ):
+        raise ValueError(
+            "worker_polars_max_threads must be >= 1, -1, or None, "
+            f"got {config.worker_polars_max_threads}",
+        )
+
+    max_batch_rows = getattr(config, "max_batch_rows", None)
+    if max_batch_rows is not None and max_batch_rows < 1:
+        raise ValueError(f"max_batch_rows must be >= 1, got {max_batch_rows}")
+
+
+def resolve_stage_worker_count(n_jobs: int, task_count: int) -> int:
+    if task_count < 1:
+        return 0
+    if n_jobs in (0, 1) or task_count <= 1:
+        return 1
+    return resolve_process_count(n_jobs, task_count)
+
+
+def iter_stage_process_results[ArgT, ResultT](
+    worker: Callable[[ArgT], ResultT],
+    specs: Sequence[ProcessTaskSpec[ArgT]],
+    config: StageRuntimeConfig,
+) -> Iterator[ProcessTaskResult[ResultT]]:
+    worker_count = resolve_stage_worker_count(config.n_jobs, len(specs))
+    if worker_count < 1:
+        return
+    yield from iter_process_results(
+        worker,
+        specs,
+        max_workers=worker_count,
+        polars_max_threads=config.worker_polars_max_threads,
+    )
+
+
+def resolve_worker_polars_max_threads(
+    requested: int | None,
+    worker_count: int,
+    *,
+    reserve_cores: int = 1,
+) -> int | None:
+    if requested is None:
+        return None
+    if requested >= 1:
+        return requested
+    if requested != -1:
+        raise ValueError(f"worker_polars_max_threads must be None, -1, or >= 1, got {requested}")
+    if worker_count < 1:
+        raise ValueError(f"worker_count must be >= 1, got {worker_count}")
+
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    available_cores = process_cpu_count() if callable(process_cpu_count) else None
+    cores = available_cores or os.cpu_count() or 1
+    return max(1, (cores - reserve_cores) // worker_count)
+
+
 def read_peak_rss_mb() -> float:
     max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     if sys.platform == "darwin":
@@ -67,7 +146,7 @@ def init_process_worker(polars_max_threads: int | None) -> None:
         os.environ["POLARS_MAX_THREADS"] = str(polars_max_threads)
 
 
-def iter_ordered_process_results[ArgT, ResultT](  # noqa: C901
+def iter_process_results[ArgT, ResultT](  # noqa: C901, PLR0912
     worker: Callable[[ArgT], ResultT],
     specs: Sequence[ProcessTaskSpec[ArgT]],
     *,
@@ -79,18 +158,30 @@ def iter_ordered_process_results[ArgT, ResultT](  # noqa: C901
     if not specs:
         return
 
-    next_submit_idx = 0
-    next_emit_index = specs[0].task_index
-    buffered: dict[int, ProcessTaskResult[ResultT]] = {}
+    if max_workers == 1:
+        for spec in specs:
+            yield _run_process_task(worker, spec)
+        return
 
-    executor = ProcessPoolExecutor(
-        max_workers=max_workers,
-        mp_context=mp.get_context("spawn"),
-        initializer=init_process_worker,
-        initargs=(polars_max_threads,),
+    next_submit_idx = 0
+
+    resolved_polars_max_threads = resolve_worker_polars_max_threads(
+        polars_max_threads,
+        max_workers,
     )
+    previous_polars_max_threads = os.environ.get("POLARS_MAX_THREADS")
+    if resolved_polars_max_threads is not None:
+        os.environ["POLARS_MAX_THREADS"] = str(resolved_polars_max_threads)
+
     aborted = False
+    executor: ProcessPoolExecutor | None = None
     try:
+        executor = ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=mp.get_context("spawn"),
+            initializer=init_process_worker,
+            initargs=(resolved_polars_max_threads,),
+        )
         future_to_spec = {}
         for _ in range(min(max_workers, len(specs))):
             spec = specs[next_submit_idx]
@@ -98,18 +189,7 @@ def iter_ordered_process_results[ArgT, ResultT](  # noqa: C901
             future_to_spec[future] = spec
             next_submit_idx += 1
 
-        while future_to_spec or buffered:
-            if next_emit_index in buffered:
-                result = buffered.pop(next_emit_index)
-                next_emit_index += 1
-                if next_submit_idx < len(specs):
-                    spec = specs[next_submit_idx]
-                    future = executor.submit(_run_process_task, worker, spec)
-                    future_to_spec[future] = spec
-                    next_submit_idx += 1
-                yield result
-                continue
-
+        while future_to_spec:
             done, _pending = wait(future_to_spec, return_when=FIRST_COMPLETED)
             for future in done:
                 spec = future_to_spec.pop(future)
@@ -117,14 +197,25 @@ def iter_ordered_process_results[ArgT, ResultT](  # noqa: C901
                     result = future.result()
                 except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
                     result = _failed_process_result(spec, exc)
-                buffered[result.task_index] = result
+                if next_submit_idx < len(specs):
+                    next_spec = specs[next_submit_idx]
+                    next_future = executor.submit(_run_process_task, worker, next_spec)
+                    future_to_spec[next_future] = next_spec
+                    next_submit_idx += 1
+                yield result
     except (GeneratorExit, KeyboardInterrupt):
         aborted = True
-        abort_process_pool(executor)
+        if executor is not None:
+            abort_process_pool(executor)
         raise
     finally:
-        if not aborted:
+        if not aborted and executor is not None:
             executor.shutdown(wait=True)
+        if resolved_polars_max_threads is not None:
+            if previous_polars_max_threads is None:
+                os.environ.pop("POLARS_MAX_THREADS", None)
+            else:
+                os.environ["POLARS_MAX_THREADS"] = previous_polars_max_threads
 
 
 def abort_process_pool(executor: object) -> None:

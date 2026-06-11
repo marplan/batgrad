@@ -14,17 +14,22 @@ from batgrad.contracts.values import BaseValues
 from batgrad.data.datasets.pozzato_2022.specs import DATASET_SPEC
 from batgrad.data.processing.config import PROCESSING_STAGE_SPECS, FailureMode, ProcessingStage
 from batgrad.data.processing.raw import (
+    PreparedRawTaskResult,
     RawBatch,
     RawIngestIssue,
     RawTask,
     RawTaskStats,
+    RawWorkerPayload,
     is_excluded_raw_file,
 )
+from batgrad.data.processing.runtime import iter_stage_process_results
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator, Sequence
 
     from batgrad.data.datasets.specs import DatasetSpec
+    from batgrad.data.processing.config import RawStageConfig
+    from batgrad.data.processing.runtime import ProcessTaskResult, ProcessTaskSpec
     from batgrad.storage.store import DataStore
 
 logger = _loggers.get_logger(__name__)
@@ -32,7 +37,7 @@ logger = _loggers.get_logger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class SchemaApplyResult:
-    data: pl.DataFrame
+    data: pl.LazyFrame
     stats: RawTaskStats
 
 
@@ -49,8 +54,6 @@ class Pozzato2022RawAdapter:
     DIAG_FILE_INDICATOR: ClassVar[str] = "Diag"
     CYCLING_FILE_INDICATOR: ClassVar[str] = "Cycling"
 
-    CYCLING_FILE_PREFIX: ClassVar[str] = "Cycling_"
-    DIAG_FILE_PREFIX: ClassVar[str] = "Diag_"
     PART_INDICATOR: ClassVar[str] = "Part"
     PROTOCOL_SORT_ORDER: ClassVar[dict[str, int]] = {
         BaseValues.cycling_protocol: 0,
@@ -58,8 +61,6 @@ class Pozzato2022RawAdapter:
         BaseValues.rpt_protocol: 2,
         BaseValues.eis_protocol: 3,
     }
-
-    NOMINAL_CAPACITY_AH: ClassVar[float] = 5.0
 
     def plan_raw_tasks(self, input_store: DataStore) -> tuple[RawTask, ...]:
         raw_spec = self.spec.raw
@@ -84,6 +85,18 @@ class Pozzato2022RawAdapter:
             for path in sorted(paths, key=self._source_sort_key)
         )
 
+    def iter_task_results(
+        self,
+        worker: Callable[[RawWorkerPayload], PreparedRawTaskResult],
+        specs: Sequence[ProcessTaskSpec[RawWorkerPayload]],
+        config: RawStageConfig,
+    ) -> Iterator[ProcessTaskResult[PreparedRawTaskResult]]:
+        return iter_stage_process_results(
+            worker,
+            specs,
+            config,
+        )
+
     def load_raw_task(
         self,
         task: RawTask,
@@ -103,7 +116,7 @@ class Pozzato2022RawAdapter:
             sheet = excel.load_sheet(idx_or_name=sheet_name, dtypes="string")
 
         schema_result = self._apply_schema(
-            sheet.to_polars(),
+            pl.LazyFrame(sheet),
             source_path,
             protocol_schema.columns,
             protocol_schema.dropped_columns,
@@ -137,7 +150,7 @@ class Pozzato2022RawAdapter:
 
     def _apply_schema(
         self,
-        data: pl.DataFrame,
+        data: pl.LazyFrame,
         source_path: str,
         declared_columns: tuple[ColumnSpec, ...],
         dropped_columns: tuple[ColumnSpec, ...],
@@ -149,29 +162,32 @@ class Pozzato2022RawAdapter:
         declared_drop_columns: list[str] = []
         duplicate_issues: list[RawIngestIssue] = []
 
-        for source_col in data.columns:
-            spec, is_declared_drop = self._resolve_source_column(
-                source_col,
-                source_path,
-                declared_columns,
-                dropped_columns,
-            )
-            if spec is None:
-                if is_declared_drop:
-                    declared_drop_columns.append(source_col)
-                else:
-                    unknown_columns.append(source_col)
-                continue
+        source_columns = tuple(data.collect_schema().names())
+        select_exprs, declared_sources, duplicate_issues = self._select_declared_columns(
+            source_columns,
+            source_path,
+            declared_columns,
+            output_counts,
+        )
 
-            output_col = self._duplicate_output_column(spec, output_counts)
-            if output_col != spec:
+        for source_col in source_columns:
+            if source_col in declared_sources:
+                continue
+            matching_declared = [spec for spec in declared_columns if spec.has_match(source_col)]
+            if matching_declared:
                 duplicate_issues.append(
-                    self._duplicate_column_issue(source_path, source_col, spec, output_col),
+                    self._duplicate_column_issue(
+                        source_path,
+                        source_col,
+                        matching_declared[0],
+                        str(matching_declared[0]),
+                    ),
                 )
-            expr = pl.col(source_col)
-            if spec.dtype is not None:
-                expr = expr.cast(spec.dtype, strict=False)
-            select_exprs.append(expr.alias(output_col))
+                continue
+            if any(spec.has_match(source_col) for spec in dropped_columns):
+                declared_drop_columns.append(source_col)
+            else:
+                unknown_columns.append(source_col)
 
         issues: list[RawIngestIssue] = []
         if declared_drop_columns:
@@ -217,6 +233,32 @@ class Pozzato2022RawAdapter:
             issues=tuple(issues),
         )
         return SchemaApplyResult(data=data.select(select_exprs), stats=stats)
+
+    def _select_declared_columns(
+        self,
+        source_columns: tuple[str, ...],
+        source_path: str,
+        declared_columns: tuple[ColumnSpec, ...],
+        output_counts: dict[str, int],
+    ) -> tuple[list[pl.Expr], set[str], list[RawIngestIssue]]:
+        select_exprs: list[pl.Expr] = []
+        declared_sources: set[str] = set()
+        duplicate_issues: list[RawIngestIssue] = []
+        for spec in declared_columns:
+            source_col = spec.matching_name(source_columns)
+            if source_col is None:
+                continue
+            declared_sources.add(source_col)
+            output_col = self._duplicate_output_column(spec, output_counts)
+            if output_col != spec:
+                duplicate_issues.append(
+                    self._duplicate_column_issue(source_path, source_col, spec, output_col),
+                )
+            expr = pl.col(source_col)
+            if spec.dtype is not None:
+                expr = expr.cast(spec.dtype, strict=False)
+            select_exprs.append(expr.alias(output_col))
+        return select_exprs, declared_sources, duplicate_issues
 
     @staticmethod
     def _resolve_source_column(

@@ -14,30 +14,34 @@ from batgrad.contracts.columns import (
     MetadataColumns,
     collect_column_specs,
 )
-from batgrad.contracts.metadata import MetadataLayoutSpec
 from batgrad.data.processing.config import (
     PROCESSING_STAGE_SPECS,
     FailureMode,
     ProcessingStage,
 )
+from batgrad.data.processing.metadata import (
+    extend_layout_with_group_columns,
+    extend_metadata_layout,
+)
 from batgrad.data.processing.runtime import (
     ProcessTaskResult,
     ProcessTaskSpec,
     WorkerMetrics,
-    iter_ordered_process_results,
     read_peak_rss_mb,
-    resolve_process_count,
+    validate_stage_runtime_config,
 )
 from batgrad.data.processing.schema import (
     add_metadata_columns,
     collect_frame,
+    frame_columns,
+    iter_data_chunks,
     select_and_cast_columns,
     validate_required_metadata,
 )
 from batgrad.data.processing.sharding import ProtocolShardWriter
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Callable, Iterator, Sequence
 
     from batgrad.data.datasets.specs import DatasetSpec
     from batgrad.data.processing.config import RawStageConfig
@@ -96,27 +100,12 @@ class RawRunStats:
         self.duplicate_columns += stats.duplicate_columns
         self.dropped_mapped_columns += stats.dropped_mapped_columns
 
-    def add_issue(self, issue: RawIngestIssue) -> None:
-        self.warnings += 1
-        if issue.kind == "dropped_unknown_columns":
-            self.dropped_unknown_columns += len(issue.columns)
-        elif issue.kind == "dropped_declared_columns":
-            self.dropped_declared_columns += len(issue.columns)
-        elif issue.kind == "duplicate_columns":
-            self.duplicate_columns += 1
-        elif issue.kind == "dropped_mapped_columns":
-            self.dropped_mapped_columns += len(issue.columns)
-
     def add_worker_metrics(self, metrics: WorkerMetrics) -> None:
         self.workers.add(metrics.worker_pid)
         self.worker_peak_rss_mb_max = max(
             self.worker_peak_rss_mb_max,
             metrics.worker_peak_rss_mb,
         )
-
-    @property
-    def warning_count(self) -> int:
-        return self.warnings
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,10 +126,8 @@ class RawBatch:
 @dataclass(frozen=True, slots=True)
 class PreparedRawBatch:
     data: pl.DataFrame
-    stream_id: str
     source_paths: tuple[str, ...]
     metadata: dict[ColumnSpec, object]
-    stats: RawTaskStats = RawTaskStats()
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +159,13 @@ class RawDatasetAdapter(Protocol):
         failure_mode: FailureMode,
     ) -> Iterator[RawBatch]: ...
 
+    def iter_task_results(
+        self,
+        worker: Callable[[RawWorkerPayload], PreparedRawTaskResult],
+        specs: Sequence[ProcessTaskSpec[RawWorkerPayload]],
+        config: RawStageConfig,
+    ) -> Iterator[ProcessTaskResult[PreparedRawTaskResult]]: ...
+
 
 class RawProcessor:
     def __init__(self, adapter: RawDatasetAdapter) -> None:
@@ -184,7 +178,8 @@ class RawProcessor:
         config: RawStageConfig,
     ) -> None:
         raw_spec = self._raw_spec()
-        self._validate_run_config(config)
+        validate_stage_runtime_config(config)
+        self._validate_normalize_group_columns(raw_spec)
 
         stage_spec = PROCESSING_STAGE_SPECS[ProcessingStage.TO_PARQUET]
         writer = ProtocolShardWriter(
@@ -192,8 +187,16 @@ class RawProcessor:
             spec=self.adapter.spec,
             stage_spec=stage_spec,
             config=config,
-            manifest_layout=stage_spec.manifest_layout,
-            footer_layout=self._footer_layout(stage_spec.footer_layout, raw_spec.footer_metadata),
+            manifest_layout=extend_layout_with_group_columns(
+                stage_spec.manifest_layout,
+                self.adapter.spec.normalize.protocol_specs
+                if self.adapter.spec.normalize is not None
+                else {},
+            ),
+            footer_layout=extend_metadata_layout(
+                stage_spec.footer_layout,
+                tuple(raw_spec.footer_metadata),
+            ),
             footer_metadata=raw_spec.footer_metadata,
         )
         failed_any = False
@@ -211,38 +214,16 @@ class RawProcessor:
                     run_stats.tasks_total,
                     run_stats.tasks_succeeded,
                     run_stats.tasks_failed,
-                    run_stats.warning_count,
+                    run_stats.warnings,
                 )
-            if config.n_jobs in (0, 1) or run_stats.tasks_total <= 1:
-                for task_idx, task in enumerate(tasks, start=1):
-                    try:
-                        result = self.prepare_task_result(
-                            task_index=task_idx,
-                            task=task,
-                            input_store=input_store,
-                            failure_mode=config.failure_mode,
-                        )
-                        self._consume_prepared_task_result(
-                            writer,
-                            result,
-                            config.chunk_rows,
-                            run_stats,
-                        )
-                    except Exception as exc:
-                        failed_any = True
-                        self._record_task_failure(task_idx, task, exc, run_stats)
-                        if config.failure_mode == FailureMode.STRICT:
-                            raise
-                    last_update_at = self._log_status_if_due(task_idx, last_update_at, run_stats)
-            else:
-                failed_any = self._run_parallel_tasks(
-                    tasks=tasks,
-                    input_store=input_store,
-                    writer=writer,
-                    config=config,
-                    run_stats=run_stats,
-                    last_update_at=last_update_at,
-                )
+            failed_any = self._run_tasks(
+                tasks=tasks,
+                input_store=input_store,
+                writer=writer,
+                config=config,
+                run_stats=run_stats,
+                last_update_at=last_update_at,
+            )
         except BaseException:
             writer.close(manifest="skip")
             raise
@@ -262,7 +243,7 @@ class RawProcessor:
                 run_stats.batches_written,
                 run_stats.chunks_written,
                 run_stats.rows_written,
-                run_stats.warning_count,
+                run_stats.warnings,
                 run_stats.dropped_unknown_columns,
                 run_stats.dropped_declared_columns,
                 run_stats.duplicate_columns,
@@ -274,20 +255,7 @@ class RawProcessor:
                 read_peak_rss_mb(),
             )
 
-    @staticmethod
-    def _validate_run_config(config: RawStageConfig) -> None:
-        if config.chunk_rows < 1:
-            raise ValueError(f"chunk_rows must be >= 1, got {config.chunk_rows}")
-        if config.row_group_size < 1:
-            raise ValueError(f"row_group_size must be >= 1, got {config.row_group_size}")
-        if config.max_shard_size_bytes < 0:
-            raise ValueError(
-                f"max_shard_size_bytes must be >= 0, got {config.max_shard_size_bytes}",
-            )
-        if config.n_jobs < -1:
-            raise ValueError(f"n_jobs must be -1, 0, or >= 1, got {config.n_jobs}")
-
-    def _run_parallel_tasks(
+    def _run_tasks(
         self,
         tasks: tuple[RawTask, ...],
         input_store: DataStore,
@@ -297,7 +265,6 @@ class RawProcessor:
         last_update_at: float,
     ) -> bool:
         failed_any = False
-        max_workers = resolve_process_count(config.n_jobs, len(tasks))
         specs = tuple(
             ProcessTaskSpec(
                 task_index=task_idx,
@@ -313,34 +280,39 @@ class RawProcessor:
             for task_idx, task in enumerate(tasks, start=1)
         )
 
-        for process_result in iter_ordered_process_results(
+        pending_results: dict[int, ProcessTaskResult[PreparedRawTaskResult]] = {}
+        next_task_index = 1
+        for process_result in self.adapter.iter_task_results(
             prepare_raw_task_worker,
             specs,
-            max_workers=max_workers,
-            polars_max_threads=config.polars_max_threads,
+            config,
         ):
             run_stats.add_worker_metrics(process_result.metrics)
-            task = tasks[process_result.task_index - 1]
-            if process_result.success and process_result.result is not None:
-                self._consume_prepared_task_result(
-                    writer,
-                    process_result.result,
-                    config.chunk_rows,
+            pending_results[process_result.task_index] = process_result
+            while next_task_index in pending_results:
+                ordered_result = pending_results.pop(next_task_index)
+                task = tasks[ordered_result.task_index - 1]
+                if ordered_result.success and ordered_result.result is not None:
+                    self._consume_prepared_task_result(
+                        writer,
+                        ordered_result.result,
+                        config.chunk_rows,
+                        run_stats,
+                    )
+                else:
+                    failed_any = True
+                    self._record_worker_failure(ordered_result, task, run_stats)
+                    if config.failure_mode == FailureMode.STRICT:
+                        raise RuntimeError(
+                            f"Raw task {ordered_result.task_id!r} failed in worker: "
+                            f"{ordered_result.error_type}: {ordered_result.error}",
+                        )
+                last_update_at = self._log_status_if_due(
+                    next_task_index,
+                    last_update_at,
                     run_stats,
                 )
-            else:
-                failed_any = True
-                self._record_worker_failure(process_result, task, run_stats)
-                if config.failure_mode == FailureMode.STRICT:
-                    raise RuntimeError(
-                        f"Raw task {process_result.task_id!r} failed in worker: "
-                        f"{process_result.error_type}: {process_result.error}",
-                    )
-            last_update_at = self._log_status_if_due(
-                process_result.task_index,
-                last_update_at,
-                run_stats,
-            )
+                next_task_index += 1
         return failed_any
 
     def prepare_task_result(
@@ -365,10 +337,8 @@ class RawProcessor:
             batches.append(
                 PreparedRawBatch(
                     data=data,
-                    stream_id=batch.stream_id,
                     source_paths=batch.source_paths,
                     metadata=batch.metadata,
-                    stats=batch.stats,
                 ),
             )
         return PreparedRawTaskResult(
@@ -386,12 +356,21 @@ class RawProcessor:
         run_stats: RawRunStats,
     ) -> None:
         run_stats.add_task_stats(result.stats)
-        self._log_issues(result.stats.issues)
-        task_batches, task_chunks, task_rows = self._append_prepared_batches(
-            writer,
-            iter(result.batches),
-            chunk_rows,
-        )
+        for issue in result.stats.issues:
+            logger.warning(
+                "raw ingest issue kind=%s source_paths=%s columns=%s message=%s",
+                issue.kind,
+                issue.source_paths,
+                issue.columns,
+                issue.message,
+            )
+        task_batches = task_chunks = task_rows = 0
+        for batch in result.batches:
+            task_batches += 1
+            for chunk in iter_data_chunks(batch.data, chunk_rows):
+                writer.append(chunk, batch.metadata, batch.source_paths)
+                task_chunks += 1
+                task_rows += chunk.height
         run_stats.tasks_succeeded += 1
         run_stats.batches_written += task_batches
         run_stats.chunks_written += task_chunks
@@ -404,23 +383,6 @@ class RawProcessor:
             task_batches,
             task_chunks,
             task_rows,
-        )
-
-    def _record_task_failure(
-        self,
-        task_idx: int,
-        task: RawTask,
-        exc: Exception,
-        run_stats: RawRunStats,
-    ) -> None:
-        run_stats.tasks_failed += 1
-        logger.exception(
-            "raw task failed task=%d/%d task_id=%s source_paths=%s error_type=%s",
-            task_idx,
-            run_stats.tasks_total,
-            task.task_id,
-            task.source_paths,
-            type(exc).__name__,
         )
 
     def _record_worker_failure(
@@ -456,26 +418,9 @@ class RawProcessor:
             run_stats.tasks_total,
             run_stats.tasks_succeeded,
             run_stats.tasks_failed,
-            run_stats.warning_count,
+            run_stats.warnings,
         )
         return now
-
-    def _append_prepared_batches(
-        self,
-        writer: ProtocolShardWriter,
-        batches: Iterator[PreparedRawBatch],
-        chunk_rows: int,
-    ) -> tuple[int, int, int]:
-        batch_count = 0
-        chunk_count = 0
-        row_count = 0
-        for batch in batches:
-            batch_count += 1
-            for chunk in self._iter_data_chunks(batch.data, chunk_rows):
-                writer.append(chunk, batch.metadata, batch.source_paths)
-                chunk_count += 1
-                row_count += chunk.height
-        return batch_count, chunk_count, row_count
 
     def _raw_spec(self) -> RawIngestSpec:
         raw_spec = self.adapter.spec.raw
@@ -485,16 +430,32 @@ class RawProcessor:
             )
         return raw_spec
 
+    def _validate_normalize_group_columns(self, raw_spec: RawIngestSpec) -> None:
+        normalize_spec = self.adapter.spec.normalize
+        if normalize_spec is None:
+            return
+
+        for protocol, protocol_spec in normalize_spec.protocol_specs.items():
+            raw_schema = raw_spec.protocol_schema(protocol)
+            raw_columns = set(raw_schema.output_columns)
+            missing = [column for column in protocol_spec.group_by if column not in raw_columns]
+            if missing:
+                raise ValueError(
+                    f"Normalize group_by columns for protocol {protocol!r} are not produced by "
+                    f"raw protocol schema: {missing}",
+                )
+
     def _prepare_batch_data(
         self,
         batch: RawBatch,
         failure_mode: FailureMode,
     ) -> tuple[pl.DataFrame, RawTaskStats]:
-        data = collect_frame(batch.data)
         protocol_schema = self._validate_protocol_metadata(batch.metadata)
+        data = batch.data
         data = add_metadata_columns(data, batch.metadata)
         data, stats = self._align_to_protocol_schema(data, protocol_schema, failure_mode, batch)
-        return self._apply_protocol_canonicalization(data, protocol_schema), stats
+        data = self._apply_protocol_canonicalization(data, protocol_schema)
+        return collect_frame(data), stats
 
     def _validate_protocol_metadata(
         self,
@@ -526,9 +487,9 @@ class RawProcessor:
 
     def _apply_protocol_canonicalization(
         self,
-        data: pl.DataFrame,
+        data: pl.DataFrame | pl.LazyFrame,
         protocol_schema: RawProtocolSchema,
-    ) -> pl.DataFrame:
+    ) -> pl.DataFrame | pl.LazyFrame:
         if not protocol_schema.flip_current_sign:
             return data
 
@@ -540,49 +501,57 @@ class RawProcessor:
                 f"but dataset {self.adapter.spec.dataset_id!r} has no cols.current",
             ) from exc
 
-        if current_col not in data.columns:
+        if current_col not in frame_columns(data):
             return data
         return data.with_columns((pl.col(current_col) * -1).alias(current_col))
 
     def _align_to_protocol_schema(
         self,
-        data: pl.DataFrame,
+        data: pl.DataFrame | pl.LazyFrame,
         protocol_schema: RawProtocolSchema,
         failure_mode: FailureMode,
         batch: RawBatch,
-    ) -> tuple[pl.DataFrame, RawTaskStats]:
+    ) -> tuple[pl.DataFrame | pl.LazyFrame, RawTaskStats]:
         output_columns = protocol_schema.output_columns
         output_set = set(output_columns)
         mapped_columns = set(collect_column_specs(self.adapter.spec.cols).values())
+        data_columns = frame_columns(data)
         extra_mapped = sorted(
-            column for column in data.columns if column in mapped_columns - output_set
+            column for column in data_columns if column in mapped_columns - output_set
         )
         extra_source_columns = [
             column
-            for column in data.columns
+            for column in data_columns
             if column not in output_set and column not in mapped_columns
         ]
-        if extra_mapped:
-            message = (
-                f"Raw batch {batch.stream_id!r} for protocol {protocol_schema.protocol!r} has "
-                f"mapped columns outside the declared protocol schema: {extra_mapped}"
-            )
-            issue = RawIngestIssue(
-                kind="dropped_mapped_columns",
-                source_paths=batch.source_paths,
-                message=f"{message}; dropping columns",
-                columns=tuple(extra_mapped),
-            )
-            if failure_mode == FailureMode.STRICT:
-                raise ValueError(message)
-            stats = RawTaskStats(
-                dropped_mapped_columns=len(extra_mapped),
-                issues=(issue,),
-            )
-        else:
-            stats = RawTaskStats()
+        if not extra_mapped:
+            return select_and_cast_columns(
+                data,
+                output_columns,
+                tuple(extra_source_columns),
+            ), RawTaskStats()
 
-        return select_and_cast_columns(data, output_columns, tuple(extra_source_columns)), stats
+        message = (
+            f"Raw batch {batch.stream_id!r} for protocol {protocol_schema.protocol!r} has "
+            f"mapped columns outside the declared protocol schema: {extra_mapped}"
+        )
+        issue = RawIngestIssue(
+            kind="dropped_mapped_columns",
+            source_paths=batch.source_paths,
+            message=f"{message}; dropping columns",
+            columns=tuple(extra_mapped),
+        )
+        if failure_mode == FailureMode.STRICT:
+            raise ValueError(message)
+
+        return select_and_cast_columns(
+            data,
+            output_columns,
+            tuple(extra_source_columns),
+        ), RawTaskStats(
+            dropped_mapped_columns=len(extra_mapped),
+            issues=(issue,),
+        )
 
     @staticmethod
     def _merge_task_stats(left: RawTaskStats, right: RawTaskStats) -> RawTaskStats:
@@ -593,46 +562,6 @@ class RawProcessor:
             dropped_mapped_columns=left.dropped_mapped_columns + right.dropped_mapped_columns,
             issues=(*left.issues, *right.issues),
         )
-
-    @staticmethod
-    def _footer_layout(
-        stage_footer_layout: MetadataLayoutSpec,
-        footer_metadata: Mapping[ColumnSpec, object],
-    ) -> MetadataLayoutSpec:
-        extra_columns = tuple(
-            column
-            for column in footer_metadata
-            if column not in stage_footer_layout.required
-            and column not in stage_footer_layout.optional
-        )
-        if not extra_columns:
-            return stage_footer_layout
-        return MetadataLayoutSpec(
-            required=stage_footer_layout.required,
-            optional=(*stage_footer_layout.optional, *extra_columns),
-        )
-
-    @staticmethod
-    def _log_issues(issues: tuple[RawIngestIssue, ...]) -> None:
-        for issue in issues:
-            logger.warning(
-                "raw ingest issue kind=%s source_paths=%s columns=%s message=%s",
-                issue.kind,
-                issue.source_paths,
-                issue.columns,
-                issue.message,
-            )
-
-    @staticmethod
-    def _iter_data_chunks(data: pl.DataFrame, chunk_rows: int) -> Iterator[pl.DataFrame]:
-        if data.height <= chunk_rows:
-            yield data
-            return
-
-        for offset in range(0, data.height, chunk_rows):
-            chunk = data.slice(offset, chunk_rows)
-            if chunk.height > 0:
-                yield chunk
 
 
 def prepare_raw_task_worker(payload: RawWorkerPayload) -> PreparedRawTaskResult:

@@ -40,6 +40,7 @@ class ProtocolShardState:
     row_count: int = 0
     protocols: set[str] = field(default_factory=set)
     domains: set[str] = field(default_factory=set)
+    footer_metadata: dict[ColumnSpec, object] = field(default_factory=dict)
 
 
 class ProtocolShardWriter:
@@ -52,6 +53,8 @@ class ProtocolShardWriter:
         manifest_layout: MetadataLayoutSpec,
         footer_layout: MetadataLayoutSpec,
         footer_metadata: Mapping[ColumnSpec, object],
+        footer_metadata_columns: tuple[ColumnSpec, ...] = (),
+        output_root: str | None = None,
     ) -> None:
         self.output_store = output_store
         self.spec = spec
@@ -60,13 +63,15 @@ class ProtocolShardWriter:
         self.manifest_layout = manifest_layout
         self.footer_layout = footer_layout
         self.footer_metadata = footer_metadata
+        self.footer_metadata_columns = footer_metadata_columns
+        self.output_root = output_root or spec.location.source_root(stage_spec.output_source)
         self.git_state = resolve_git_state()
         if self.git_state.dirty:
             logger.warning(
                 "%s parquet footers will record git_dirty=true",
                 stage_spec.processing_stage,
             )
-        self.manifest_path = spec.location.manifest(stage_spec.output_source)
+        self.manifest_path = f"{self.output_root}/manifest.parquet"
         self._states: dict[str, ProtocolShardState] = {}
         self._next_part_idx: dict[str, int] = {}
         self._manifest_rows: list[ManifestRow] = []
@@ -76,17 +81,18 @@ class ProtocolShardWriter:
         self,
         data: pl.DataFrame,
         metadata: dict[ColumnSpec, object],
-        source_paths: tuple[str, ...],
+        raw_file_paths: tuple[str, ...],
     ) -> None:
         if data.height == 0:
             return
 
         protocol_value = metadata.get(MetadataColumns.protocol)
         if protocol_value is None:
-            raise ValueError("Raw batch metadata is missing protocol")
+            raise ValueError("Shard metadata is missing protocol")
         protocol = str(protocol_value)
 
         state = self._state_for_protocol(protocol, data)
+        self._update_state_footer_metadata(state, metadata)
         row_start = state.row_count
         state.writer.write_table(data, row_group_size=self.config.row_group_size)
         state.row_count += data.height
@@ -101,7 +107,7 @@ class ProtocolShardWriter:
                 row_start=row_start,
                 row_count=data.height,
                 ingest_order=self._next_ingest_order,
-                source_paths=source_paths,
+                raw_file_paths=raw_file_paths,
                 metadata=metadata,
             ),
         )
@@ -126,8 +132,7 @@ class ProtocolShardWriter:
 
         protocol_dir = protocol.casefold()
         file_name = f"{protocol.casefold()}_part-{part_idx:06d}.parquet"
-        source_root = self.spec.location.source_root(self.stage_spec.output_source)
-        location = f"{source_root}/{protocol_dir}/{file_name}"
+        location = f"{self.output_root}/{protocol_dir}/{file_name}"
         writer = self.output_store.open_table_writer(
             location,
             data.to_arrow().schema,
@@ -149,13 +154,32 @@ class ProtocolShardWriter:
 
         return size_bytes >= max_size
 
+    def _update_state_footer_metadata(
+        self,
+        state: ProtocolShardState,
+        metadata: dict[ColumnSpec, object],
+    ) -> None:
+        for column in self.footer_metadata_columns:
+            value = metadata.get(column)
+            if value is None:
+                continue
+            existing = state.footer_metadata.get(column)
+            if existing is not None and existing != value:
+                raise ValueError(
+                    f"Inconsistent footer metadata {column!r} in shard {state.path}: "
+                    f"{existing!r} != {value!r}",
+                )
+            state.footer_metadata[column] = value
+
     def _close_state(self, protocol: str) -> None:
         state = self._states.pop(protocol)
+        footer_metadata_values = dict(self.footer_metadata)
+        footer_metadata_values.update(state.footer_metadata)
         footer_metadata = build_stage_footer_metadata(
             spec=self.spec,
             stage_spec=self.stage_spec,
             footer_layout=self.footer_layout,
-            footer_metadata=self.footer_metadata,
+            footer_metadata=footer_metadata_values,
             git_state=self.git_state,
             manifest_path=self.manifest_path,
             file_path=state.path,

@@ -70,11 +70,9 @@ class MetadataLayout:
     )
 
     parquet_manifest: tuple[ColumnSpec, ...] = (
-        BaseColumns.file_path,
-        MetadataColumns.row_start,
+        MetadataColumns.raw_file_paths,
+        MetadataColumns.parquet_segments,
         BaseColumns.row_count,
-        MetadataColumns.ingest_order,
-        MetadataColumns.source_file_paths,
         MetadataColumns.protocol,
         MetadataColumns.domain_id,
         BaseColumns.cell_id,
@@ -84,18 +82,17 @@ class MetadataLayout:
 
     normalized_manifest: tuple[ColumnSpec, ...] = (
         BaseColumns.dataset_id,
-        BaseColumns.cell_id,
-        BaseColumns.stream_id,
-        BaseColumns.stream_part_idx,
-        BaseColumns.file_path,
-        MetadataColumns.row_start,
+        MetadataColumns.raw_file_paths,
+        MetadataColumns.parquet_segments,
+        MetadataColumns.normalized_segments,
         BaseColumns.row_count,
-        MetadataColumns.source_file_paths,
         MetadataColumns.domain_id,
         MetadataColumns.protocol,
-        MetadataColumns.role,
         BaseColumns.axis_kind,
         BaseColumns.axis_col,
+        MetadataColumns.resampling_method,
+        MetadataColumns.resampling_params,
+        MetadataColumns.time_convention,
     )
 
     parquet_footer: tuple[ColumnSpec, ...] = (
@@ -111,13 +108,16 @@ class MetadataLayout:
 
     normalized_footer: tuple[ColumnSpec, ...] = (
         BaseColumns.dataset_id,
-        BaseColumns.file_path,
-        MetadataColumns.domain_id,
-        MetadataColumns.protocol,
-        BaseColumns.axis_kind,
-        BaseColumns.axis_col,
         MetadataColumns.processing_stage,
         MetadataColumns.git_commit,
+        MetadataColumns.git_dirty,
+        MetadataColumns.manifest_path,
+        MetadataColumns.protocols,
+        MetadataColumns.domains,
+        BaseColumns.row_count,
+        MetadataColumns.resampling_method,
+        MetadataColumns.resampling_params,
+        MetadataColumns.time_convention,
     )
 
 
