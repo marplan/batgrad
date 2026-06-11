@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,10 +45,12 @@ class LocalTableWriter:
 
 
 class LocalDataStore:
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, create: bool = False) -> None:
         root_path = Path(root)
         if not root_path.is_absolute():
             raise ValueError(f"Local data root must be an absolute path: {root_path}")
+        if create:
+            root_path.mkdir(parents=True, exist_ok=True)
         if not root_path.exists():
             raise FileNotFoundError(f"Local data root does not exist: {root_path}")
         if not root_path.is_dir():
@@ -65,6 +68,16 @@ class LocalDataStore:
 
     def exists(self, location: str | Path | None = None) -> bool:
         return Path(self.resolve(location)).exists()
+
+    def delete_dir(self, location: str | Path, *, missing_ok: bool = True) -> None:
+        path = Path(self.resolve(location))
+        if not path.exists():
+            if missing_ok:
+                return
+            raise FileNotFoundError(f"Directory does not exist: {path}")
+        if not path.is_dir():
+            raise NotADirectoryError(f"Path is not a directory: {path}")
+        shutil.rmtree(path)
 
     def _relative_location(self, path: Path) -> str:
         return path.relative_to(self.root).as_posix()

@@ -14,14 +14,29 @@ StorageBackend = Literal["auto", "local"]
 
 
 @overload
-def get_storage(root: str | Path, backend: Literal["local"]) -> LocalDataStore: ...
+def get_storage(
+    root: str | Path,
+    backend: Literal["local"],
+    *,
+    create: bool = False,
+) -> LocalDataStore: ...
 
 
 @overload
-def get_storage(root: str | Path | None = None, backend: Literal["auto"] = "auto") -> DataStore: ...
+def get_storage(
+    root: str | Path | None = None,
+    backend: Literal["auto"] = "auto",
+    *,
+    create: bool = False,
+) -> DataStore: ...
 
 
-def get_storage(root: str | Path | None = None, backend: StorageBackend = "auto") -> DataStore:
+def get_storage(
+    root: str | Path | None = None,
+    backend: StorageBackend = "auto",
+    *,
+    create: bool = False,
+) -> DataStore:
     """Create a data store instance. Can be used to create a local or remote data store.
 
     Args:
@@ -29,6 +44,7 @@ def get_storage(root: str | Path | None = None, backend: StorageBackend = "auto"
             `DATA_ROOT` environment variable is used.
         backend: Storage backend selection. Use `auto` for environment/root-based
             detection or `local` to require an absolute local path.
+        create: Create the local root directory when it does not exist.
 
     Returns:
         A data store instance.
@@ -43,13 +59,13 @@ def get_storage(root: str | Path | None = None, backend: StorageBackend = "auto"
         root_path = Path(root)
         if not root_path.is_absolute():
             raise ValueError("backend='local' requires an absolute root path")
-        return LocalDataStore(root_path)
+        return LocalDataStore(root_path, create=create)
 
     resolved_root = str(root or os.environ.get(DATA_ROOT_ENV, "")).strip()
     if not resolved_root:
         raise ValueError(f"Data root is not configured. Set {DATA_ROOT_ENV} or pass root.")
 
     if resolved_root.startswith("/"):
-        return LocalDataStore(resolved_root)
+        return LocalDataStore(resolved_root, create=create)
 
     raise ValueError(f"Unknown data root: {resolved_root}. Provide root as an absolute path.")

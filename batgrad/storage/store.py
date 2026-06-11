@@ -24,6 +24,8 @@ class DataStore(Protocol):
 
     def exists(self, location: str | Path | None = None) -> bool: ...
 
+    def delete_dir(self, location: str | Path, *, missing_ok: bool = True) -> None: ...
+
     def list_dirs(
         self,
         location: str | Path | None = None,
