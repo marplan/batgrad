@@ -2,131 +2,332 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Literal, cast
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import numpy as np
 import polars as pl
 from tsdownsample import MinMaxLTTBDownsampler
 
-from batgrad.contracts.columns import BatteryColumns
+from batgrad.contracts.mapping import BaseColumns, MappingSpec
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
-
-    from batgrad.contracts.columns import ColumnSpec
-
+    from collections.abc import Callable, Iterator
 
 DOWNSAMPLE_OVERSAMPLE_FACTOR = 4
 TINY_DOWNSAMPLE_BUDGET = 2
 
 
-class ResamplingSpecBase:
-    method: ClassVar[str]
-
-    def __init_subclass__(cls) -> None:
-        super().__init_subclass__()
-        if "method" not in cls.__dict__:
-            raise TypeError(f"{cls.__name__} must define class variable 'method'")
-
-
-type ResamplingHandler = Callable[[pl.DataFrame, ResamplingSpecBase], pl.DataFrame]
-RESAMPLING_REGISTRY: dict[type[ResamplingSpecBase], ResamplingHandler] = {}
-
-
-def register_resampling[SpecT: ResamplingSpecBase](
-    spec_type: type[SpecT],
-) -> Callable[
-    [Callable[[pl.DataFrame, SpecT], pl.DataFrame]],
-    Callable[[pl.DataFrame, SpecT], pl.DataFrame],
-]:
-    def decorator(
-        fn: Callable[[pl.DataFrame, SpecT], pl.DataFrame],
-    ) -> Callable[[pl.DataFrame, SpecT], pl.DataFrame]:
-        if spec_type in RESAMPLING_REGISTRY:
-            raise ValueError(f"Resampling {spec_type.__name__} is already registered")
-        if any(registered.method == spec_type.method for registered in RESAMPLING_REGISTRY):
-            raise ValueError(f"Resampling method {spec_type.method!r} is already registered")
-
-        RESAMPLING_REGISTRY[spec_type] = cast("ResamplingHandler", fn)
-        return fn
-
-    return decorator
-
-
-@dataclass(frozen=True, slots=True)
-class MinMaxLTTBResamplingSpec(ResamplingSpecBase):
-    x_col: ColumnSpec
-    y_col: ColumnSpec
+@dataclass(frozen=True)
+class MinMaxLTTBResamplingSpec:
+    x_col: MappingSpec
+    y_col: MappingSpec
     points: int | None = None
     points_ratio: float | None = None
     min_points: int = 3
 
-    method: ClassVar[str] = "min_max_lttb"
+    method: str = "min_max_lttb"
+
+    @property
+    def input_columns(self) -> tuple[MappingSpec, ...]:
+        return (self.x_col, self.y_col)
+
+    def metadata_values(self) -> tuple[str, str]:
+        params = {
+            "x_col": str(self.x_col),
+            "y_col": str(self.y_col),
+            "points": self.points,
+            "points_ratio": self.points_ratio,
+            "min_points": self.min_points,
+        }
+        return self.method, json.dumps(params, sort_keys=True, separators=(",", ":"))
+
+    def apply_full(
+        self,
+        data: pl.DataFrame,
+        *,
+        apply_physics_compensation: bool = True,
+    ) -> pl.DataFrame:
+        _ = apply_physics_compensation
+        return self._downsample_frame(data, resolve_min_max_lttb_budget(self, data.height))
+
+    def apply_bounded(
+        self,
+        chunks: Callable[[], Iterator[pl.DataFrame]],
+        *,
+        row_count: int,
+        max_batch_rows: int,
+        row_id_col: str,
+        apply_physics_compensation: bool = True,
+    ) -> Iterator[pl.DataFrame]:
+        budget = resolve_min_max_lttb_budget(self, row_count)
+        if row_count <= budget:
+            for chunk in chunks():
+                yield chunk.drop(row_id_col)
+            return
+
+        selected_ids = self._select_row_ids(
+            chunks,
+            row_id_col=row_id_col,
+            row_count=row_count,
+            budget=budget,
+            max_batch_rows=max_batch_rows,
+        )
+        dt_sums = rebuilt_time = averaged_signal = None
+        signal_col = self._resolve_physics_signal_col(chunks())
+        if signal_col is not None and apply_physics_compensation:
+            dt_sums, rebuilt_time, averaged_signal = self._compute_physics_arrays(
+                chunks(),
+                selected_ids,
+                row_id_col=row_id_col,
+                row_count=row_count,
+                signal_col=signal_col,
+            )
+        yield from self._selected_rows(
+            chunks(),
+            selected_ids,
+            row_id_col=row_id_col,
+            dt_sums=dt_sums,
+            rebuilt_time=rebuilt_time,
+            averaged_signal=averaged_signal,
+            signal_col=signal_col,
+        )
+
+    def _downsample_frame(self, data: pl.DataFrame, budget: int) -> pl.DataFrame:
+        if data.height <= budget:
+            return data
+        if self.x_col not in data.columns or self.y_col not in data.columns:
+            raise ValueError(
+                f"MinMaxLTTB requires columns {self.x_col!r} and {self.y_col!r}; "
+                f"available columns: {sorted(data.columns)}",
+            )
+        if budget <= TINY_DOWNSAMPLE_BUDGET:
+            return downsample_tiny_budget_frame(data, budget)
+        x = data[self.x_col].to_numpy().astype(np.float64)
+        y = data[self.y_col].to_numpy().astype(np.float64)
+        finite_mask = np.isfinite(x) & np.isfinite(y)
+        if not finite_mask.all():
+            valid_idx = np.where(finite_mask)[0]
+            if len(valid_idx) <= budget:
+                return data.filter(pl.Series(finite_mask))
+            indices = MinMaxLTTBDownsampler().downsample(
+                x[finite_mask], y[finite_mask], n_out=budget
+            )
+            return data[np.sort(valid_idx[indices]).tolist()]
+        indices = MinMaxLTTBDownsampler().downsample(x, y, n_out=budget)
+        return data[np.sort(indices).tolist()]
+
+    def _select_row_ids(
+        self,
+        chunks: Callable[[], Iterator[pl.DataFrame]],
+        *,
+        row_id_col: str,
+        row_count: int,
+        budget: int,
+        max_batch_rows: int,
+    ) -> np.ndarray:
+        chunk_count = math.ceil(row_count / max_batch_rows)
+        chunk_budget = max(
+            self.min_points,
+            math.ceil((budget * DOWNSAMPLE_OVERSAMPLE_FACTOR) / chunk_count),
+        )
+        sample_columns = tuple(dict.fromkeys((row_id_col, self.x_col, self.y_col)))
+        sampled_chunks = [
+            self._downsample_frame(chunk.select(sample_columns), chunk_budget)
+            for chunk in chunks()
+        ]
+        if not sampled_chunks:
+            return np.array([], dtype=np.int64)
+        candidates = pl.concat(sampled_chunks, how="vertical")
+        selected = self._downsample_frame(candidates, budget).sort(row_id_col)
+        return selected[row_id_col].to_numpy().astype(np.int64)
+
+    @staticmethod
+    def _selected_rows(
+        chunks: Iterator[pl.DataFrame],
+        selected_ids: np.ndarray,
+        *,
+        row_id_col: str,
+        dt_sums: np.ndarray | None = None,
+        rebuilt_time: np.ndarray | None = None,
+        averaged_signal: np.ndarray | None = None,
+        signal_col: MappingSpec | None = None,
+    ) -> Iterator[pl.DataFrame]:
+        for chunk in chunks:
+            chunk_row_ids = chunk[row_id_col].to_numpy().astype(np.int64)
+            start = int(np.searchsorted(selected_ids, int(chunk_row_ids[0]), side="left"))
+            end = int(np.searchsorted(selected_ids, int(chunk_row_ids[-1]) + 1, side="left"))
+            if end <= start:
+                continue
+            selected = chunk[(selected_ids[start:end] - int(chunk_row_ids[0])).tolist()]
+            if (
+                dt_sums is not None
+                and rebuilt_time is not None
+                and averaged_signal is not None
+                and signal_col is not None
+            ):
+                selected = selected.with_columns(
+                    pl.Series(BaseColumns.dt, dt_sums[start:end]),
+                    pl.Series(BaseColumns.time, rebuilt_time[start:end]),
+                    pl.Series(signal_col, averaged_signal[start:end]),
+                )
+            yield selected.drop(row_id_col)
+
+    @staticmethod
+    def _compute_physics_arrays(
+        chunks: Iterator[pl.DataFrame],
+        selected_ids: np.ndarray,
+        *,
+        row_id_col: str,
+        row_count: int,
+        signal_col: MappingSpec,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        target_ends = np.empty(selected_ids.size, dtype=np.int64)
+        if selected_ids.size > 1:
+            target_ends[:-1] = selected_ids[1:]
+        if selected_ids.size:
+            target_ends[-1] = row_count
+        dt_sums = np.zeros(selected_ids.size, dtype=np.float64)
+        signal_dt_sums = np.zeros(selected_ids.size, dtype=np.float64)
+        sample_idx = 0
+        for chunk in chunks:
+            chunk_row_ids = chunk[row_id_col].to_numpy().astype(np.int64)
+            chunk_start = int(chunk_row_ids[0])
+            chunk_end = int(chunk_row_ids[-1]) + 1
+            dt = chunk[BaseColumns.dt].to_numpy().astype(np.float64)
+            signal = chunk[signal_col].to_numpy().astype(np.float64)
+            while sample_idx < selected_ids.size:
+                start = int(selected_ids[sample_idx])
+                end = int(target_ends[sample_idx])
+                if end <= chunk_start:
+                    sample_idx += 1
+                    continue
+                if start >= chunk_end:
+                    break
+                local_start = max(0, start - chunk_start)
+                local_end = min(chunk.height, end - chunk_start)
+                if local_end > local_start:
+                    dt_slice = dt[local_start:local_end]
+                    signal_slice = signal[local_start:local_end]
+                    dt_sums[sample_idx] += float(dt_slice.sum())
+                    signal_dt_sums[sample_idx] += float((signal_slice * dt_slice).sum())
+                if end <= chunk_end:
+                    sample_idx += 1
+                    continue
+                break
+        averaged_signal = np.divide(
+            signal_dt_sums,
+            dt_sums,
+            out=np.zeros(selected_ids.size, dtype=np.float64),
+            where=dt_sums > 0.0,
+        )
+        rebuilt_time = np.cumsum(dt_sums) - dt_sums
+        return dt_sums, rebuilt_time, averaged_signal
+
+    @staticmethod
+    def _resolve_physics_signal_col(chunks: Iterator[pl.DataFrame]) -> MappingSpec | None:
+        for chunk in chunks:
+            names = set(chunk.columns)
+            if BaseColumns.crate in names:
+                return BaseColumns.crate
+            if BaseColumns.curr in names:
+                return BaseColumns.curr
+            return None
+        return None
 
 
-@dataclass(frozen=True, slots=True)
-class LinearResamplingSpec(ResamplingSpecBase):
-    x_col: ColumnSpec
+@dataclass(frozen=True)
+class LinearResamplingSpec:
+    x_col: MappingSpec
     points: int
     scale: Literal["linear", "log"] = "linear"
     value_range: tuple[float, float] | None = None
 
-    method: ClassVar[str] = "linear"
+    method: str = "linear"
+
+    @property
+    def input_columns(self) -> tuple[MappingSpec, ...]:
+        return (self.x_col,)
+
+    def metadata_values(self) -> tuple[str, str]:
+        params = {
+            "x_col": str(self.x_col),
+            "points": self.points,
+            "scale": self.scale,
+            "value_range": self.value_range,
+        }
+        return self.method, json.dumps(params, sort_keys=True, separators=(",", ":"))
+
+    def apply_full(
+        self,
+        data: pl.DataFrame,
+        *,
+        apply_physics_compensation: bool = True,
+    ) -> pl.DataFrame:
+        _ = apply_physics_compensation
+        return resample_linear_frame(data, self)
+
+    def apply_bounded(
+        self,
+        chunks: Callable[[], Iterator[pl.DataFrame]],
+        *,
+        row_count: int,
+        max_batch_rows: int,
+        row_id_col: str,
+        apply_physics_compensation: bool = True,
+    ) -> Iterator[pl.DataFrame]:
+        _ = chunks, row_count, max_batch_rows, row_id_col, apply_physics_compensation
+        raise NotImplementedError("LinearResamplingSpec does not support bounded resampling")
 
 
-@register_resampling(MinMaxLTTBResamplingSpec)
-def min_max_lttb_resampling(
+class ResamplingSpec(Protocol):
+    @property
+    def input_columns(self) -> tuple[MappingSpec, ...]: ...
+
+    def metadata_values(self) -> tuple[str, str]: ...
+
+    def apply_full(
+        self,
+        data: pl.DataFrame,
+        *,
+        apply_physics_compensation: bool = True,
+    ) -> pl.DataFrame: ...
+
+    def apply_bounded(
+        self,
+        chunks: Callable[[], Iterator[pl.DataFrame]],
+        *,
+        row_count: int,
+        max_batch_rows: int,
+        row_id_col: str,
+        apply_physics_compensation: bool = True,
+    ) -> Iterator[pl.DataFrame]: ...
+
+
+class MinMaxLTTBLikeSpec(ResamplingSpec, Protocol):
+    x_col: MappingSpec
+    y_col: MappingSpec
+    points: int | None
+    points_ratio: float | None
+    min_points: int
+
+
+def run_resampling(
     data: pl.DataFrame,
-    resampling_spec: MinMaxLTTBResamplingSpec,
+    spec: ResamplingSpec,
+    *,
+    apply_physics_compensation: bool = True,
 ) -> pl.DataFrame:
-    budget = resolve_min_max_lttb_budget(resampling_spec, data.height)
-    return downsample_min_max_lttb_frame(data, budget, resampling_spec)
+    return spec.apply_full(data, apply_physics_compensation=apply_physics_compensation)
 
 
-@register_resampling(LinearResamplingSpec)
-def linear_resampling(
-    data: pl.DataFrame,
-    resampling_spec: LinearResamplingSpec,
-) -> pl.DataFrame:
-    return resample_linear_frame(data, resampling_spec)
-
-
-def run_resampling(data: pl.DataFrame, resampling_spec: ResamplingSpecBase) -> pl.DataFrame:
-    handler = RESAMPLING_REGISTRY.get(type(resampling_spec))
-    if handler is None:
-        raise ValueError(f"No handler registered for resampling {type(resampling_spec).__name__}")
-    return handler(data, resampling_spec)
-
-
-def resampling_metadata_values(resampling_spec: ResamplingSpecBase | None) -> tuple[str, str]:
-    if resampling_spec is None:
+def resampling_metadata_values(spec: ResamplingSpec | None) -> tuple[str, str]:
+    if spec is None:
         return "none", "{}"
-    if isinstance(resampling_spec, MinMaxLTTBResamplingSpec):
-        params = {
-            "x_col": str(resampling_spec.x_col),
-            "y_col": str(resampling_spec.y_col),
-            "points": resampling_spec.points,
-            "points_ratio": resampling_spec.points_ratio,
-            "min_points": resampling_spec.min_points,
-        }
-    elif isinstance(resampling_spec, LinearResamplingSpec):
-        params = {
-            "x_col": str(resampling_spec.x_col),
-            "points": resampling_spec.points,
-            "scale": resampling_spec.scale,
-            "value_range": resampling_spec.value_range,
-        }
-    else:
-        raise TypeError(f"Unsupported resampling spec {type(resampling_spec).__name__}")
-    return resampling_spec.method, json.dumps(params, sort_keys=True, separators=(",", ":"))
+    return spec.metadata_values()
 
 
-def resolve_min_max_lttb_budget(
-    spec: MinMaxLTTBResamplingSpec,
-    row_count: int,
-) -> int:
+def resolve_min_max_lttb_budget(spec: MinMaxLTTBLikeSpec, row_count: int) -> int:
     if spec.min_points < 1:
         raise ValueError(f"min_points must be >= 1, got {spec.min_points}")
     if spec.points is not None:
@@ -140,40 +341,6 @@ def resolve_min_max_lttb_budget(
     else:
         raise ValueError("MinMaxLTTB resampling requires points or points_ratio")
     return min(row_count, max(spec.min_points, budget))
-
-
-def downsample_min_max_lttb_frame(
-    data: pl.DataFrame,
-    budget: int,
-    spec: MinMaxLTTBResamplingSpec,
-) -> pl.DataFrame:
-    if data.height <= budget:
-        return data
-    if spec.x_col not in data.columns or spec.y_col not in data.columns:
-        raise ValueError(
-            f"MinMaxLTTB requires columns {spec.x_col!r} and {spec.y_col!r}; "
-            f"available columns: {sorted(data.columns)}",
-        )
-    if budget <= TINY_DOWNSAMPLE_BUDGET:
-        return downsample_tiny_budget_frame(data, budget)
-
-    x = data[spec.x_col].to_numpy().astype(np.float64)
-    y = data[spec.y_col].to_numpy().astype(np.float64)
-    finite_mask = np.isfinite(x) & np.isfinite(y)
-    if not finite_mask.all():
-        valid_idx = np.where(finite_mask)[0]
-        if len(valid_idx) <= budget:
-            return data.filter(pl.Series(finite_mask))
-        indices = MinMaxLTTBDownsampler().downsample(
-            x[finite_mask],
-            y[finite_mask],
-            n_out=budget,
-        )
-        resolved = np.sort(valid_idx[indices]).tolist()
-        return data[resolved]
-
-    indices = MinMaxLTTBDownsampler().downsample(x, y, n_out=budget)
-    return data[np.sort(indices).tolist()]
 
 
 def downsample_tiny_budget_frame(data: pl.DataFrame, budget: int) -> pl.DataFrame:
@@ -196,7 +363,6 @@ def resample_linear_frame(data: pl.DataFrame, spec: LinearResamplingSpec) -> pl.
             f"Linear resampling requires column {spec.x_col!r}; "
             f"available columns: {sorted(data.columns)}",
         )
-
     source = _linear_source_frame(data, spec.x_col)
     if source.height == 0:
         return data.limit(0)
@@ -204,7 +370,6 @@ def resample_linear_frame(data: pl.DataFrame, spec: LinearResamplingSpec) -> pl.
     x_target = _linear_target_grid(x_source, spec)
     if x_target.size == 0:
         return data.limit(0)
-
     output: dict[str, object] = {spec.x_col: x_target}
     for column, dtype in source.schema.items():
         if column == spec.x_col:
@@ -220,15 +385,13 @@ def resample_linear_frame(data: pl.DataFrame, spec: LinearResamplingSpec) -> pl.
     return pl.DataFrame(output).select(source.columns)
 
 
-def _linear_source_frame(data: pl.DataFrame, x_col: ColumnSpec) -> pl.DataFrame:
+def _linear_source_frame(data: pl.DataFrame, x_col: MappingSpec) -> pl.DataFrame:
     source = (
-        data.with_columns(pl.col(x_col).cast(pl.Float64, strict=False).alias(x_col))
+        data.with_columns(pl.col(x_col).cast(pl.Float64).alias(x_col))
         .filter(pl.col(x_col).is_finite())
         .sort(x_col)
     )
-    if source.height == 0:
-        return source
-    return source.group_by(x_col, maintain_order=True).last()
+    return source.group_by(x_col, maintain_order=True).last() if source.height else source
 
 
 def _linear_target_grid(x_source: np.ndarray, spec: LinearResamplingSpec) -> np.ndarray:
@@ -242,7 +405,7 @@ def _linear_target_grid(x_source: np.ndarray, spec: LinearResamplingSpec) -> np.
     if spec.scale == "log":
         if x_min <= 0.0 or x_max <= 0.0:
             raise ValueError(
-                f"log scale linear resampling requires positive range, got ({x_min}, {x_max})",
+                f"log scale linear resampling requires positive range, got ({x_min}, {x_max})"
             )
         return np.logspace(np.log10(x_min), np.log10(x_max), spec.points)
     return np.linspace(x_min, x_max, spec.points)
@@ -260,230 +423,34 @@ def _interp_numeric_with_extrapolation(
     y = y_source[valid]
     if x.size == 1:
         return np.full(x_target.size, y[0], dtype=np.float64)
-
     out = np.interp(x_target, x, y)
     left = x_target < x[0]
     if left.any():
         left_span = x[1] - x[0] or 1.0
-        left_slope = (y[1] - y[0]) / left_span
-        out[left] = y[0] + left_slope * (x_target[left] - x[0])
-
+        out[left] = y[0] + ((y[1] - y[0]) / left_span) * (x_target[left] - x[0])
     right = x_target > x[-1]
     if right.any():
         right_span = x[-1] - x[-2] or 1.0
-        right_slope = (y[-1] - y[-2]) / right_span
-        out[right] = y[-1] + right_slope * (x_target[right] - x[-1])
+        out[right] = y[-1] + ((y[-1] - y[-2]) / right_span) * (x_target[right] - x[-1])
     return out
 
 
 def _nearest_values(
-    x_target: np.ndarray,
-    x_source: np.ndarray,
-    values: list[object],
+    x_target: np.ndarray, x_source: np.ndarray, values: list[object]
 ) -> list[object]:
     positions = np.searchsorted(x_source, x_target, side="left")
-    out: list[object] = []
+    out = []
     for target, pos in zip(x_target, positions, strict=True):
         if pos <= 0:
             out.append(values[0])
-            continue
-        if pos >= x_source.size:
+        elif pos >= x_source.size:
             out.append(values[-1])
-            continue
-        left = pos - 1
-        right = pos
-        out.append(
-            values[left] if target - x_source[left] <= x_source[right] - target else values[right],
-        )
+        else:
+            left = pos - 1
+            right = pos
+            out.append(
+                values[left]
+                if target - x_source[left] <= x_source[right] - target
+                else values[right]
+            )
     return out
-
-
-def select_min_max_lttb_row_ids(
-    chunks: Iterable[pl.DataFrame],
-    *,
-    row_id_col: str,
-    row_count: int,
-    budget: int,
-    spec: MinMaxLTTBResamplingSpec,
-    chunk_rows: int,
-) -> np.ndarray:
-    chunk_count = math.ceil(row_count / chunk_rows)
-    chunk_budget = max(
-        spec.min_points,
-        math.ceil((budget * DOWNSAMPLE_OVERSAMPLE_FACTOR) / chunk_count),
-    )
-    slim_columns = [row_id_col, spec.x_col, spec.y_col]
-    sampled_chunks = [
-        downsample_min_max_lttb_frame(chunk.select(slim_columns), chunk_budget, spec)
-        for chunk in chunks
-    ]
-    if not sampled_chunks:
-        return np.array([], dtype=np.int64)
-    candidates = pl.concat(sampled_chunks, how="vertical")
-    selected = downsample_min_max_lttb_frame(candidates, budget, spec).sort(row_id_col)
-    return selected[row_id_col].to_numpy().astype(np.int64)
-
-
-def compute_physics_arrays_from_chunks(
-    chunks: Iterable[pl.DataFrame],
-    selected_ids: np.ndarray,
-    *,
-    row_id_col: str,
-    row_count: int,
-    signal_col: ColumnSpec,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    target_ends = np.empty(selected_ids.size, dtype=np.int64)
-    if selected_ids.size > 1:
-        target_ends[:-1] = selected_ids[1:]
-    if selected_ids.size:
-        target_ends[-1] = row_count
-
-    dt_sums = np.zeros(selected_ids.size, dtype=np.float64)
-    signal_dt_sums = np.zeros(selected_ids.size, dtype=np.float64)
-    sample_idx = 0
-    for chunk in chunks:
-        chunk_row_ids = chunk[row_id_col].to_numpy().astype(np.int64)
-        chunk_start = int(chunk_row_ids[0])
-        chunk_end = int(chunk_row_ids[-1]) + 1
-        dt = chunk[BatteryColumns.dt].to_numpy().astype(np.float64)
-        signal = chunk[signal_col].to_numpy().astype(np.float64)
-        while sample_idx < selected_ids.size:
-            start = int(selected_ids[sample_idx])
-            end = int(target_ends[sample_idx])
-            if end <= chunk_start:
-                sample_idx += 1
-                continue
-            if start >= chunk_end:
-                break
-            local_start = max(0, start - chunk_start)
-            local_end = min(chunk.height, end - chunk_start)
-            if local_end > local_start:
-                dt_slice = dt[local_start:local_end]
-                signal_slice = signal[local_start:local_end]
-                dt_sums[sample_idx] += float(dt_slice.sum())
-                signal_dt_sums[sample_idx] += float((signal_slice * dt_slice).sum())
-            if end <= chunk_end:
-                sample_idx += 1
-                continue
-            break
-
-    averaged_signal = np.divide(
-        signal_dt_sums,
-        dt_sums,
-        out=np.zeros(selected_ids.size, dtype=np.float64),
-        where=dt_sums > 0.0,
-    )
-    rebuilt_time = np.cumsum(dt_sums) - dt_sums
-    return dt_sums, rebuilt_time, averaged_signal
-
-
-def resolve_downsampling_signal_col(columns: Iterable[str]) -> ColumnSpec | None:
-    names = set(columns)
-    if BatteryColumns.c_rate in names:
-        return BatteryColumns.c_rate
-    if BatteryColumns.current in names:
-        return BatteryColumns.current
-    return None
-
-
-def apply_physics_preserving_downsampling(
-    *,
-    source_lf: pl.LazyFrame,
-    sampled_lf: pl.LazyFrame,
-    row_count: int,
-    row_id_col: str,
-    dt_col: ColumnSpec,
-    time_col: ColumnSpec,
-    signal_col: ColumnSpec,
-) -> pl.LazyFrame:
-    source_schema = set(source_lf.collect_schema().names())
-    sampled_schema = set(sampled_lf.collect_schema().names())
-    required_source = {row_id_col, dt_col, signal_col}
-    missing_source = sorted(required_source - source_schema)
-    if missing_source:
-        raise ValueError(
-            "Cannot apply physics-preserving downsampling: "
-            f"source is missing columns {missing_source}",
-        )
-    if row_id_col not in sampled_schema:
-        raise ValueError(
-            "Cannot apply physics-preserving downsampling: "
-            f"sampled data is missing row id column {row_id_col!r}",
-        )
-
-    prefix_lf = source_lf.select(
-        pl.col(row_id_col).cast(pl.Int64).alias(row_id_col),
-        pl.col(dt_col).cast(pl.Float64).cum_sum().alias("__physics_cum_dt"),
-        (pl.col(signal_col).cast(pl.Float64) * pl.col(dt_col).cast(pl.Float64))
-        .cum_sum()
-        .alias("__physics_cum_signal_dt"),
-    )
-    sampled_windows_lf = (
-        sampled_lf.sort(row_id_col)
-        .with_columns(pl.col(row_id_col).cast(pl.Int64).alias(row_id_col))
-        .with_columns(pl.col(row_id_col).shift(-1).alias("__physics_next_row_id"))
-        .with_columns(
-            pl.coalesce([pl.col("__physics_next_row_id"), pl.lit(row_count)])
-            .cast(pl.Int64)
-            .alias("__physics_end_row_id"),
-            pl.when(pl.col("__physics_sample_pos") == 0)
-            .then(pl.lit(-1))
-            .otherwise(pl.col(row_id_col) - 1)
-            .cast(pl.Int64)
-            .alias("__physics_start_prev_row_id"),
-        )
-        .with_columns((pl.col("__physics_end_row_id") - 1).alias("__physics_end_prev_row_id"))
-    )
-    prefix_end_lf = prefix_lf.rename(
-        {
-            row_id_col: "__physics_end_prev_row_id",
-            "__physics_cum_dt": "__physics_cum_dt_end",
-            "__physics_cum_signal_dt": "__physics_cum_signal_dt_end",
-        },
-    )
-    prefix_start_lf = prefix_lf.rename(
-        {
-            row_id_col: "__physics_start_prev_row_id",
-            "__physics_cum_dt": "__physics_cum_dt_start",
-            "__physics_cum_signal_dt": "__physics_cum_signal_dt_start",
-        },
-    )
-    return (
-        sampled_windows_lf.join(prefix_end_lf, on="__physics_end_prev_row_id", how="left")
-        .join(prefix_start_lf, on="__physics_start_prev_row_id", how="left")
-        .sort("__physics_sample_pos")
-        .with_columns(
-            (
-                pl.coalesce([pl.col("__physics_cum_dt_end"), pl.lit(0.0)])
-                - pl.coalesce([pl.col("__physics_cum_dt_start"), pl.lit(0.0)])
-            ).alias("__physics_dt_sum"),
-            (
-                pl.coalesce([pl.col("__physics_cum_signal_dt_end"), pl.lit(0.0)])
-                - pl.coalesce([pl.col("__physics_cum_signal_dt_start"), pl.lit(0.0)])
-            ).alias("__physics_signal_dt_sum"),
-        )
-        .with_columns(
-            pl.col("__physics_dt_sum").cast(pl.Float64).alias(dt_col),
-            pl.when(pl.col("__physics_dt_sum") > 0.0)
-            .then(pl.col("__physics_signal_dt_sum") / pl.col("__physics_dt_sum"))
-            .otherwise(pl.col(signal_col).cast(pl.Float64))
-            .alias(signal_col),
-        )
-        .with_columns((pl.col(dt_col).cum_sum() - pl.col(dt_col)).alias(time_col))
-        .drop(
-            [
-                row_id_col,
-                "__physics_sample_pos",
-                "__physics_next_row_id",
-                "__physics_end_row_id",
-                "__physics_start_prev_row_id",
-                "__physics_end_prev_row_id",
-                "__physics_cum_dt_end",
-                "__physics_cum_signal_dt_end",
-                "__physics_cum_dt_start",
-                "__physics_cum_signal_dt_start",
-                "__physics_dt_sum",
-                "__physics_signal_dt_sum",
-            ],
-        )
-    )
