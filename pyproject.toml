@@ -81,12 +81,14 @@ line-length = 100
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
+  "COM812", # Trailing comma missing
   "D10", # Missing docstring in public ...
-  "D102", # Missing docstring in public method
   "EM101", # Exception must not use a string literal, assign to variable first
   "EM102", # Exception must not use an f-string literal, assign to variable first
   "FIX0", # flake8-fixme (FIX)
   "PLR0913", # Too many arguments in function definition
+  "SLF001", # Private member accessed
+  "TD001", # Invalid TODO tag
   "TD002", # Missing author in TODO
   "TD003", # Missing issue link in TODO
   "TRY003", # Avoid specifying long messages outside the exception class
