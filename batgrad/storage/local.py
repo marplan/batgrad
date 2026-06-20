@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
-from decorator import contextmanager
+
+from batgrad.data.processing.io import iter_data_chunks
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -27,7 +29,6 @@ class LocalTableWriter:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
             raise FileExistsError(f"File exists: {path}")
-
         self._writer = pq.ParquetWriter(
             path,
             schema,
@@ -44,7 +45,7 @@ class LocalTableWriter:
         self._writer.close()
 
 
-class LocalDataStore:
+class LocalDataProcessingStore:
     def __init__(self, root: str | Path, *, create: bool = False) -> None:
         root_path = Path(root)
         if not root_path.is_absolute():
@@ -55,7 +56,6 @@ class LocalDataStore:
             raise FileNotFoundError(f"Local data root does not exist: {root_path}")
         if not root_path.is_dir():
             raise NotADirectoryError(f"Local data root is not a directory: {root_path}")
-
         self.root = str(root_path.resolve())
 
     def resolve(self, location: str | Path | None = None) -> str:
@@ -66,8 +66,8 @@ class LocalDataStore:
             return str(path)
         return str(Path(self.root) / path)
 
-    def exists(self, location: str | Path | None = None) -> bool:
-        return Path(self.resolve(location)).exists()
+    def create_dir(self, location: str | Path) -> None:
+        Path(self.resolve(location)).mkdir(parents=True, exist_ok=True)
 
     def delete_dir(self, location: str | Path, *, missing_ok: bool = True) -> None:
         path = Path(self.resolve(location))
@@ -79,54 +79,31 @@ class LocalDataStore:
             raise NotADirectoryError(f"Path is not a directory: {path}")
         shutil.rmtree(path)
 
-    def _relative_location(self, path: Path) -> str:
-        return path.relative_to(self.root).as_posix()
-
-    @staticmethod
-    def _is_visible_path(path: Path, root: Path) -> bool:
-        return not any(part.startswith(".") for part in path.relative_to(root).parts)
-
-    def _list_paths(
-        self,
-        location: str | Path | None,
-        pattern: str,
-        *,
-        dirs: bool,
-    ) -> tuple[str, ...]:
-        root = Path(self.resolve(location))
-        if not root.exists() or not root.is_dir():
-            raise FileNotFoundError(f"Directory does not exist: {root}")
-        paths: list[str] = []
-        for path in root.rglob(pattern):
-            if not self._is_visible_path(path, root):
-                continue
-            if dirs and path.is_dir():
-                paths.append(self._relative_location(path))
-            if not dirs and path.is_file():
-                paths.append(self._relative_location(path))
-        return tuple(sorted(paths))
-
-    def list_dirs(
-        self,
-        location: str | Path | None = None,
-        pattern: str = "*",
-    ) -> tuple[str, ...]:
-        return self._list_paths(location, pattern, dirs=True)
+    def delete_file(self, location: str | Path, *, missing_ok: bool = True) -> None:
+        path = Path(self.resolve(location))
+        if not path.exists():
+            if missing_ok:
+                return
+            raise FileNotFoundError(f"File does not exist: {path}")
+        if not path.is_file():
+            raise IsADirectoryError(f"Path is not a file: {path}")
+        path.unlink()
 
     def list_files(
         self,
         location: str | Path | None = None,
         pattern: str = "*",
     ) -> tuple[str, ...]:
-        return self._list_paths(location, pattern, dirs=False)
-
-    def _resolve_table_locations(
-        self,
-        location: str | Path | tuple[str | Path, ...],
-    ) -> str | list[str]:
-        if isinstance(location, tuple):
-            return [self.resolve(path) for path in location]
-        return self.resolve(location)
+        root = Path(self.resolve(location))
+        if not root.exists() or not root.is_dir():
+            raise FileNotFoundError(f"Directory does not exist: {root}")
+        paths = [
+            path.relative_to(self.root).as_posix()
+            for path in root.rglob(pattern)
+            if path.is_file()
+            and not any(part.startswith(".") for part in path.relative_to(root).parts)
+        ]
+        return tuple(sorted(paths))
 
     @contextmanager
     def local_file(self, location: str | Path) -> Iterator[Path]:
@@ -139,15 +116,18 @@ class LocalDataStore:
         filters: pl.Expr | None = None,
         limit: int | None = None,
     ) -> pl.LazyFrame:
-        lf = pl.scan_parquet(self._resolve_table_locations(location))
-
+        resolved = (
+            [self.resolve(path) for path in location]
+            if isinstance(location, tuple)
+            else self.resolve(location)
+        )
+        lf = pl.scan_parquet(resolved)
         if columns is not None:
             lf = lf.select(list(columns))
         if filters is not None:
             lf = lf.filter(filters)
         if limit is not None:
             lf = lf.limit(limit)
-
         return lf
 
     def iter_table_chunks(
@@ -159,29 +139,68 @@ class LocalDataStore:
     ) -> Iterator[pl.DataFrame]:
         if chunk_rows < 1:
             raise ValueError(f"chunk_rows must be >= 1, got {chunk_rows}")
-
-        resolved = self._resolve_table_locations(location)
-        paths = resolved if isinstance(resolved, list) else [resolved]
+        resolved = (
+            [self.resolve(path) for path in location]
+            if isinstance(location, tuple)
+            else [self.resolve(location)]
+        )
         selected_columns = list(columns) if columns is not None else None
-
-        # NOTE: Using pyarrow here because polars collect_batches is marked unstable
-        for path in paths:
+        for path in resolved:
             parquet_file = pq.ParquetFile(path)
             for arrow_batch in parquet_file.iter_batches(
                 batch_size=chunk_rows,
                 columns=selected_columns,
             ):
-                df = pl.from_arrow(arrow_batch)
-                if not isinstance(df, pl.DataFrame):
+                frame = pl.from_arrow(arrow_batch)
+                if not isinstance(frame, pl.DataFrame):
                     raise TypeError(
-                        f"Expected batch conversion to return DataFrame, got {type(df).__name__}",
+                        f"Expected batch conversion to return DataFrame, got {type(frame).__name__}"
                     )
-
                 if filters is not None:
-                    df = df.filter(filters)
+                    frame = frame.filter(filters)
+                if frame.height > 0:
+                    yield frame
 
-                if df.height > 0:
-                    yield df
+    def iter_table_slices(
+        self,
+        location: str | Path,
+        slices: tuple[tuple[int, int], ...],
+        chunk_rows: int,
+        columns: tuple[str, ...] | None = None,
+    ) -> Iterator[pl.DataFrame]:
+        if chunk_rows < 1:
+            raise ValueError(f"chunk_rows must be >= 1, got {chunk_rows}")
+        if not slices:
+            return
+        selected_columns = list(columns) if columns is not None else None
+        parquet_file = pq.ParquetFile(self.resolve(location))
+        row_group_starts: list[int] = []
+        cursor = 0
+        for idx in range(parquet_file.metadata.num_row_groups):
+            row_group_starts.append(cursor)
+            cursor += parquet_file.metadata.row_group(idx).num_rows
+        sorted_slices = tuple(sorted(slices))
+        for row_group_idx, group_start in enumerate(row_group_starts):
+            group_rows = parquet_file.metadata.row_group(row_group_idx).num_rows
+            group_end = group_start + group_rows
+            overlaps = [
+                (max(0, start - group_start), min(group_rows, start + count - group_start))
+                for start, count in sorted_slices
+                if count > 0 and start < group_end and start + count > group_start
+            ]
+            if not overlaps:
+                continue
+            table = parquet_file.read_row_group(row_group_idx, columns=selected_columns)
+            frame = pl.from_arrow(table)
+            if not isinstance(frame, pl.DataFrame):
+                raise TypeError(
+                    f"Expected row-group conversion to return DataFrame, got {type(frame).__name__}"
+                )
+            for local_start, local_end in overlaps:
+                yield from iter_data_chunks(
+                    frame.slice(local_start, local_end - local_start),
+                    chunk_rows,
+                )
 
     def write_table(
         self,
@@ -192,14 +211,11 @@ class LocalDataStore:
     ) -> None:
         out_path = Path(self.resolve(location))
         out_path.parent.mkdir(parents=True, exist_ok=True)
-
         if out_path.exists():
             raise FileExistsError(f"File exists: {out_path}")
-
         if isinstance(data, pl.LazyFrame):
             data.sink_parquet(out_path, metadata=metadata, row_group_size=row_group_size)
             return
-
         data.write_parquet(out_path, metadata=metadata, row_group_size=row_group_size)
 
     def open_table_writer(

@@ -17,20 +17,14 @@ class TableWriter(Protocol):
     def close(self, metadata: dict[str, str] | None = None) -> None: ...
 
 
-class DataStore(Protocol):
+class DataProcessingStore(Protocol):
     root: str
 
-    def resolve(self, location: str | Path | None = None) -> str: ...
-
-    def exists(self, location: str | Path | None = None) -> bool: ...
+    def create_dir(self, location: str | Path) -> None: ...
 
     def delete_dir(self, location: str | Path, *, missing_ok: bool = True) -> None: ...
 
-    def list_dirs(
-        self,
-        location: str | Path | None = None,
-        pattern: str = "*",
-    ) -> tuple[str, ...]: ...
+    def delete_file(self, location: str | Path, *, missing_ok: bool = True) -> None: ...
 
     def list_files(
         self,
@@ -54,6 +48,14 @@ class DataStore(Protocol):
         chunk_rows: int,
         columns: tuple[str, ...] | None = None,
         filters: pl.Expr | None = None,
+    ) -> Iterator[pl.DataFrame]: ...
+
+    def iter_table_slices(
+        self,
+        location: str | Path,
+        slices: tuple[tuple[int, int], ...],
+        chunk_rows: int,
+        columns: tuple[str, ...] | None = None,
     ) -> Iterator[pl.DataFrame]: ...
 
     def write_table(
