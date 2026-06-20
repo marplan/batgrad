@@ -1,0 +1,22 @@
+.batgrad-resampler-frame {
+  position: relative;
+  width: 100%;
+}
+
+.batgrad-resampler-plot {
+  width: 100%;
+}
+
+.batgrad-resampler-status {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 10;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, Canvas 85%, transparent);
+  color: CanvasText;
+  border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+  font: 12px/1.4 system-ui, sans-serif;
+  pointer-events: none;
+}
