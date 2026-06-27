@@ -27,8 +27,7 @@ dev = [
   "pytest>=9.0.2",
   "ruff>=0.15.0",
   "ty>=0.0.22",
-  "playwright>=1.55.0",
-  "pytest-playwright>=0.7.0",
+  "zensical>=0.0.11",
 ]
 ml = [
   "mamba-ssm; sys_platform == 'linux'",
@@ -69,6 +68,7 @@ python_functions = "test_*"
 [tool.ty.src]
 exclude = [
   "notebooks/*.py",
+  "tests/**/*.py",
 ]
 
 [tool.ruff]
@@ -96,10 +96,16 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = [
+  "ANN", # type annotations add noise in compact pytest cases.
   "ARG", # unused-argument: pytest fixtures/mocks often use intentionally unused args.
+  "INP001", # tests are not application packages.
+  "PLR2004", # magic-value-comparison: expected values are the point of tests.
+  "PT011", # broad pytest.raises is acceptable when message assertions are explicit elsewhere.
+  "PT012", # multiple statements in raises blocks keep setup local in small tests.
   "S101", # assert: allow plain assert statements in tests.
   "SLF001", # private-member-access: tests often intentionally inspect internals.
   "T201", # `print` found
+  "TC003", # runtime fixture annotations are clearer than TYPE_CHECKING imports in tests.
 ]
 
 [tool.ruff.lint.isort]
@@ -111,7 +117,3 @@ docstring-code-format = true
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
-
-[tool.marimo]
-keymap = { preset = "vim" }
-display = { theme = "dark" }

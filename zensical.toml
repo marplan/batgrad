@@ -1,0 +1,92 @@
+[project]
+site_name = "batgrad docs"
+site_description = "Data processing tools for battery degradation datasets."
+site_author = "batgrad contributors"
+copyright = "Copyright &copy; 2026 The authors"
+
+nav = [
+  { "Home" = "index.md" },
+  { "Quick Start" = "quick-start.md" },
+  { "Environment Setup" = "environment-setup.md" },
+  { "API Reference" = [
+    { "Datastore" = [
+      { "Local Data Processing Store" = [
+        "api/datastore/local-data-processing-store/index.md",
+        { "Paths and Files" = "api/datastore/local-data-processing-store/paths-and-files.md" },
+        { "Table Reads" = "api/datastore/local-data-processing-store/table-reads.md" },
+        { "Table Writes" = "api/datastore/local-data-processing-store/table-writes.md" },
+        { "Local Table Writer" = "api/datastore/local-data-processing-store/local-table-writer.md" },
+      ] },
+    ] },
+    { "Contracts" = "api/contracts.md" },
+    { "Data" = [
+      { "Configuration" = "api/data/configuration.md" },
+      { "Ingested" = "api/data/ingested.md" },
+      { "Normalized" = "api/data/normalized.md" },
+      { "Transformations" = "api/data/transformations.md" },
+    ] },
+  ] },
+]
+
+[project.theme]
+variant = "classic"
+features = [
+  "content.code.copy",
+  "navigation.indexes",
+  "navigation.path",
+  "navigation.sections",
+]
+
+[[project.theme.palette]]
+scheme = "default"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+scheme = "slate"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to light mode"
+
+[project.validation]
+invalid_links = true
+invalid_link_anchors = true
+
+[project.markdown_extensions.toc]
+permalink = true
+
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+
+[project.markdown_extensions.pymdownx.inlinehilite]
+
+[project.markdown_extensions.pymdownx.superfences]
+
+[[project.markdown_extensions.pymdownx.superfences.custom_fences]]
+name = "mermaid"
+class = "mermaid"
+format = "pymdownx.superfences.fence_code_format"
+
+[project.plugins.mkdocstrings.handlers.python]
+inventories = ["https://docs.python.org/3/objects.inv"]
+paths = ["."]
+
+[project.plugins.mkdocstrings.handlers.python.options]
+docstring_style = "google"
+docstring_section_style = "list"
+filters = ["!^_"]
+heading_level = 3
+inherited_members = false
+merge_init_into_class = true
+separate_signature = true
+show_root_heading = true
+show_root_full_path = false
+show_signature_annotations = true
+show_symbol_type_heading = true
+show_symbol_type_toc = true
+show_source = true
+signature_crossrefs = true
+summary = true
+
+[project.plugins.mkdocstrings.handlers.python.options.docstring_options]
+ignore_init_summary = true
+trim_doctest_flags = true
