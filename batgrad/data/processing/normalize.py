@@ -104,6 +104,37 @@ class NormalizeTransformSpec(Protocol):
 
 @dataclass(frozen=True)
 class NormalizeStageConfig:
+    """Runtime, validation, and parquet-writing settings for normalization.
+
+    Tasks are collected in memory when `max_batch_rows` is `None` or the task row
+    count fits within that limit. Larger tasks use bounded chunk processing; if a
+    protocol also has resampling, its resampling spec must support bounded
+    execution.
+
+    Attributes:
+        n_jobs: Worker count. Use `1` for sequential execution, `-1` for
+            available CPUs minus one, or a positive count capped by task count.
+        worker_polars_max_threads: Polars threads per worker. `-1` divides CPUs
+            across workers, `None` leaves Polars unrestricted, and a positive
+            value sets an exact thread count.
+        chunk_rows: Output chunk size written to final shards.
+        compression: Parquet compression codec.
+        use_content_defined_chunking: Whether table writers may use content
+            defined chunking.
+        row_group_size: Parquet row group size for written files.
+        max_shard_size_bytes: Roll a protocol shard after this approximate size;
+            `0` disables size-based rolling.
+        max_batch_rows: Maximum rows processed in memory per bounded batch. Set
+            to `None` to collect each task fully.
+        apply_resampling: Whether protocol resampling specs are applied.
+        apply_physics_compensation: Whether bounded MinMaxLTTB recomputes `dt`,
+            rebuilt time, and averaged current/C-rate when possible.
+
+    Examples:
+        >>> NormalizeStageConfig(n_jobs=-1, max_batch_rows=500_000)
+        NormalizeStageConfig(...)
+    """
+
     n_jobs: int = 1
     worker_polars_max_threads: int | None = -1
     chunk_rows: int = 500_000
@@ -118,6 +149,46 @@ class NormalizeStageConfig:
 
 @dataclass(frozen=True)
 class NormalizeProtocolSpec:
+    """Normalization recipe for one protocol.
+
+    Required input columns are inferred from order columns, transform inputs,
+    output columns not produced by transforms/constants/checks, check inputs,
+    and resampling inputs. When multiple aliases for a requested column are
+    available in ingested shards, normalization coalesces them into the canonical
+    output column.
+
+    Resampling runs after transforms and checks. Large tasks only work with a
+    resampler that implements bounded execution; otherwise keep `max_batch_rows`
+    unset or high enough for full-task processing.
+
+    Attributes:
+        protocol: Shared protocol definition, including task grouping metadata.
+        order_by: Columns used to sort each task. Defaults to `protocol.axis_col`.
+        columns: Canonical output columns to write.
+        constant_columns: Fixed columns added to every output row, such as
+            ambient temperature when it is known from dataset metadata instead of
+            raw measurements.
+        transforms: Column derivations run before checks.
+        checks: Validation or annotation checks run after transforms.
+        resampling: Optional row reduction or interpolation step.
+
+    Examples:
+        >>> from batgrad.contracts.protocols import BatteryProtocols
+        >>> from batgrad.data.transforms.checks import MissingCheckSpec, TimeCheckSpec
+        >>> NormalizeProtocolSpec(
+        ...     protocol=BatteryProtocols.cyc,
+        ...     columns=(
+        ...         BaseColumns.time,
+        ...         BaseColumns.volt,
+        ...         BaseColumns.curr,
+        ...         BaseColumns.amb_temp,
+        ...     ),
+        ...     constant_columns={BaseColumns.amb_temp: 20.0},
+        ...     checks=(MissingCheckSpec(), TimeCheckSpec(BaseColumns.time, BaseColumns.dt)),
+        ... )
+        NormalizeProtocolSpec(...)
+    """
+
     protocol: BatteryProtocolSpec
     order_by: tuple[MappingSpec, ...] = ()
     columns: tuple[MappingSpec, ...] = ()
@@ -132,18 +203,22 @@ class NormalizeProtocolSpec:
 
     @property
     def protocol_id(self) -> DatasetProtocolId:
+        """Canonical protocol id for this normalize spec."""
         return self.protocol.protocol_id
 
     @property
     def group_by(self) -> tuple[MappingSpec, ...]:
+        """Task grouping columns inherited from protocol metadata."""
         return self.protocol.metadata.task_key
 
     @property
     def output_columns(self) -> tuple[MappingSpec, ...]:
+        """Canonical columns written for this protocol before annotations."""
         return tuple(dict.fromkeys((*self.order_by, *self.columns, *self.constant_columns)))
 
     @property
     def required_input_columns(self) -> tuple[MappingSpec, ...]:
+        """Ingested columns needed to prepare this protocol's normalize tasks."""
         produced = set(self.produced_columns)
         return tuple(
             dict.fromkeys(
@@ -203,6 +278,27 @@ class NormalizeProtocolSpec:
 
 @dataclass(frozen=True)
 class NormalizeStageSpec:
+    """Dataset-level normalization configuration.
+
+    The stage expands manifest metadata with raw paths, ingested parquet segment
+    references, resampling method/arguments, time convention, and protocol group
+    keys. `time_convention` is also written to generated parquet footers.
+
+    Attributes:
+        metadata: Base normalized-stage metadata layout.
+        protocol_specs: Protocol normalization recipes.
+        time_convention: Label written to manifest/footer metadata describing
+            how task time values are interpreted.
+
+    Examples:
+        >>> from batgrad.contracts.protocols import BatteryProtocols
+        >>> NormalizeStageSpec(
+        ...     protocol_specs=(NormalizeProtocolSpec(protocol=BatteryProtocols.cyc),),
+        ...     time_convention="start_of_interval",
+        ... )
+        NormalizeStageSpec(...)
+    """
+
     metadata: StageLayout = NORMALIZE_STAGE_METADATA
     protocol_specs: tuple[NormalizeProtocolSpec, ...] = field(default_factory=tuple)
     time_convention: str = "start_of_interval"
@@ -234,15 +330,51 @@ class NormalizeStageSpec:
         )
 
     def protocol_spec(self, protocol: object) -> NormalizeProtocolSpec:
+        """Return the protocol spec matching a protocol id or value.
+
+        Args:
+            protocol: Protocol id, enum value, or string-like value.
+
+        Returns:
+            Matching normalize protocol spec.
+
+        Raises:
+            ValueError: If no protocol spec matches.
+        """
         return protocol_spec_by_id(self.protocol_specs, protocol)
 
     def output_columns(self, protocol: object) -> tuple[MappingSpec, ...]:
+        """Canonical output columns for a protocol.
+
+        Args:
+            protocol: Protocol id, enum value, or string-like value.
+
+        Returns:
+            Columns written to normalized parquet before annotations.
+        """
         return self.protocol_spec(protocol).output_columns
 
     def required_input_columns(self, protocol: object) -> tuple[MappingSpec, ...]:
+        """Ingested columns required for a protocol's normalize tasks.
+
+        Args:
+            protocol: Protocol id, enum value, or string-like value.
+
+        Returns:
+            Ingested columns needed to prepare and validate the protocol.
+        """
         return self.protocol_spec(protocol).required_input_columns
 
     def task_metadata(self, dataset_id: str, task: NormalizeTask) -> dict[MappingSpec, object]:
+        """Metadata written for one normalized task's manifest rows and footers.
+
+        Args:
+            dataset_id: Dataset id for generated output metadata.
+            task: Planned normalization task.
+
+        Returns:
+            Metadata values for manifest rows and footer resolution.
+        """
         return {
             BaseColumns.set_id: dataset_id,
             BaseColumns.proto: task.protocol_id,
@@ -259,6 +391,16 @@ class NormalizeStageSpec:
         output_root: str | None = None,
         manifest_path: str | None = None,
     ) -> StageOutputSpec:
+        """Build the output writer configuration for normalized shards.
+
+        Args:
+            dataset_spec: Dataset storage configuration.
+            output_root: Optional output root override for interactive runs.
+            manifest_path: Optional manifest path override for interactive runs.
+
+        Returns:
+            Stage writer configuration for protocol-sharded normalized output.
+        """
         output_root = output_root or dataset_spec.source_root(self.metadata.stage_id)
         manifest_path = manifest_path or dataset_spec.manifest(self.metadata.stage_id)
         return stage_output_spec(
@@ -274,6 +416,49 @@ class NormalizeStageSpec:
         )
 
 
+def normalize_spec_with_resampling(
+    normalize_spec: NormalizeStageSpec,
+    resampling_by_protocol: dict[DatasetProtocolId, ResamplingSpec | None],
+) -> NormalizeStageSpec:
+    """Return a copy of a normalize spec with protocol resampling overrides.
+
+    Args:
+        normalize_spec: Base normalization spec.
+        resampling_by_protocol: Resampling spec or `None` keyed by protocol id.
+
+    Returns:
+        A new stage spec with matching protocol specs replaced.
+
+    Examples:
+        >>> from batgrad.contracts.mapping import DatasetProtocolId
+        >>> from batgrad.contracts.protocols import BatteryProtocols
+        >>> from batgrad.data.transforms.resampling import MinMaxLTTBResamplingSpec
+        >>> base = NormalizeStageSpec(
+        ...     protocol_specs=(NormalizeProtocolSpec(protocol=BatteryProtocols.cyc),),
+        ... )
+        >>> updated = normalize_spec_with_resampling(
+        ...     base,
+        ...     {
+        ...         DatasetProtocolId.cycling: MinMaxLTTBResamplingSpec(
+        ...             x_col=BaseColumns.time,
+        ...             y_col=BaseColumns.volt,
+        ...             points_ratio=0.1,
+        ...         )
+        ...     },
+        ... )
+    """
+    return replace(
+        normalize_spec,
+        protocol_specs=tuple(
+            replace(
+                protocol_spec,
+                resampling=resampling_by_protocol.get(protocol_spec.protocol_id),
+            )
+            for protocol_spec in normalize_spec.protocol_specs
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class NormalizeTaskContext:
     task: NormalizeTask
@@ -284,6 +469,21 @@ class NormalizeTaskContext:
 
 @dataclass(frozen=True)
 class NormalizeTask:
+    """One protocol/group normalization unit planned from the ingested manifest.
+
+    A task contains the ingested parquet segments for one protocol task key, such
+    as one cell/cycle pair, plus source-path and row-count metadata used for the
+    normalized manifest.
+
+    Attributes:
+        task_id: Stable id used in logs and temporary output paths.
+        protocol_id: Protocol represented by the task.
+        group_values: Task-key metadata values, such as cell and cycle.
+        raw_paths: Raw source paths represented by the task.
+        parquet_segments: Ingested parquet segments to read.
+        row_count: Total input row count across segments.
+    """
+
     task_id: str
     protocol_id: str
     group_values: dict[MappingSpec, object]
@@ -316,6 +516,26 @@ def run_normalize(
     tasks: tuple[NormalizeTask, ...] | None = None,
     dry_run: bool = False,
 ) -> None:
+    """Run ingested-to-normalized parquet processing for a dataset.
+
+    The stage reads the ingested manifest, plans protocol/group tasks, applies
+    configured transforms, checks, and resampling, then writes normalized shards
+    and a normalized manifest. `dry_run=True` validates tasks and checks without
+    writing outputs.
+
+    Args:
+        dataset_spec: Dataset configuration containing a normalized stage spec.
+        input_store: Store containing ingested manifest and shards.
+        output_store: Store receiving normalized shards and manifest.
+        config: Runtime, validation, and parquet-writing settings.
+        scratch_store: Optional store for temporary task outputs. Defaults to
+            `output_store`.
+        tasks: Optional task subset for retries or tests.
+        dry_run: Validate and log check violations without writing output.
+
+    Returns:
+        `None`. Outputs are written to `output_store` unless `dry_run=True`.
+    """
     normalize_spec = _dataset_normalize_spec(dataset_spec)
     output_root = dataset_spec.source_root(normalize_spec.metadata.stage_id)
     manifest_path = dataset_spec.manifest(normalize_spec.metadata.stage_id)
@@ -346,6 +566,28 @@ def run_normalize_interactive(
     source_run: InteractiveStageRun | None = None,
     normalize_spec: NormalizeStageSpec | None = None,
 ) -> InteractiveStageRun:
+    """Run selected normalization work into a scratch-backed interactive run.
+
+    `protocols` and `group_values` filter planned tasks. Passing an unresampled
+    normalized `source_run` lets developers try different resampling settings
+    without repeating the full normalize preparation path.
+
+    Args:
+        dataset_spec: Dataset configuration containing a normalized stage spec.
+        input_store: Store containing ingested manifest and shards, unless
+            `source_run` is provided.
+        scratch_store: Store receiving temporary interactive outputs.
+        config: Normalize runtime, validation, and parquet-writing settings.
+        protocols: Optional protocol selector, such as one id or a list of ids.
+        group_values: Optional task group selector or list of selectors.
+        annotate: Whether public annotation columns are included in outputs.
+        source_run: Optional prior unresampled normalized run used as the source
+            for resampling experiments.
+        normalize_spec: Optional normalization spec override.
+
+    Returns:
+        Interactive run handle for scanning outputs and cleaning scratch files.
+    """
     normalize_spec = normalize_spec or _dataset_normalize_spec(dataset_spec)
     if source_run is not None:
         return _run_normalize_interactive_from_source_run(
@@ -662,11 +904,18 @@ def _iter_source_run_output_chunks(
         row_count=row_count,
     )
     resampling = protocol_spec.resampling if config.apply_resampling else None
-    output_columns = _source_run_output_columns(source, protocol_spec, include_annotations=annotate)
+
+    def finalize(frame: pl.DataFrame) -> pl.DataFrame:
+        return _finalize_output_columns(
+            frame,
+            protocol_spec,
+            include_annotations=annotate,
+        )
+
     if resampling is None:
         yield from coalesce_frames(
             (
-                frame.select(output_columns)
+                finalize(frame)
                 for frame in source.iter_chunks(config.max_batch_rows or config.chunk_rows)
             ),
             config.chunk_rows,
@@ -690,7 +939,7 @@ def _iter_source_run_output_chunks(
 
         yield from coalesce_frames(
             (
-                frame.select(output_columns)
+                finalize(frame)
                 for frame in _iter_resampled_bounded(
                     chunks,
                     row_count,
@@ -707,22 +956,9 @@ def _iter_source_run_output_chunks(
         resampling.apply_full(
             frame,
             apply_physics_compensation=config.apply_physics_compensation,
-        ).select(output_columns),
+        ).pipe(finalize),
         config.chunk_rows,
     )
-
-
-def _source_run_output_columns(
-    source: SegmentSource,
-    protocol_spec: NormalizeProtocolSpec,
-    *,
-    include_annotations: bool,
-) -> tuple[MappingSpec, ...]:
-    schema = set(source.scan().collect_schema().names())
-    columns = [*protocol_spec.output_columns]
-    if include_annotations and str(BaseColumns.anns) in schema:
-        columns.append(BaseColumns.anns)
-    return tuple(dict.fromkeys(columns))
 
 
 def plan_normalize_tasks(
@@ -733,6 +969,25 @@ def plan_normalize_tasks(
     protocols: object = None,
     group_values: object = None,
 ) -> tuple[NormalizeTask, ...]:
+    """Plan normalization tasks from the ingested manifest.
+
+    The ingested manifest is optionally filtered by protocol and group values,
+    then rows are grouped by each protocol's task key. Each output task merges
+    raw source paths and parquet segment references for one group.
+
+    Args:
+        dataset_spec: Dataset configuration.
+        input_store: Store containing the ingested manifest.
+        normalize_spec: Normalization configuration.
+        protocols: Optional protocol selector.
+        group_values: Optional task group selector or list of selectors.
+
+    Returns:
+        Planned normalization tasks.
+
+    Raises:
+        ValueError: If required manifest metadata or group selectors are invalid.
+    """
     manifest_path = dataset_spec.manifest(DatasetStageId.ingested)
     manifest_lf = input_store.scan_table(manifest_path)
     parquet_manifest_metadata = stage_manifest_metadata(dataset_spec, DatasetStageId.ingested)
@@ -1076,6 +1331,7 @@ def _prepare_full_task_frame(
     )
     if sort_columns:
         data = data.sort([str(column) for column in sort_columns])
+    data = _with_resolved_output_columns(data, context)
     data = _apply_task_transforms(data, context)
     data = _with_resolved_output_columns(data, context)
     data, violations = apply_checks_full_task(
@@ -1105,7 +1361,8 @@ def _iter_bounded_frames(
         columns=context.input_columns,
     ):
         frame = _apply_eager_task_transforms(
-            _prepare_eager_task_frame(input_frame, context), context
+            _with_resolved_output_columns(_prepare_eager_task_frame(input_frame, context), context),
+            context,
         )
         frame = _with_resolved_output_columns(frame, context)
         frame, violations = apply_checks_bounded_chunk(

@@ -14,6 +14,8 @@ type GroupSelector = dict[MappingSpec, SelectorValues]
 
 @dataclass(frozen=True, slots=True)
 class StageSelection:
+    """Protocol and group-value selector for manifests and planned tasks."""
+
     protocols: SelectorValues
     groups: tuple[GroupSelector, ...]
 
@@ -25,12 +27,14 @@ class StageSelection:
         group_values: object,
         group_columns: Sequence[MappingSpec],
     ) -> StageSelection:
+        """Normalize public selector values into a stage selection."""
         return cls(
             protocols=normalize_selector_values(protocols),
             groups=normalize_group_selectors(group_values, group_columns),
         )
 
     def expr(self) -> pl.Expr | None:
+        """Return a Polars filter expression, or `None` for no filtering."""
         exprs = [self.protocol_expr(), self.group_expr()]
         expr = None
         for next_expr in exprs:
@@ -72,15 +76,18 @@ class StageSelection:
         )
 
     def matches_row(self, row: Mapping[str, object]) -> bool:
+        """Return whether a manifest row matches this selection."""
         return self.matches_protocol(row.get(str(BaseColumns.proto))) and any(
             _row_matches_group(row, selector) for selector in self.groups
         )
 
     def matches_group_values(self, group_values: Mapping[MappingSpec, object]) -> bool:
+        """Return whether task group values match this selection."""
         return any(_group_values_match(group_values, selector) for selector in self.groups)
 
 
 def normalize_selector_values(value: object) -> SelectorValues:
+    """Normalize `None`, scalar, string, or iterable selectors to a tuple."""
     if value is None:
         return None
     if isinstance(value, str):
@@ -94,6 +101,11 @@ def normalize_group_selectors(
     group_values: object,
     columns: Sequence[MappingSpec],
 ) -> tuple[GroupSelector, ...]:
+    """Normalize public `group_values` into one or more group selectors.
+
+    `group_values` may be `None`, a mapping, or a list/tuple of mappings. Mapping
+    keys are matched by stringified group column names.
+    """
     by_name = {str(column): column for column in columns}
     if group_values is None:
         return ({},)
@@ -140,6 +152,7 @@ def _group_values_match(
 def all_group_columns(
     columns_by_protocol: Sequence[Sequence[MappingSpec]],
 ) -> tuple[MappingSpec, ...]:
+    """Return unique group columns preserving protocol order."""
     return tuple(dict.fromkeys(column for columns in columns_by_protocol for column in columns))
 
 

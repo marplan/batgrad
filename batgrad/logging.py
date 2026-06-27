@@ -133,7 +133,7 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
-def configure(
+def configure_logger(
     level: str | int = logging.INFO,
     *,
     console: bool = True,

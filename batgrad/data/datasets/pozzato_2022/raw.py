@@ -25,6 +25,16 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class Pozzato2022RawAdapter:
+    """Raw Excel adapter for the Pozzato 2022 dataset conventions.
+
+    The adapter plans one task per included source file, infers protocol and task
+    metadata from the source path, selects exactly one data sheet, and injects
+    null columns for missing declared raw columns before generic ingest alignment.
+    Path conventions are part of the adapter contract: EIS SOC is parsed from
+    `SOC...` or `EIS...` tokens, cycling paths carry the cell id after
+    `Cycling_N`, and `Diag_N` directories map to cycle index `N - 1`.
+    """
+
     spec: DatasetSpec
 
     EIS_SHEET_PATTERN: ClassVar[str] = "ACIM"

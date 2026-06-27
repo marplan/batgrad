@@ -33,6 +33,8 @@ class ShardWriteConfig(Protocol):
 
 @dataclass
 class ShardState:
+    """Open parquet shard state for one shard key."""
+
     key: str
     path: str
     writer: TableWriter
@@ -42,6 +44,14 @@ class ShardState:
 
 
 class ShardWriter:
+    """Write stage output into shard files and a manifest.
+
+    Rows are appended to shard files grouped by `shard_key_col`, currently the
+    protocol column for ingest and normalize. Each append also records a manifest
+    row with segment location, source paths, row count, and declared metadata.
+    Footer metadata is resolved when each shard closes.
+    """
+
     def __init__(
         self,
         output_store: DataProcessingStore,
@@ -80,6 +90,14 @@ class ShardWriter:
         metadata: dict[MappingSpec, object],
         source_paths: tuple[str, ...],
     ) -> None:
+        """Append a data chunk to its shard and record a manifest segment.
+
+        Args:
+            data: Non-empty output chunk.
+            metadata: Task metadata used for shard key, manifest rows, and footer
+                values.
+            source_paths: Raw source paths represented by the chunk.
+        """
         if data.height == 0:
             return
         shard_key = str(metadata[self.shard_key_col])
@@ -108,6 +126,12 @@ class ShardWriter:
             self._close_state(shard_key)
 
     def close(self, *, manifest: Literal["write", "error", "skip"] = "write") -> None:
+        """Close open shards and write, error-write, or skip the manifest.
+
+        Args:
+            manifest: `"write"` writes the normal manifest, `"error"` writes an
+                `err_` manifest, and `"skip"` only closes shards.
+        """
         for shard_key in tuple(self._states):
             self._close_state(shard_key)
         if manifest == "write":
@@ -177,6 +201,12 @@ def resolve_footer_values(
     task_values: dict[MappingSpec, object | None],
     runtime_values: dict[MappingSpec, object | None],
 ) -> dict[MappingSpec, object | None]:
+    """Resolve parquet footer metadata for one output shard.
+
+    Values are chosen in priority order: task values, runtime values, layout
+    defaults, then `None` for optional metadata. Missing required values raise an
+    error.
+    """
     layout_values = footer_metadata.values
     values: dict[MappingSpec, object | None] = {}
     missing_required: list[MappingSpec] = []
@@ -207,6 +237,7 @@ def manifest_row(
     source_paths: tuple[str, ...],
     metadata: dict[MappingSpec, object],
 ) -> dict[MappingSpec, object]:
+    """Build one manifest row for an appended output segment."""
     values: dict[MappingSpec, object] = {
         source_paths_col: list(source_paths),
         segment_col: [
@@ -227,6 +258,11 @@ def build_manifest(
     segment_col: MappingSpec,
     rows: list[dict[MappingSpec, object]],
 ) -> pl.DataFrame:
+    """Build a manifest frame by grouping compatible segment rows.
+
+    Segment references and raw source paths are accumulated while row counts are
+    summed. The final frame is selected and cast according to `manifest_metadata`.
+    """
     if not rows:
         return pl.DataFrame(
             schema={str(column): column.dtype for column in manifest_metadata.columns},

@@ -41,6 +41,7 @@ class ProcessTaskResult[T]:
 
 
 def validate_stage_runtime_config(config: StageRuntimeConfig) -> None:
+    """Validate shared stage runtime and parquet size settings."""
     if config.n_jobs < -1 or config.n_jobs == 0:
         raise ValueError(f"n_jobs must be -1 or >= 1, got {config.n_jobs}")
     if config.worker_polars_max_threads is not None and config.worker_polars_max_threads < -1:
@@ -57,6 +58,7 @@ def validate_stage_runtime_config(config: StageRuntimeConfig) -> None:
 
 
 def available_cpu_count() -> int:
+    """Return available CPUs, respecting process CPU affinity when supported."""
     process_cpu_count = getattr(os, "process_cpu_count", None)
     if callable(process_cpu_count):
         return process_cpu_count() or 1
@@ -64,6 +66,11 @@ def available_cpu_count() -> int:
 
 
 def resolve_worker_count(n_jobs: int, task_count: int) -> int:
+    """Resolve requested `n_jobs` to an actual worker count.
+
+    `-1` means available CPUs minus one, `1` means sequential execution, and
+    positive values are capped by `task_count`.
+    """
     if task_count < 1:
         return 0
     if n_jobs == 1:
@@ -79,6 +86,11 @@ def resolve_worker_polars_max_threads(
     worker_polars_max_threads: int | None,
     worker_count: int,
 ) -> int | None:
+    """Resolve per-worker Polars thread limits for multiprocessing.
+
+    `None` leaves Polars unrestricted inside workers. `-1` divides available CPUs
+    across workers. Positive values are used directly.
+    """
     if worker_polars_max_threads is None:
         return None
     if worker_polars_max_threads > 0:
@@ -97,6 +109,7 @@ def iter_process_task_results[ArgT, ResultT](  # noqa: C901, PLR0912
     *,
     ordered: bool = True,
 ) -> Iterator[ProcessTaskResult[ResultT]]:
+    """Run process tasks sequentially or in a spawned process pool."""
     worker_count = resolve_worker_count(config.n_jobs, len(specs))
     if worker_count <= 1:
         _log_runtime_settings(
@@ -141,20 +154,27 @@ def iter_process_task_results[ArgT, ResultT](  # noqa: C901, PLR0912
 
         while future_to_index:
             done, _not_done = wait(future_to_index, return_when=FIRST_COMPLETED)
+            results_to_yield: list[ProcessTaskResult[ResultT]] = []
             for future in done:
                 future_to_index.pop(future)
                 result = cast("ProcessTaskResult[ResultT]", future.result())
                 if next_submit_idx < len(specs):
+                    if executor is None:
+                        raise RuntimeError("process pool is closed before all tasks are submitted")
                     spec = specs[next_submit_idx]
                     future_to_index[executor.submit(_run_task, worker, spec)] = spec.task_index
                     next_submit_idx += 1
                 if ordered:
                     pending_results[result.task_index] = result
                     while next_yield_idx in pending_results:
-                        yield pending_results.pop(next_yield_idx)
+                        results_to_yield.append(pending_results.pop(next_yield_idx))
                         next_yield_idx += 1
                 else:
-                    yield result
+                    results_to_yield.append(result)
+            if not future_to_index and executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+                executor = None
+            yield from results_to_yield
     except (GeneratorExit, KeyboardInterrupt):
         aborted = True
         if executor is not None:
@@ -162,7 +182,7 @@ def iter_process_task_results[ArgT, ResultT](  # noqa: C901, PLR0912
         raise
     finally:
         if not aborted and executor is not None:
-            executor.shutdown(wait=True)
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _log_runtime_settings(
@@ -211,6 +231,7 @@ def log_task_progress_if_due(
     force: bool = False,
     interval_s: float = _PROGRESS_TIME_INTERVAL_S,
 ) -> float:
+    """Log stage task progress when enough time has elapsed."""
     now = time.perf_counter()
     if not force and now - last_progress_at < interval_s:
         return last_progress_at
@@ -228,12 +249,14 @@ def log_task_progress_if_due(
 
 
 def init_process_worker(polars_max_threads: int | None) -> None:
+    """Initialize spawned workers with signal and Polars thread settings."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     if polars_max_threads is not None:
         os.environ["POLARS_MAX_THREADS"] = str(polars_max_threads)
 
 
 def abort_process_pool(executor: object) -> None:
+    """Terminate a process pool promptly after cancellation or interruption."""
     process_map = getattr(executor, "_processes", {}) or {}
     processes = (
         tuple(process_map.values()) if hasattr(process_map, "values") else tuple(process_map)

@@ -24,6 +24,7 @@ def validate_metadata_columns(
     *,
     context: str,
 ) -> None:
+    """Validate that required metadata layout columns are present."""
     available = set(columns)
     missing = [column for column in layout.columns if str(column) not in available]
     if missing:
@@ -31,6 +32,7 @@ def validate_metadata_columns(
 
 
 def stage_manifest_metadata(spec: DatasetSpec, stage_id: DatasetStageId) -> MetadataLayout:
+    """Return manifest metadata layout declared for a dataset stage."""
     stage_spec = spec.processing_stages.get(stage_id)
     manifest_metadata = getattr(stage_spec, "manifest_metadata", None)
     if not isinstance(manifest_metadata, MetadataLayout):
@@ -45,6 +47,13 @@ def stage_layout_with_protocol_metadata(
     manifest_extra: Iterable[MappingSpec] = (),
     footer_extra: Iterable[MappingSpec] = (),
 ) -> StageLayout:
+    """Expand stage metadata with protocol task keys and metadata extras.
+
+    Protocol task keys and manifest extras become optional manifest columns.
+    Protocol footer extras become optional footer metadata. Additional stage
+    extras are merged first so dataset-specific configuration can declare values
+    without duplicating protocol metadata.
+    """
     protocol_metadata = tuple(protocol_metadata)
     return layout.with_manifest(
         _new_optional_columns(
@@ -87,6 +96,7 @@ class GitState:
 
 
 def encode_footer_values(values: dict[MappingSpec, object | None]) -> dict[str, str]:
+    """Encode typed footer metadata values as parquet string metadata."""
     encoded = {}
     for key, value in values.items():
         if value is None:
@@ -101,6 +111,7 @@ def encode_footer_values(values: dict[MappingSpec, object | None]) -> dict[str, 
 
 
 def git_state() -> GitState:
+    """Return current git commit and dirty state for output footers."""
     git = shutil.which("git")
     if git is None:
         return GitState(commit="na", dirty="na")
@@ -192,6 +203,7 @@ def safe_name(value: object, max_len: int = 96) -> str:
 
 
 def group_task_id(protocol: str, group_values: Mapping[MappingSpec, object]) -> str:
+    """Build a stable task id from protocol and group metadata values."""
     suffix = "_".join(
         f"{safe_name(column)}-{safe_name(value)}" for column, value in group_values.items()
     )

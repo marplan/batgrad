@@ -15,7 +15,22 @@ _DATASETS: dict[str, Dataset] = {
 
 
 def get_dataset(dataset_id: DatasetId) -> Dataset:
-    """Get a registered dataset bundle by ID."""
+    """Get a registered dataset bundle by ID.
+
+    Args:
+        dataset_id: Dataset registry id, such as `"pozzato-2022"`.
+
+    Returns:
+        Registered dataset bundle with ingest and normalize helpers.
+
+    Raises:
+        ValueError: If the dataset id is unknown.
+
+    Examples:
+        >>> dataset = get_dataset("pozzato-2022")
+        >>> dataset.spec.dataset_id
+        'pozzato-2022'
+    """
     dataset = _DATASETS.get(dataset_id)
     if dataset is None:
         known = ", ".join(sorted(_DATASETS))

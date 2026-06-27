@@ -41,6 +41,8 @@ class StageRunConfig(Protocol):
 
 @dataclass(frozen=True)
 class StageOutputSpec:
+    """Resolved output-writing configuration for one processing stage."""
+
     dataset_spec: DatasetSpec
     stage_id: DatasetStageId
     output_root: str
@@ -54,6 +56,8 @@ class StageOutputSpec:
 
 @dataclass(frozen=True)
 class PreparedTable:
+    """Temporary parquet table produced by one stage task."""
+
     temp_path: str
     metadata: dict[MappingSpec, object]
     source_paths: tuple[str, ...]
@@ -61,6 +65,8 @@ class PreparedTable:
 
 @dataclass(frozen=True)
 class TaskOutput[TaskT]:
+    """Result payload returned by one stage task before final sharding."""
+
     task: TaskT
     tables: tuple[PreparedTable, ...]
     warnings: tuple[str, ...] = ()
@@ -70,12 +76,16 @@ class TaskOutput[TaskT]:
 
 @dataclass(frozen=True)
 class ConsumeStats:
+    """Rows and chunks consumed from prepared task tables."""
+
     chunks: int = 0
     rows: int = 0
 
 
 @dataclass(frozen=True)
 class StageRunStats:
+    """Aggregate task and row counts for a stage run."""
+
     succeeded: int = 0
     failed: int = 0
     warnings: int = 0
@@ -84,6 +94,7 @@ class StageRunStats:
 
 
 def stage_scratch_root(output_spec: StageOutputSpec) -> str:
+    """Return a unique scratch root under a stage output root."""
     value = f"{time.time_ns()}-{os.getpid()}-{output_spec.output_root}".encode()
     digest = hashlib.blake2s(value, digest_size=5).hexdigest()
     return f"{output_spec.output_root}/_tmp_{output_spec.stage_id}_{os.getpid():x}-{digest}"
@@ -94,11 +105,13 @@ def stage_temp_path(
     task_index: int,
     batch_index: int | None = None,
 ) -> str:
+    """Return the temporary parquet path for one task or task batch."""
     suffix = "" if batch_index is None else f"_batch-{batch_index:04d}"
     return f"{scratch_root}/task-{task_index:06d}{suffix}.parquet"
 
 
 def interactive_run_root(dataset_spec: DatasetSpec, stage_id: DatasetStageId) -> str:
+    """Return a unique scratch root for an interactive stage run."""
     value = f"{time.time_ns()}-{os.getpid()}".encode()
     digest = hashlib.blake2s(value, digest_size=5).hexdigest()
     run_id = f"{os.getpid():x}-{digest}"
@@ -106,6 +119,7 @@ def interactive_run_root(dataset_spec: DatasetSpec, stage_id: DatasetStageId) ->
 
 
 def validate_scratch_run_root(run_root: str) -> None:
+    """Validate that a path looks like a single scratch run before deletion."""
     parts = PurePosixPath(run_root).parts
     if "scratch" not in parts:
         raise ValueError(f"Refusing to clean non-scratch run: {run_root}")
@@ -119,6 +133,7 @@ def create_stage_writer(
     output_spec: StageOutputSpec,
     config: ShardWriteConfig,
 ) -> ShardWriter:
+    """Create the protocol-sharding writer used by ingest and normalize."""
     return ShardWriter(
         output_store=output_store,
         dataset_spec=output_spec.dataset_spec,
@@ -138,6 +153,7 @@ def protocol_spec_by_id[SpecT](
     protocol_specs: Sequence[SpecT],
     protocol: object,
 ) -> SpecT:
+    """Return a protocol spec whose `protocol_id` matches `protocol` as a string."""
     for spec in protocol_specs:
         protocol_id = getattr(spec, "protocol_id", None)
         if str(protocol_id) == str(protocol):
@@ -157,6 +173,7 @@ def stage_output_spec(
     segment_col: MappingSpec,
     source_paths_col: MappingSpec,
 ) -> StageOutputSpec:
+    """Construct a stage output spec from resolved dataset and metadata paths."""
     return StageOutputSpec(
         dataset_spec=dataset_spec,
         stage_id=stage_id,
@@ -177,6 +194,7 @@ def close_stage_writer(
     failed: int = 0,
     aborted: bool,
 ) -> None:
+    """Close the writer and choose whether to write, skip, or error the manifest."""
     manifest: Literal["write", "error", "skip"] = "error" if aborted or failed else "write"
     if succeeded == 0 and failed == 0:
         manifest = "skip"
@@ -195,6 +213,12 @@ def run_stage_task_outputs[TaskT](
     delete_output_root: bool = True,
     dry_run: bool = False,
 ) -> StageRunStats:
+    """Run stage tasks and consume their temporary tables into final shards.
+
+    This shared runner creates a scratch root, starts the shard writer, iterates
+    task results, appends successful task tables to final output, writes an error
+    manifest when tasks fail, and always cleans scratch files.
+    """
     scratch_root = stage_scratch_root(output_spec)
     if delete_output_root and not dry_run:
         output_store.delete_dir(output_spec.output_root, missing_ok=True)
@@ -314,6 +338,7 @@ def prepare_stage_scratch(
     *,
     dry_run: bool,
 ) -> None:
+    """Create scratch storage unless running in dry-run mode."""
     if not dry_run:
         scratch_store.create_dir(scratch_root)
 
@@ -324,6 +349,7 @@ def clean_stage_scratch(
     *,
     dry_run: bool,
 ) -> None:
+    """Delete scratch storage unless running in dry-run mode."""
     if not dry_run:
         scratch_store.delete_dir(scratch_root, missing_ok=True)
 
@@ -337,6 +363,7 @@ def iter_stage_task_results[TaskT, PayloadT, OutputT](
     config: StageRunConfig,
     ordered: bool = True,
 ) -> Iterator[ProcessTaskResult[OutputT]]:
+    """Build process task specs and yield worker results."""
     specs = tuple(
         ProcessTaskSpec(
             task_index=idx,
@@ -355,6 +382,18 @@ def consume_prepared_tables(
     chunk_rows: int,
     coalesce_rows: int | None = None,
 ) -> ConsumeStats:
+    """Append temporary task tables into final shards and delete them.
+
+    Args:
+        store: Store containing temporary parquet tables.
+        writer: Final shard writer.
+        tables: Prepared task tables.
+        chunk_rows: Rows read from each temporary table at a time.
+        coalesce_rows: Optional larger output batch size before appending.
+
+    Returns:
+        Number of chunks and rows appended to final output.
+    """
     chunks = rows = 0
     for table in tables:
         table_chunks = table_rows = 0
@@ -364,6 +403,7 @@ def consume_prepared_tables(
             writer.append(chunk, prepared.metadata, prepared.source_paths)
             table_chunks += 1
             table_rows += chunk.height
+
         try:
             table_frames = store.iter_table_chunks(table.temp_path, chunk_rows)
             if coalesce_rows is not None and coalesce_rows > chunk_rows:

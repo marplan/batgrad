@@ -34,12 +34,15 @@ def add_metadata_columns(
 
 @dataclass(frozen=True, slots=True)
 class ParquetSegment:
+    """Contiguous row slice inside a generated parquet file."""
+
     path: str
     row_start: int
     row_count: int
 
     @classmethod
     def from_value(cls, value: ParquetSegment | Mapping[Any, Any]) -> ParquetSegment:
+        """Normalize an existing segment or manifest segment mapping."""
         if isinstance(value, ParquetSegment):
             return value
         return cls(
@@ -49,6 +52,7 @@ class ParquetSegment:
         )
 
     def as_manifest_dict(self) -> dict[str, object]:
+        """Return this segment in manifest-compatible dictionary form."""
         return {
             str(BaseColumns.path): self.path,
             str(BaseColumns.row0): self.row_start,
@@ -61,6 +65,8 @@ type SegmentLike = ParquetSegment | Mapping[Any, Any]
 
 @dataclass(frozen=True, slots=True)
 class SegmentSource:
+    """Store plus segment list used to scan or chunk selected data."""
+
     store: DataProcessingStore
     segments: tuple[ParquetSegment, ...]
     row_count: int | None = None
@@ -73,6 +79,7 @@ class SegmentSource:
         *,
         row_count: int | None = None,
     ) -> SegmentSource:
+        """Build a segment source from manifest segment values."""
         normalized = normalize_segments(segments)
         return cls(
             store=store,
@@ -81,6 +88,7 @@ class SegmentSource:
         )
 
     def scan(self) -> pl.LazyFrame:
+        """Scan all referenced segments as one lazy frame."""
         return scan_segment_frames(self.store, self.segments)
 
     def iter_chunks(
@@ -89,14 +97,17 @@ class SegmentSource:
         *,
         columns: tuple[str, ...] | None = None,
     ) -> Iterator[pl.DataFrame]:
+        """Iterate referenced segments as dataframe chunks."""
         yield from iter_segment_frames(self.store, self.segments, chunk_rows, columns=columns)
 
 
 def normalize_segments(segments: tuple[SegmentLike, ...]) -> tuple[ParquetSegment, ...]:
+    """Normalize segment mappings to `ParquetSegment` objects."""
     return tuple(ParquetSegment.from_value(segment) for segment in segments)
 
 
 def segment_values(value: object) -> tuple[SegmentLike, ...]:
+    """Return manifest segment values as segment-like objects."""
     if not isinstance(value, list | tuple):
         return ()
     segments: list[SegmentLike] = []
@@ -116,6 +127,7 @@ def segment_row_count(segments: tuple[ParquetSegment, ...]) -> int:
 
 
 def segment_manifest_dicts(segments: tuple[ParquetSegment, ...]) -> tuple[dict[str, object], ...]:
+    """Return segments as manifest-compatible dictionaries."""
     return tuple(segment.as_manifest_dict() for segment in segments)
 
 
@@ -129,6 +141,7 @@ def add_metadata_columns(
     data: pl.DataFrame | pl.LazyFrame,
     metadata: dict[MappingSpec, object],
 ) -> pl.DataFrame | pl.LazyFrame:
+    """Add typed literal metadata columns to a dataframe or lazy frame."""
     return data.with_columns(
         pl.lit(value).cast(column.dtype).alias(column) for column, value in metadata.items()
     )
@@ -140,6 +153,7 @@ def select_and_cast_columns(
     *,
     resolved_columns: ResolvedColumns | None = None,
 ) -> pl.DataFrame | pl.LazyFrame:
+    """Select canonical mapping columns and cast them to declared dtypes."""
     available = set(frame_columns(data))
     return data.select(
         mapping_column_expr(column, available, resolved_columns=resolved_columns)
@@ -156,6 +170,7 @@ def mapping_column_exprs(
     skip_existing: bool = True,
     null_for_missing: bool = False,
 ) -> tuple[pl.Expr, ...]:
+    """Build expressions that resolve mapping aliases, metadata, or nulls."""
     available_set = set(available)
     produced = set(available_set)
     exprs: list[pl.Expr] = []
@@ -189,6 +204,7 @@ def mapping_column_expr(
     *,
     resolved_columns: ResolvedColumns | None = None,
 ) -> pl.Expr:
+    """Build one canonical output expression from available alias columns."""
     available_set = set(available)
     sources = (
         resolved_columns.get(column)
@@ -208,6 +224,7 @@ def mapping_column_expr(
 def mapping_column_sources(
     column: MappingSpec, available: set[str] | Sequence[str]
 ) -> tuple[str, ...]:
+    """Return available source columns matching a mapping spec's aliases."""
     available_set = set(available)
     return tuple(alias for alias in column.alias if alias in available_set)
 
@@ -221,6 +238,11 @@ def resolve_mapping_columns_for_segments(
     context: str,
     alias_count_chunk_rows: int = 500_000,
 ) -> tuple[tuple[str, ...], ResolvedColumns]:
+    """Resolve source columns needed to read requested mappings from segments.
+
+    The result lists physical input columns to scan and a mapping from canonical
+    specs to alias sources when the source differs from the canonical name.
+    """
     available = set(_scan_segments_schema(store, segments))
     del alias_count_chunk_rows
     input_columns: list[str] = []
@@ -242,6 +264,7 @@ def iter_segment_frames(
     chunk_rows: int,
     columns: tuple[str, ...] | None = None,
 ) -> Iterator[pl.DataFrame]:
+    """Iterate parquet segment slices as dataframe chunks."""
     for segment in normalize_segments(segments):
         if segment.row_count <= 0:
             continue
@@ -257,6 +280,7 @@ def scan_segment_frames(
     store: DataProcessingStore,
     segments: tuple[SegmentLike, ...],
 ) -> pl.LazyFrame:
+    """Scan parquet segment slices and concatenate them lazily."""
     frames = [
         store.scan_table(segment.path).slice(
             segment.row_start,
@@ -286,6 +310,7 @@ def consume_temp_table(
     on_chunk: Callable[[pl.DataFrame], None],
     delete: bool = True,
 ) -> None:
+    """Consume a temporary table by chunks and optionally delete it."""
     try:
         for chunk in store.iter_table_chunks(location, chunk_rows):
             on_chunk(chunk)
@@ -295,6 +320,7 @@ def consume_temp_table(
 
 
 def iter_data_chunks(data: pl.DataFrame, chunk_rows: int) -> Iterator[pl.DataFrame]:
+    """Yield non-empty chunks from an in-memory dataframe."""
     if data.height <= chunk_rows:
         if data.height > 0:
             yield data
@@ -309,6 +335,7 @@ def coalesce_frames(
     frames: Iterator[pl.DataFrame],
     chunk_rows: int,
 ) -> Iterator[pl.DataFrame]:
+    """Coalesce small frames into chunks with up to `chunk_rows` rows."""
     pending: list[pl.DataFrame] = []
     pending_rows = 0
     for frame in frames:

@@ -17,6 +17,8 @@ from batgrad.data.transforms.annotations import (
 )
 
 type CheckViolation = tuple[str, str]
+
+
 @dataclass
 class TimeCheckState:
     pending_tail: pl.DataFrame | None = None
@@ -33,6 +35,16 @@ type CheckState = TimeCheckState | DomainAxisCheckState | None
 
 @dataclass(frozen=True)
 class MissingCheckSpec:
+    """Annotate null or NaN numeric values.
+
+    If `columns` is omitted, all numeric columns present in the input frame are
+    checked. The check produces internal annotation columns that are finalized by
+    normalization when annotations are requested.
+
+    Attributes:
+        columns: Optional columns to check. Missing requested columns are ignored.
+    """
+
     columns: tuple[MappingSpec, ...] | None = None
 
     @property
@@ -86,6 +98,22 @@ class MissingCheckSpec:
 
 @dataclass(frozen=True)
 class TimeCheckSpec:
+    """Validate and rebuild a monotonically increasing task time axis.
+
+    The check computes `dt_col` from consecutive `time_col` differences, drops
+    duplicate or non-positive intervals, optionally flags large intervals, and
+    rebuilds time from cumulative `dt_col`. Full-task normalization applies the
+    diff within `group_by`; because this uses a forward interval, the final row
+    has no `dt_col` and is dropped. Bounded normalization carries a pending tail
+    row across chunks and may emit no rows until at least two rows are available.
+
+    Attributes:
+        time_col: Source time column.
+        dt_col: Output time-step column.
+        max_dt_s: Maximum allowed interval in seconds. Set to `None` to skip the
+            large time-step annotation.
+    """
+
     time_col: MappingSpec
     dt_col: MappingSpec
     max_dt_s: float | None = 86_400.0
@@ -105,15 +133,10 @@ class TimeCheckSpec:
             raise ValueError(f"No time column found. Expected {self.time_col!r}")
         group_columns = list(group_by)
         violations: list[CheckViolation] = []
-        data = data.with_columns(
-            pl.col(self.time_col)
-            .cast(pl.Float64)
-            .diff()
-            .shift(-1)
-            .over(group_columns)
-            .cast(pl.Float64)
-            .alias(self.dt_col),
-        )
+        dt_expr = pl.col(self.time_col).cast(pl.Float64).diff().shift(-1)
+        if group_columns:
+            dt_expr = dt_expr.over(group_columns)
+        data = data.with_columns(dt_expr.cast(pl.Float64).alias(self.dt_col))
         helper_cols: list[str] = []
         duplicate_col = "__duplicate_time_count"
         helper_cols.append(duplicate_col)
@@ -197,6 +220,16 @@ class TimeCheckSpec:
 
 @dataclass(frozen=True)
 class ColumnBoundsCheckSpec:
+    """Annotate numeric values outside configured inclusive bounds.
+
+    Bounds use `(lower, upper)` pairs. `None` disables one side. Values equal to
+    a bound are accepted; the check annotates values below `lower` or above
+    `upper` and never clips data.
+
+    Attributes:
+        bounds: Per-column `(lower, upper)` bounds.
+    """
+
     bounds: dict[MappingSpec, tuple[float | None, float | None]]
 
     @property
@@ -258,6 +291,13 @@ class ColumnBoundsCheckSpec:
 
 @dataclass(frozen=True)
 class ImpedanceComponentsCheckSpec:
+    """Ensure EIS data has both rectangular and polar impedance components.
+
+    Input must contain either `(z_real, z_imag)` or `(z_mag, z_phase)`. Missing
+    counterparts are derived from the available representation. Existing columns
+    are preserved by coalescing existing values before derived values.
+    """
+
     z_real: MappingSpec = BaseColumns.z_real
     z_imag: MappingSpec = BaseColumns.z_imag
     z_mag: MappingSpec = BaseColumns.z_mag
@@ -331,6 +371,21 @@ class ImpedanceComponentsCheckSpec:
 
 @dataclass(frozen=True)
 class DomainAxisCheckSpec:
+    """Annotate invalid domain-axis values within a task or group.
+
+    The axis is invalid when it is null, NaN, or not strictly increasing. Use
+    `zero_replacement` before validation for sources that encode the first EIS
+    frequency as zero. Set `enforce_positive` to also reject zero or negative
+    values after replacement. Bounded normalization carries the previous axis
+    value across chunks; the first row is not invalid only because it has no
+    previous value.
+
+    Attributes:
+        axis_col: Domain column to validate.
+        zero_replacement: Optional value used to replace zeros before checking.
+        enforce_positive: Whether to reject non-positive axis values.
+    """
+
     axis_col: MappingSpec
     zero_replacement: float | None = None
     enforce_positive: bool = False
@@ -349,7 +404,9 @@ class DomainAxisCheckSpec:
         if self.axis_col not in data.collect_schema():
             raise ValueError(f"Domain axis column {self.axis_col!r} is missing")
         data = self._apply_zero_replacement(data)
-        previous = pl.col(self.axis_col).diff().over(list(group_by))
+        previous = pl.col(self.axis_col).diff()
+        if group_by:
+            previous = previous.over(list(group_by))
         return _apply_or_validate_updates_lazy(
             data,
             [self._invalid_axis_update(previous)],
@@ -448,9 +505,10 @@ def rebuild_time_axis_lazy(
     dt_col: MappingSpec,
     group_by: tuple[MappingSpec, ...],
 ) -> pl.LazyFrame:
-    return data.with_columns(
-        (pl.col(dt_col).cum_sum().over(list(group_by)) - pl.col(dt_col)).alias(time_col),
-    )
+    cumulative = pl.col(dt_col).cum_sum()
+    if group_by:
+        cumulative = cumulative.over(list(group_by))
+    return data.with_columns((cumulative - pl.col(dt_col)).alias(time_col))
 
 
 def rebuild_time_axis_chunk(
@@ -472,6 +530,18 @@ def apply_checks_full_task(
     *,
     annotate: bool = True,
 ) -> tuple[pl.LazyFrame, tuple[CheckViolation, ...]]:
+    """Apply checks to a full lazy normalization task.
+
+    Args:
+        data: Task frame.
+        group_by: Columns that define independent time/domain groups.
+        checks: Checks to run in order.
+        annotate: When `True`, write annotation columns. When `False`, leave the
+            frame unchanged and return detected violations.
+
+    Returns:
+        Updated frame and unique `(column, reason)` violations.
+    """
     violations: list[CheckViolation] = []
     for check in checks:
         data, check_violations = check.apply_full(data, group_by, annotate=annotate)
@@ -486,6 +556,18 @@ def apply_checks_bounded_chunk(
     *,
     annotate: bool = True,
 ) -> tuple[pl.DataFrame, tuple[CheckViolation, ...]]:
+    """Apply checks to one bounded normalization chunk.
+
+    Args:
+        data: Chunk frame.
+        checks: Checks to run in order.
+        states: Mutable per-check state created with `CheckSpec.init_state`.
+        annotate: When `True`, write annotation columns. When `False`, return
+            detected violations for the chunk.
+
+    Returns:
+        Updated chunk and unique `(column, reason)` violations.
+    """
     violations: list[CheckViolation] = []
     for check, state in zip(checks, states, strict=True):
         data, check_violations = check.apply_chunk(data, state, annotate=annotate)

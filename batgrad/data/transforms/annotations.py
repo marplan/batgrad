@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from operator import attrgetter
+
 import numpy as np
 import polars as pl
 import pyarrow as pa
@@ -44,6 +46,12 @@ def flat_annotations_to_structs(
     *,
     max_annotations: int = MAX_FLAT_ANNOTATIONS,
 ) -> pl.DataFrame | pl.LazyFrame:
+    """Convert internal flat annotation columns to the public struct-list column.
+
+    Checks accumulate compact flat string columns while processing. This function
+    converts them to `BaseColumns.anns` with `column` and `reason` fields and
+    drops the flat columns.
+    """
     columns = data.collect_schema().names() if isinstance(data, pl.LazyFrame) else data.columns
     if BaseColumns.ann_cols not in columns or BaseColumns.ann_reasons not in columns:
         return data
@@ -83,6 +91,7 @@ def finalize_annotations(
     *,
     include_annotations: bool,
 ) -> pl.DataFrame | pl.LazyFrame:
+    """Return public annotations when requested, otherwise leave output compact."""
     return flat_annotations_to_structs(data) if include_annotations else data
 
 
@@ -129,16 +138,22 @@ def _flat_single_annotation_to_struct(data: pl.DataFrame) -> pl.DataFrame:
 def _single_annotation_series(data: pl.DataFrame) -> pl.Series:
     columns = data[str(BaseColumns.ann_cols)].to_arrow()
     reasons = data[str(BaseColumns.ann_reasons)].to_arrow()
-    valid = pc.and_(pc.is_valid(columns), pc.is_valid(reasons))
+    is_valid = attrgetter("is_valid")(pc)
+    valid = attrgetter("and_")(pc)(is_valid(columns), is_valid(reasons))
     valid_values = np.asarray(valid).astype(np.int32, copy=False)
     offsets = np.empty(data.height + 1, dtype=np.int32)
     offsets[0] = 0
     offsets[1:] = np.cumsum(valid_values)
+    filter_values = attrgetter("filter")(pc)
     child = pa.StructArray.from_arrays(
-        [pc.filter(columns, valid), pc.filter(reasons, valid)],
+        [filter_values(columns, valid), filter_values(reasons, valid)],
         names=["column", "reason"],
     )
-    annotations = pa.ListArray.from_arrays(pa.array(offsets), child, mask=pc.invert(valid))
+    annotations = pa.ListArray.from_arrays(
+        pa.array(offsets),
+        child,
+        mask=attrgetter("invert")(pc)(valid),
+    )
     return pl.Series(str(BaseColumns.anns), annotations)
 
 

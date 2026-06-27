@@ -20,6 +20,37 @@ TINY_DOWNSAMPLE_BUDGET = 2
 
 @dataclass(frozen=True)
 class MinMaxLTTBResamplingSpec:
+    """Downsample a task with MinMaxLTTB using one domain and one signal column.
+
+    `x_col` is the domain column used for ordering and point placement. `y_col`
+    is the signal whose shape should be preserved. Use either an absolute
+    `points` budget or a `points_ratio`; `min_points` is the lower bound after
+    the budget is resolved. If both `points` and `points_ratio` are set,
+    `points` takes precedence. Non-finite domain or signal rows are ignored for
+    sampling.
+
+    Bounded normalization uses the same spec without materializing the full task.
+    When physics compensation is enabled and `dt` plus current or C-rate are
+    available, bounded output rebuilds interval `dt`, time, and averaged signal
+    values for the selected rows. Physics compensation is bounded-only and
+    prefers C-rate over current when both are present.
+
+    Attributes:
+        x_col: Domain column used for sampling.
+        y_col: Signal column used by MinMaxLTTB to preserve shape.
+        points: Absolute number of output rows, if set.
+        points_ratio: Output row ratio relative to the input row count, if set.
+        min_points: Lower bound for the resolved output row budget.
+
+    Examples:
+        >>> MinMaxLTTBResamplingSpec(
+        ...     x_col=BaseColumns.time,
+        ...     y_col=BaseColumns.volt,
+        ...     points_ratio=0.1,
+        ... )
+        MinMaxLTTBResamplingSpec(...)
+    """
+
     x_col: MappingSpec
     y_col: MappingSpec
     points: int | None = None
@@ -30,9 +61,19 @@ class MinMaxLTTBResamplingSpec:
 
     @property
     def input_columns(self) -> tuple[MappingSpec, ...]:
+        """Columns required before this resampling step runs.
+
+        Returns:
+            Domain and signal columns used by MinMaxLTTB.
+        """
         return (self.x_col, self.y_col)
 
     def metadata_values(self) -> tuple[str, str]:
+        """Return method name and JSON parameters written to normalized metadata.
+
+        Returns:
+            Resampling method id and compact JSON argument string.
+        """
         params = {
             "x_col": str(self.x_col),
             "y_col": str(self.y_col),
@@ -133,8 +174,7 @@ class MinMaxLTTBResamplingSpec:
         )
         sample_columns = tuple(dict.fromkeys((row_id_col, self.x_col, self.y_col)))
         sampled_chunks = [
-            self._downsample_frame(chunk.select(sample_columns), chunk_budget)
-            for chunk in chunks()
+            self._downsample_frame(chunk.select(sample_columns), chunk_budget) for chunk in chunks()
         ]
         if not sampled_chunks:
             return np.array([], dtype=np.int64)
@@ -238,6 +278,30 @@ class MinMaxLTTBResamplingSpec:
 
 @dataclass(frozen=True)
 class LinearResamplingSpec:
+    """Resample rows onto a fixed domain grid with interpolation.
+
+    Numeric columns are interpolated against `x_col`; non-numeric columns are
+    carried from the nearest source row. This is used for protocols such as EIS,
+    where each task should have the same frequency grid. Linear resampling only
+    supports full-task execution. Non-finite domain rows are dropped, duplicate
+    domain values keep the last row, and explicit `value_range` may extrapolate
+    numeric columns beyond the source range.
+
+    Attributes:
+        x_col: Domain column used as the interpolation axis.
+        points: Number of target grid points.
+        scale: Grid spacing, either linear or logarithmic.
+        value_range: Optional explicit lower and upper x-axis range.
+
+    Examples:
+        >>> LinearResamplingSpec(
+        ...     x_col=BaseColumns.freq,
+        ...     points=48,
+        ...     scale="log",
+        ... )
+        LinearResamplingSpec(...)
+    """
+
     x_col: MappingSpec
     points: int
     scale: Literal["linear", "log"] = "linear"
@@ -247,9 +311,19 @@ class LinearResamplingSpec:
 
     @property
     def input_columns(self) -> tuple[MappingSpec, ...]:
+        """Columns required before this resampling step runs.
+
+        Returns:
+            Domain column used as the interpolation axis.
+        """
         return (self.x_col,)
 
     def metadata_values(self) -> tuple[str, str]:
+        """Return method name and JSON parameters written to normalized metadata.
+
+        Returns:
+            Resampling method id and compact JSON argument string.
+        """
         params = {
             "x_col": str(self.x_col),
             "points": self.points,
@@ -318,16 +392,27 @@ def run_resampling(
     *,
     apply_physics_compensation: bool = True,
 ) -> pl.DataFrame:
+    """Apply a resampling spec to a fully materialized frame."""
     return spec.apply_full(data, apply_physics_compensation=apply_physics_compensation)
 
 
 def resampling_metadata_values(spec: ResamplingSpec | None) -> tuple[str, str]:
+    """Return manifest metadata values for an optional resampling spec."""
     if spec is None:
         return "none", "{}"
     return spec.metadata_values()
 
 
 def resolve_min_max_lttb_budget(spec: MinMaxLTTBLikeSpec, row_count: int) -> int:
+    """Resolve MinMaxLTTB output rows from `points` or `points_ratio`.
+
+    Args:
+        spec: Resampling spec with `points`, `points_ratio`, and `min_points`.
+        row_count: Number of input rows.
+
+    Returns:
+        Output row budget capped by `row_count` and bounded by `min_points`.
+    """
     if spec.min_points < 1:
         raise ValueError(f"min_points must be >= 1, got {spec.min_points}")
     if spec.points is not None:
