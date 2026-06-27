@@ -14,6 +14,22 @@ from batgrad.contracts.metadata import (
 
 @dataclass(frozen=True, slots=True)
 class BatteryProtocolSpec:
+    """Canonical configuration for one battery protocol.
+
+    `axis_col` is the default domain column used for analysis and plots.
+    `metadata` defines protocol-specific task grouping and metadata additions.
+    `one_of_col_groups` lists alternative required column groups for protocols
+    that accept more than one representation, such as EIS impedance columns.
+
+    Attributes:
+        protocol_id: Canonical protocol label used in manifests, paths, and
+            dataset mappings.
+        axis_col: Default domain/x-axis column for analysis and plots.
+        metadata: Protocol-specific metadata extensions and task grouping keys.
+        one_of_col_groups: Alternative accepted required column groups. When set,
+            a dataset must provide at least one full group.
+    """
+
     protocol_id: DatasetProtocolId
     axis_col: MappingSpec
     metadata: ProtocolMetadata
@@ -21,6 +37,8 @@ class BatteryProtocolSpec:
 
 
 class BatteryProtocols:
+    """Shared protocol specs used by dataset configs and processing code."""
+
     cyc = BatteryProtocolSpec(
         protocol_id=DatasetProtocolId.cycling,
         axis_col=BaseColumns.time,

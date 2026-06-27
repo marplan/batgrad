@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 
 class MissingValues:
+    """Sentinel for mapping specs without declared fixed values."""
+
     __slots__ = ()
 
 
@@ -20,17 +22,23 @@ MISSING_VALUES = MissingValues()
 
 
 class DatasetStageId(StrEnum):
+    """Pipeline stage identifiers used in paths, specs, and manifests."""
+
     raw = "raw"
     ingested = "ingested"
     normalized = "normalized"
 
 
 class DatasetTypeId(StrEnum):
+    """Dataset origin labels used by dataset registry metadata."""
+
     published = "published"
     synthetic = "synthetic"
 
 
 class DatasetProtocolId(StrEnum):
+    """Canonical battery protocol labels used across processing stages."""
+
     cycling = "cycling"
     hppc = "HPPC"
     rpt = "RPT"
@@ -38,12 +46,16 @@ class DatasetProtocolId(StrEnum):
 
 
 class GitValues(NamedTuple):
+    """Fixed git state values written to metadata."""
+
     clean: Literal["clean"] = "clean"
     dirty: Literal["dirty"] = "dirty"
     na: Literal["na"] = "na"
 
 
 class CheckReasonValues(NamedTuple):
+    """Shared validation annotation reasons."""
+
     missing: Literal["missing"] = "missing"
     col_min: Literal["below column minimum"] = "below column minimum"
     col_max: Literal["above column maximum"] = "above column maximum"
@@ -53,15 +65,19 @@ class CheckReasonValues(NamedTuple):
 
 
 class SplitValues(NamedTuple):
+    """Shared split labels for train and validation partitions."""
+
     train: Literal["train"] = "train"
     val: Literal["val"] = "val"
 
 
 class MappingSpec[ValuesT](str):
-    """Canonical column mapping with dtype, aliases, and optional fixed values.
+    """Canonical column name with dtype, aliases, parser, and optional values.
 
-    The object is a string, so it can be used directly with dataframe APIs while still carrying
-    schema metadata for validation and discovery.
+    `MappingSpec` is a `str` subclass, so it can be passed directly to Polars
+    selectors and aliases while carrying schema metadata for validation and raw
+    column discovery. Common columns live in `BaseColumns`; dataset mapping
+    modules derive dataset-specific variants with aliases or parsers.
 
     Examples:
         >>> curr = MappingSpec("Current [A]", dtype=pl.Float64)
@@ -70,11 +86,15 @@ class MappingSpec[ValuesT](str):
         >>> curr.dtype
         Float64
 
-        >>> raw_time = MappingSpec("Time [s]", dtype=pl.Float64, alias=("Test Time", "time"))
-        >>> raw_time.matching_name(["test time"])
-        'test time'
+        >>> raw_time = BaseColumns.time.with_alias("Test_Time(s)", "Test Time (s)")
+        >>> raw_time.matching_name(["Test Time (s)"])
+        'Test Time (s)'
 
-        >>> git_status = MappingSpec("git commit", dtype=pl.String, values=GitValues())
+        >>> parsed_time = raw_time.with_parser(lambda col: pl.col(col).cast(pl.Float64))
+        >>> parsed_time.parser is not None
+        True
+
+        >>> git_status = BaseColumns.git_status
         >>> git_status.values.clean
         'clean'
     """
@@ -103,6 +123,16 @@ class MappingSpec[ValuesT](str):
         parser: Callable[[str], pl.Expr] | None = None,
         values: ValuesT | MissingValues = MISSING_VALUES,
     ) -> Self:
+        """Create a string column spec and attach schema metadata.
+
+        Args:
+            name: Canonical column name used in processed outputs.
+            dtype: Polars dtype stored for validation and schema construction.
+            alias: Additional raw/source column names that may map to `name`.
+            description: Optional human-readable column description.
+            parser: Optional expression factory for parsing a raw column.
+            values: Optional namespace of fixed values for this column.
+        """
         instance = cast("Self", super().__new__(cls, name))
 
         if alias is None:
@@ -120,6 +150,12 @@ class MappingSpec[ValuesT](str):
         return instance
 
     def __getnewargs_ex__(self) -> tuple[tuple[str], dict[str, object]]:
+        """Preserve mapping metadata when specs are pickled for workers.
+
+        Returns:
+            Positional and keyword constructor arguments used to recreate the
+            spec during unpickling.
+        """
         return (
             (str(self),),
             {
@@ -139,6 +175,15 @@ class MappingSpec[ValuesT](str):
         return dtype
 
     def with_alias(self, *alias: str) -> MappingSpec[ValuesT]:
+        """Return a copy with dataset-specific source column aliases.
+
+        Args:
+            alias: Raw/source column names that should match this canonical spec.
+
+        Returns:
+            A spec with the same canonical name and metadata, but the supplied
+            source aliases.
+        """
         return MappingSpec[ValuesT](
             str(self),
             dtype=self.dtype,
@@ -149,6 +194,16 @@ class MappingSpec[ValuesT](str):
         )
 
     def with_parser(self, parser: Callable[[str], pl.Expr]) -> MappingSpec[ValuesT]:
+        """Return a copy with a raw-column parser expression factory.
+
+        Args:
+            parser: Callable receiving the matched raw column name and returning
+                a Polars expression for the parsed canonical column.
+
+        Returns:
+            A spec with the same canonical name, aliases, and values, but the
+            supplied parser.
+        """
         return MappingSpec[ValuesT](
             str(self),
             dtype=self.dtype,
@@ -159,6 +214,15 @@ class MappingSpec[ValuesT](str):
         )
 
     def with_values[NewValuesT](self, values: NewValuesT) -> MappingSpec[NewValuesT]:
+        """Return a copy with fixed named values attached.
+
+        Args:
+            values: Namespace of allowed or conventional values for the column.
+
+        Returns:
+            A spec with the same canonical name, aliases, parser, and dtype, but
+            the supplied values namespace.
+        """
         return MappingSpec[NewValuesT](
             str(self),
             dtype=self.dtype,
@@ -170,11 +234,30 @@ class MappingSpec[ValuesT](str):
 
     @property
     def values(self) -> ValuesT:
+        """Fixed named values declared for this column.
+
+        Returns:
+            The values namespace attached to this spec.
+
+        Raises:
+            TypeError: If no values namespace was declared.
+        """
         if isinstance(self._values, MissingValues):
             raise TypeError(f"Column {self!r} has no values")
         return self._values
 
     def matching_name(self, columns: set[str] | tuple[str, ...] | list[str]) -> str | None:
+        """Return the first available column matching this spec or its aliases.
+
+        Args:
+            columns: Available column names to search. Matching is
+                case-insensitive and checks the canonical name first, followed by
+                aliases in declaration order.
+
+        Returns:
+            The original available column name when a match is found, otherwise
+            `None`.
+        """
         available = {column.casefold(): column for column in columns}
         for alias in self.alias:
             match = available.get(alias.casefold())
@@ -183,12 +266,27 @@ class MappingSpec[ValuesT](str):
         return None
 
     def has_match(self, columns: str | set[str] | tuple[str, ...] | list[str]) -> bool:
+        """Return whether any available column matches this spec or its aliases.
+
+        Args:
+            columns: One column name or a collection of available column names.
+
+        Returns:
+            `True` when `matching_name` would return a column name.
+        """
         if isinstance(columns, str):
             columns = (columns,)
         return self.matching_name(columns) is not None
 
 
 class BaseColumns:
+    """Namespace of canonical column specs reused across datasets and stages.
+
+    Add columns here when they are shared by processing stages, metadata layouts,
+    transforms, or multiple datasets. Dataset-specific raw names should usually be
+    attached with `MappingSpec.with_alias` in the dataset mapping module.
+    """
+
     set_id = MappingSpec("dataset id", dtype=pl.String, description="Source dataset identifier.")
     cell_id = MappingSpec(
         "cell id", dtype=pl.String, description="Cell identifier within a dataset."
