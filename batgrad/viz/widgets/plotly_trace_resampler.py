@@ -3,24 +3,26 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import anywidget
+import polars as pl
 import traitlets
 
+from batgrad.data.processing.io import collect_frame
 from batgrad.viz.viewport import (
     AnnotationSource,
     TraceSample,
     TraceSource,
     sample_annotation_viewport,
     sample_trace_viewport,
+    viewport_expr,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     import plotly.graph_objects as go
-    import polars as pl
 
     from batgrad.contracts.mapping import MappingSpec
     from batgrad.data.processing.io import SegmentSource
@@ -36,6 +38,7 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
     _fig_json = traitlets.Dict(default_value={}).tag(sync=True)
     _update = traitlets.Dict(default_value={}).tag(sync=True)
     _evt = traitlets.Dict(default_value={}).tag(sync=True)
+    selection = traitlets.Dict(default_value={}).tag(sync=True)
     _status = traitlets.Unicode(default_value="Ready").tag(sync=True)
     _height = traitlets.Int(default_value=600).tag(sync=True)
 
@@ -61,6 +64,7 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
 
         self._fig = fig
         self._sources: dict[int, TraceSource] = {}
+        self._inspection_sources: dict[int, TraceSource] = {}
         self._annotation_sources: dict[int, AnnotationSource] = {}
         self._trace_axes: dict[int, tuple[str, str]] = {}
         self._initial_samples: dict[int, TraceSample] = {}
@@ -89,6 +93,15 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
             Iterator[pl.DataFrame],
         ]
         | None = None,
+        inspection_lf: pl.LazyFrame | None = None,
+        inspection_segment_source: SegmentSource | None = None,
+        inspection_extra_exprs: tuple[pl.Expr, ...] | None = None,
+        inspection_row_count: int | None = None,
+        inspection_chunk_iter: Callable[
+            [TraceSource, tuple[float, float] | None, tuple[float, float] | None, int, str],
+            Iterator[pl.DataFrame],
+        ]
+        | None = None,
     ) -> None:
         if trace_idx < 0 or trace_idx >= len(self._fig.data):
             raise IndexError(f"trace_idx {trace_idx} is outside figure trace range")
@@ -103,6 +116,24 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
             extra_exprs=extra_exprs,
             row_count=row_count,
             chunk_iter=chunk_iter,
+        )
+        self._inspection_sources[trace_idx] = TraceSource(
+            trace_idx=trace_idx,
+            lf=lf if inspection_lf is None else inspection_lf,
+            x_col=x_col,
+            y_col=y_col,
+            resampling=resampling,
+            customdata_cols=customdata_cols,
+            segment_source=(
+                segment_source
+                if inspection_segment_source is None
+                else inspection_segment_source
+            ),
+            extra_exprs=(
+                extra_exprs if inspection_extra_exprs is None else inspection_extra_exprs
+            ),
+            row_count=row_count if inspection_row_count is None else inspection_row_count,
+            chunk_iter=chunk_iter if inspection_chunk_iter is None else inspection_chunk_iter,
         )
         self._trace_axes[trace_idx] = _trace_axis_keys(self._fig.data[trace_idx].to_plotly_json())
 
@@ -153,7 +184,80 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         self._fig_json = fig_json
         self._status = _status_text(samples)
         self._update = {"updates": [], "status": self._status, "_rid": 0}
+        self.selection = {}
         return self
+
+    def selected_data(  # noqa: C901, PLR0912
+        self,
+        *,
+        selection: Mapping[str, object] | None = None,
+        widget_index: int | None = None,
+        offset: int = 0,
+        limit: int = 100_000,
+    ) -> tuple[pl.DataFrame, int]:
+        del widget_index
+        if offset < 0:
+            raise ValueError(f"offset must be >= 0, got {offset}")
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+
+        selection_payload = self.selection if selection is None else selection
+        selected_traces = selection_payload.get("traces")
+        if not isinstance(selected_traces, list):
+            return pl.DataFrame(), 0
+
+        frames = []
+        total_rows = 0
+        remaining = limit
+        for selected_trace in selected_traces:
+            if remaining <= 0:
+                break
+            if not isinstance(selected_trace, Mapping):
+                continue
+            selected_trace_map = cast("Mapping[str, object]", selected_trace)
+            try:
+                trace_idx = int(cast("Any", selected_trace_map.get("trace_idx")))
+            except (TypeError, ValueError):
+                continue
+            source = self._inspection_sources.get(trace_idx, self._sources.get(trace_idx))
+            if source is None:
+                continue
+
+            lf = source.lf.with_row_index("data index")
+            if source.extra_exprs:
+                lf = lf.with_columns(source.extra_exprs)
+            expr = viewport_expr(
+                source.x_col,
+                source.y_col,
+                _numeric_range(selected_trace_map.get("x_range")),
+                _numeric_range(selected_trace_map.get("y_range")),
+            )
+            if expr is not None:
+                lf = lf.filter(expr)
+
+            columns = list(
+                dict.fromkeys((source.x_col, source.y_col, *source.customdata_cols))
+            )
+            lf = lf.select(
+                pl.lit(_figure_title(self._fig)).alias("widget title"),
+                pl.lit(_selected_trace_label(selected_trace_map, trace_idx)).alias("trace"),
+                pl.lit(str(source.x_col)).alias("x column"),
+                pl.lit(str(source.y_col)).alias("y column"),
+                "data index",
+                *columns,
+            )
+            trace_rows = int(collect_frame(lf.select(pl.len().alias("__n")))["__n"].item())
+            trace_offset = max(0, offset - total_rows)
+            if trace_offset < trace_rows:
+                frame = collect_frame(lf.slice(trace_offset, remaining))
+                if frame.height:
+                    frames.append(frame)
+                    remaining -= frame.height
+            total_rows += trace_rows
+
+        if not frames:
+            return pl.DataFrame(), total_rows
+        return pl.concat(frames, how="diagonal_relaxed"), total_rows
 
     def _on_evt(self, change: dict[str, Any]) -> None:
         evt = change.get("new")
@@ -263,6 +367,30 @@ def _axis_range(axis: object) -> tuple[float, float] | None:
     if axis_map.get("type") == "log":
         return math.pow(10.0, low), math.pow(10.0, high)
     return low, high
+
+
+def _numeric_range(value: object) -> tuple[float, float] | None:
+    if not isinstance(value, list | tuple) or len(value) < _AXIS_RANGE_VALUES:
+        return None
+    values = cast("tuple[Any, ...] | list[Any]", value)
+    try:
+        return float(values[0]), float(values[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _figure_title(fig: go.Figure) -> str:
+    title = getattr(getattr(fig, "layout", None), "title", None)
+    text = getattr(title, "text", None)
+    return str(text) if text else ""
+
+
+def _selected_trace_label(selected_trace: Mapping[str, object], trace_idx: int) -> str:
+    name = str(selected_trace.get("name") or trace_idx)
+    legendgroup = str(selected_trace.get("legendgroup") or "")
+    if name == "ingested" and legendgroup:
+        return f"ingested | {legendgroup}"
+    return name
 
 
 def _sample_payload(sample: TraceSample) -> dict[str, object]:

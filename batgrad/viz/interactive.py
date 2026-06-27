@@ -51,6 +51,7 @@ def make_widgets(
     cols: list[MappingSpec] | tuple[MappingSpec, ...],
     *,
     overlay_sources: tuple[DatasetStageId, ...] = (),
+    x_col: MappingSpec | None = None,
     max_points_per_trace: int = 1_000,
     max_points_per_figure: int = 100_000,
     max_batch_rows: int | None = 500_000,
@@ -74,6 +75,7 @@ def make_widgets(
                 protocol_entries,
                 overlay_entries=tuple(protocol_overlays),
                 cols=cols,
+                x_col=x_col,
                 max_points_per_trace=max_points_per_trace,
                 max_points_per_figure=max_points_per_figure,
                 max_batch_rows=max_batch_rows,
@@ -89,11 +91,13 @@ def make_timeseries_widget(
     *,
     overlay_entries: tuple[_OverlayEntry, ...] = (),
     cols: list[MappingSpec] | tuple[MappingSpec, ...],
+    x_col: MappingSpec | None,
     max_points_per_trace: int,
     max_points_per_figure: int,
     max_batch_rows: int | None,
 ) -> PlotlyTraceResampler | None:
-    y_cols = _timeseries_y_cols(entries, cols)
+    axis_col = x_col or entries[0].protocol_spec.protocol.axis_col
+    y_cols = [col for col in _timeseries_y_cols(entries, cols) if col != axis_col]
     if not y_cols:
         return None
 
@@ -101,11 +105,10 @@ def make_timeseries_widget(
     fig.update_layout(
         height=max(350, 240 * len(y_cols)),
         hovermode="closest",
+        paper_bgcolor="rgba(0,0,0,0)",
         title=_protocol_title_layout(entries),
     )
-    fig.update_xaxes(
-        title_text=str(entries[0].protocol_spec.protocol.axis_col), row=len(y_cols), col=1
-    )
+    fig.update_xaxes(title_text=str(axis_col), row=len(y_cols), col=1)
 
     widget = PlotlyTraceResampler(
         fig,
@@ -119,7 +122,6 @@ def make_timeseries_widget(
     shown_labels: set[str] = set()
     shown_overlay_labels: set[str] = set()
     for entry in entries:
-        axis_col = entry.protocol_spec.protocol.axis_col
         if axis_col not in entry.schema:
             continue
         label = _entry_label(entry)
@@ -175,7 +177,7 @@ def make_timeseries_widget(
                 overlay_source = _overlay_y_source(overlay.entry, output_y_col)
                 if overlay_source is None:
                     continue
-                hover_y_label = _raw_overlay_y_label(overlay_source, y_col)
+                hover_y_label = _ingested_overlay_y_label(overlay_source, y_col)
                 _add_ingested_overlay_trace(
                     fig,
                     widget,
@@ -187,9 +189,9 @@ def make_timeseries_widget(
                     hover_y_label=hover_y_label,
                     row=row_idx,
                     col=1,
-                    label="raw",
+                    label="ingested",
                     legendgroup=label,
-                    showlegend=_consume_showlegend("raw", shown_overlay_labels),
+                    showlegend=_consume_showlegend("ingested", shown_overlay_labels),
                     max_points_per_trace=max_points_per_trace,
                 )
             fig.update_yaxes(title_text=str(y_col), row=row_idx, col=1)
@@ -369,6 +371,7 @@ def make_eis_widget(
     fig.update_layout(
         height=650,
         hovermode="closest",
+        paper_bgcolor="rgba(0,0,0,0)",
         title=_protocol_title_layout(entries),
     )
     fig.update_xaxes(title_text=str(BaseColumns.z_real), row=1, col=1)
@@ -462,7 +465,7 @@ def make_eis_widget(
     return widget if fig.data else None
 
 
-def _raw_overlay_y_label(source_y_name: str, y_col: MappingSpec) -> str | None:
+def _ingested_overlay_y_label(source_y_name: str, y_col: MappingSpec) -> str | None:
     if source_y_name == str(y_col):
         return None
     return f"{y_col} | alias: {source_y_name}"

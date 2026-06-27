@@ -20,6 +20,74 @@ function visibleTraces(data) {
   return visible;
 }
 
+function numericRange(values) {
+  const numeric = values.map(Number).filter(Number.isFinite);
+  if (!numeric.length) return null;
+  return [Math.min(...numeric), Math.max(...numeric)];
+}
+
+function axisKey(axis) {
+  if (!axis || axis === "x" || axis === "y") return axis || "";
+  return axis.replace("axis", "");
+}
+
+function selectionAxisRange(evt, axis) {
+  const key = axisKey(axis);
+  const boxRange = evt?.range?.[key];
+  if (Array.isArray(boxRange) && boxRange.length >= 2) return numericRange(boxRange);
+  const lassoRange = evt?.lassoPoints?.[key];
+  if (Array.isArray(lassoRange) && lassoRange.length >= 2) return numericRange(lassoRange);
+  return null;
+}
+
+function selectionFromEvent(evt, data) {
+  const byTrace = new Map();
+  for (const point of evt?.points || []) {
+    const traceIdx = Number.isInteger(point?.curveNumber) ? point.curveNumber : null;
+    if (traceIdx === null) continue;
+    const current = byTrace.get(traceIdx) || { x: [], y: [], count: 0 };
+    current.x.push(point.x);
+    current.y.push(point.y);
+    current.count += 1;
+    byTrace.set(traceIdx, current);
+  }
+  const traces = [];
+  for (const [traceIdx, selected] of byTrace.entries()) {
+    const trace = data?.[traceIdx] || {};
+    const xaxis = trace.xaxis || "x";
+    const yaxis = trace.yaxis || "y";
+    const xRange = selectionAxisRange(evt, xaxis);
+    const yRange = selectionAxisRange(evt, yaxis);
+    if (!xRange || !yRange) continue;
+    traces.push({
+      trace_idx: traceIdx,
+      name: trace.name || `${traceIdx}`,
+      legendgroup: trace.legendgroup || "",
+      xaxis,
+      yaxis,
+      x_range: xRange,
+      y_range: yRange,
+      point_count: selected.count,
+    });
+  }
+  traces.sort((left, right) => left.trace_idx - right.trace_idx);
+  return { traces };
+}
+
+function mergeSelection(previous, next) {
+  const byTrace = new Map();
+  for (const selected of previous?.traces || []) {
+    if (!Number.isInteger(selected?.trace_idx)) continue;
+    byTrace.set(selected.trace_idx, selected);
+  }
+  for (const selected of next?.traces || []) {
+    if (!Number.isInteger(selected?.trace_idx)) continue;
+    byTrace.set(selected.trace_idx, selected);
+  }
+  const traces = [...byTrace.values()].sort((left, right) => left.trace_idx - right.trace_idx);
+  return { traces };
+}
+
 export default {
   async render({ model, el }) {
     const loadPlotly = () => {
@@ -53,6 +121,7 @@ export default {
     await Plotly.newPlot(plot, fig.data || [], fig.layout || {}, {
       responsive: true,
       scrollZoom: true,
+      displayModeBar: true,
     });
 
     let requestId = 0;
@@ -110,6 +179,19 @@ export default {
       if (update && Object.prototype.hasOwnProperty.call(update, "visible")) {
         emitViewport();
       }
+    });
+
+    plot.on("plotly_selected", evt => {
+      model.set(
+        "selection",
+        mergeSelection(model.get("selection"), selectionFromEvent(evt, plot.data)),
+      );
+      model.save_changes();
+    });
+
+    plot.on("plotly_deselect", () => {
+      model.set("selection", {});
+      model.save_changes();
     });
 
     const applyUpdate = update => {
