@@ -1,4 +1,4 @@
-# Dev Containers
+# Environment Setup
 
 Container work happens as `ubuntu`. `root` is only needed for provider bootstrapping
 or host-level fixes. `/usr/local/bin/container-init` prepares `/home/ubuntu`,
@@ -57,7 +57,7 @@ Vast.ai and RunPod use the same remote image layout and init logic. Build the pr
 target, start the instance, SSH as `ubuntu`, clone the repo, copy or mount data at
 `/data`, then run the shared setup.
 
-Build Vast.ai:
+### Vast.ai
 
 ```sh
 docker buildx build --platform linux/amd64 --target remote-vastai \
@@ -65,7 +65,7 @@ docker buildx build --platform linux/amd64 --target remote-vastai \
   -t marplan/batgrad:vastai --push .
 ```
 
-Build RunPod:
+### RunPod
 
 ```sh
 docker buildx build --platform linux/amd64 --target remote-runpod \
@@ -73,7 +73,7 @@ docker buildx build --platform linux/amd64 --target remote-runpod \
   -t marplan/batgrad:runpod --push .
 ```
 
-On the remote instance:
+## Remote Instance Setup
 
 ```sh
 ssh ubuntu@<host>
