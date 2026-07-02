@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from types import UnionType
@@ -38,17 +39,17 @@ class ScalingRuleConfig:
 
 @dataclass(frozen=True, slots=True)
 class DataConfig:
-    store_root: str
     manifest_paths: dict[str, str]
     protocols: tuple[str, ...]
     input_columns: tuple[str, ...]
     target_columns: tuple[str, ...]
+    store_root: str | None = None
     feedback_columns: tuple[str, ...] = ()
     scaling: tuple[ScalingRuleConfig, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.store_root.strip():
-            raise ValueError("data.store_root must not be empty")
+        if self.store_root is not None and not self.store_root.strip():
+            raise ValueError("data.store_root must not be empty when provided")
         if not self.manifest_paths:
             raise ValueError("data.manifest_paths must not be empty")
         if not self.protocols:
@@ -385,6 +386,13 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
     if not isinstance(raw, dict):
         raise TypeError("experiment config JSON must be an object")
     return _coerce_dataclass(ExperimentConfig, raw, "config")
+
+
+def resolve_store_root(configured: str | None) -> str:
+    value = configured if configured is not None else os.getenv("DATA_ROOT")
+    if value is None or not value.strip():
+        raise ValueError("data.store_root is missing and DATA_ROOT is not set")
+    return value
 
 
 def _coerce_dataclass[T](cls: type[T], raw: object, path: str) -> T:

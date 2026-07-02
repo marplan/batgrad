@@ -121,6 +121,7 @@ class SequenceMixerConfig:
     mlp_ratio: float = 4.0
     dropout: float = 0.0
     norm: Literal["rmsnorm"] = "rmsnorm"
+    causal_attention: bool = True
     num_bins: int = 64
     input_sigma: float = 0.0
     output_sigma: float = 0.0
@@ -171,14 +172,15 @@ class FeedForward(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+    def __init__(self, config: SequenceMixerConfig) -> None:
         super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.norm = nn.RMSNorm(d_model)
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out = nn.Linear(d_model, d_model, bias=False)
-        self.dropout = dropout
+        self.n_heads = config.n_heads
+        self.head_dim = config.d_model // config.n_heads
+        self.causal = config.causal_attention
+        self.norm = nn.RMSNorm(config.d_model)
+        self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
+        self.out = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.dropout = config.dropout
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         batch, seq_len, width = x.shape
@@ -186,15 +188,27 @@ class SelfAttention(nn.Module):
         q, k, v = qkv.unbind(dim=2)
         q, k, v = (item.transpose(1, 2) for item in (q, k, v))
         attn_mask = None
+        use_causal = self.causal
         if mask is not None:
-            valid = mask[:, None, None, :].to(dtype=torch.bool, device=x.device)
-            attn_mask = valid.expand(batch, self.n_heads, seq_len, seq_len)
+            valid = mask.to(dtype=torch.bool, device=x.device)
+            query_valid = valid[:, None, :, None]
+            key_valid = valid[:, None, None, :]
+            attn_mask = torch.logical_and(query_valid, key_valid).expand(
+                batch, self.n_heads, seq_len, seq_len
+            )
+            if self.causal:
+                causal_mask = torch.ones(
+                    (seq_len, seq_len), dtype=torch.bool, device=x.device
+                ).tril()
+                attn_mask = torch.logical_and(attn_mask, causal_mask.view(1, 1, seq_len, seq_len))
+                use_causal = False
         y = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
+            is_causal=use_causal,
         )
         return self.out(y.transpose(1, 2).reshape(batch, seq_len, width))
 
@@ -382,7 +396,7 @@ class SequenceMixer(nn.Module):
 
     def _build_layer(self, layer: LayerConfig, device: torch.device) -> nn.Module:
         if layer.kind == "attention":
-            return SelfAttention(self.config.d_model, self.config.n_heads, self.config.dropout)
+            return SelfAttention(self.config)
         if layer.kind == "ffn":
             return FeedForward(self.config.d_model, self.config.mlp_ratio, self.config.dropout)
         if layer.kind == "mamba":

@@ -1,8 +1,7 @@
 {
   "data": {
-    "store_root": "/data",
     "manifest_paths": {
-      "type=synthetic/dataset=synthetic-pozzato-2022-m50t/source=normalized/manifest.parquet": "1f5c354"
+      "type=published/dataset=pozzato-2022/source=normalized/manifest.parquet": "1f5c354"
     },
     "protocols": ["cycling"],
     "input_columns": [
@@ -12,7 +11,6 @@
     ],
     "target_columns": ["Terminal voltage [V]", "Surface temperature [degC]"],
     "feedback_columns": ["Terminal voltage [V]"],
-    "teacher_forced_columns": ["Time diff [s]", "Current [C-rate]"],
     "scaling": [
       {"column": "Time diff [s]", "input_min": 0.0, "input_max": 10000.0, "transform": "log1p"},
       {"column": "Current [C-rate]", "input_min": -6.0, "input_max": 6.0},
@@ -35,6 +33,7 @@
     "mlp_ratio": 4.0,
     "dropout": 0.0,
     "norm": "rmsnorm",
+    "causal_attention": true,
     "num_bins": 64,
     "input_sigma": 0.0,
     "output_sigma": 0.0,

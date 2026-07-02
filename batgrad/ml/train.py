@@ -15,6 +15,7 @@ from batgrad.ml.config import (
     ExperimentConfig,
     config_to_dict,
     load_experiment_config,
+    resolve_store_root,
 )
 from batgrad.ml.data.loader import MlDataIterable, create_dataloader
 from batgrad.ml.loggers import build_logger
@@ -45,7 +46,7 @@ def train_from_config(path: str | Path) -> Path | None:
 
     torch.manual_seed(config.seed)
     device = torch.device(config.run.device)
-    store = LocalDataProcessingStore(config.data.store_root)
+    store = LocalDataProcessingStore(resolve_store_root(config.data.store_root))
     train_loader, val_loader, train_dataset = _create_loaders(config, store)
     max_steps = config.train.max_steps or _max_steps_for_epochs(train_dataset, config.train.epochs)
     model: torch.nn.Module = SequenceMixer(
