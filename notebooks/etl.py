@@ -21,12 +21,11 @@ with app.setup:
         with_manifest_row_id,
     )
     from batgrad.logging import configure_logger
-    from batgrad.storage.local import LocalDataProcessingStore
+    from batgrad.notebook_helpers import make_plot_inspection_result, open_local_store_status
     from notebooks.etl_helpers import (
         EtlPlotResult,
         default_stage_widget_columns,
         make_controls,
-        make_inspection_result,
         run_submission,
         scratch_state as make_scratch_state,
         stage_plot_columns,
@@ -51,20 +50,15 @@ def _():
 
 @app.cell
 def _(store_root):
-    try:
-        input_store = LocalDataProcessingStore(store_root.value)
-    except (FileNotFoundError, NotADirectoryError, ValueError):
-        input_store = None
-    return (input_store,)
+    input_store, store_error = open_local_store_status(store_root.value)
+    return input_store, store_error
 
 
 @app.cell
-def _(dataset_id, input_store, store_root):
+def _(dataset_id, input_store, store_error, store_root):
     dataset = get_dataset(dataset_id.value)
     available_stages = (
-        available_manifest_stages(dataset.spec, input_store)
-        if input_store is not None
-        else ()
+        available_manifest_stages(dataset.spec, input_store) if input_store is not None else ()
     )
     available_stage_options = [str(stage) for stage in available_stages]
     stage_id = mo.ui.dropdown(
@@ -94,7 +88,8 @@ def _(dataset_id, input_store, store_root):
                 if available_stage_options
                 else [
                     mo.md(
-                        """No manifests found for this `Dataset/Store root`. Please check your
+                        store_error
+                        or """No manifests found for this `Dataset/Store root`. Please check your
                         `DATA_ROOT` in the **.env** file or manually enter a valid `Store root`."""
                     )
                 ]
@@ -161,7 +156,6 @@ def _(
     stage_x_columns,
 ):
     etl_controls = make_controls(
-        mo,
         manifest=manifest,
         selected_stage=selected_stage,
         interactive_normalization=interactive_normalization,
@@ -214,7 +208,6 @@ def _(
         EtlPlotResult()
         if input_store is None
         else run_submission(
-            mo,
             dataset=dataset,
             input_store=input_store,
             manifest=manifest,
@@ -235,8 +228,7 @@ def _(inspection_limit, inspection_offset, plot_result, sync_selection):
     _ = sync_selection.value
     _offset = int(inspection_offset.value or 0)
     _limit = int(inspection_limit.value or 100_000)
-    inspection_result = make_inspection_result(
-        mo,
+    inspection_result = make_plot_inspection_result(
         plot_widgets=plot_result.plot_widgets,
         offset=_offset,
         limit=_limit,
@@ -255,7 +247,6 @@ def _(dataset_controls_view, etl_controls, inspection_result, plot_view):
             inspection_result.view,
         ]
     ).style(gap="0")
-    return
 
 
 if __name__ == "__main__":

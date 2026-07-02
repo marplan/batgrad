@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, SupportsInt
+from typing import Any
 
+import marimo as mo
 import polars as pl
 
 from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId, DatasetStageId, MappingSpec
@@ -22,6 +23,11 @@ from batgrad.data.processing.normalize import (
     normalize_spec_with_resampling,
 )
 from batgrad.data.transforms.resampling import LinearResamplingSpec, MinMaxLTTBResamplingSpec
+from batgrad.notebook_helpers import (
+    make_selectable_table,
+    selected_row_ids_from_table,
+    wrap_anywidget_blocks,
+)
 from batgrad.storage.store import DataProcessingStore
 from batgrad.viz.interactive import make_widgets
 
@@ -93,23 +99,7 @@ class EtlControls:
 class EtlPlotResult:
     output: Any = None
     view: Any = None
-    run: Any = None
-    widgets: tuple[Any, ...] = ()
     plot_widgets: tuple[Any, ...] = ()
-    selected_manifest: pl.DataFrame | None = None
-    group_values: list[dict[MappingSpec, object]] | None = None
-    protocols: tuple[object, ...] = ()
-    status_text: str | None = None
-
-
-@dataclass(frozen=True)
-class EtlInspectionResult:
-    data: pl.DataFrame
-    table: Any
-    total_rows: int
-    offset: int
-    end: int
-    view: Any
 
 
 def scratch_state() -> dict[str, object]:
@@ -117,9 +107,7 @@ def scratch_state() -> dict[str, object]:
         "source_key": None,
         "source_run": None,
         "widget_run": None,
-        "plot_widgets": (),
         "widget_view": None,
-        "plot_result": EtlPlotResult(),
     }
 
 
@@ -133,9 +121,7 @@ def clear_committed_runs(state: dict[str, object]) -> None:
     state["source_key"] = None
     state["source_run"] = None
     state["widget_run"] = None
-    state["plot_widgets"] = ()
     state["widget_view"] = None
-    state["plot_result"] = EtlPlotResult()
 
 
 def stage_plot_columns(
@@ -205,31 +191,7 @@ def grouped_manifest(frame: pl.DataFrame) -> pl.DataFrame:
     return frame.group_by(*group_keys).agg(aggregations).sort(*group_keys)
 
 
-def selected_row_ids_from_table(value: object) -> tuple[int, ...]:
-    rows = _table_rows(value)
-    row_ids: list[int] = []
-
-    def extend_row_ids(values: object) -> None:
-        if values is None:
-            return
-        if isinstance(values, str):
-            row_ids.extend(int(row_id) for row_id in values.split(", ") if row_id)
-            return
-        if isinstance(values, Iterable):
-            row_ids.extend(_row_id(row_id) for row_id in values)
-            return
-        row_ids.append(_row_id(values))
-
-    for row in rows:
-        if MANIFEST_ROW_IDS_COLUMN in row:
-            extend_row_ids(row[MANIFEST_ROW_IDS_COLUMN])
-        elif MANIFEST_ROW_ID_COLUMN in row and row[MANIFEST_ROW_ID_COLUMN] is not None:
-            row_ids.append(_row_id(row[MANIFEST_ROW_ID_COLUMN]))
-    return tuple(row_ids)
-
-
 def make_controls(
-    mo: Any,
     *,
     manifest: pl.DataFrame,
     selected_stage: DatasetStageId | None,
@@ -244,15 +206,7 @@ def make_controls(
         grouped_manifest(manifest) if group_manifest.value and manifest.height else manifest
     )
     table_display = table_data.select(order_manifest_columns(table_data))
-    selection_table = mo.ui.table(
-        table_display,
-        selection="multi",
-        hidden_columns=[
-            column
-            for column in (MANIFEST_ROW_ID_COLUMN, MANIFEST_ROW_IDS_COLUMN)
-            if column in table_display.columns
-        ],
-    )
+    selection_table = make_selectable_table(table_display)
     effective_stage = (
         DatasetStageId.normalized
         if selected_stage == DatasetStageId.ingested and interactive_normalization.value
@@ -364,7 +318,6 @@ def make_controls(
 
 
 def run_submission(
-    mo: Any,
     *,
     dataset: Dataset,
     input_store: DataProcessingStore,
@@ -400,8 +353,6 @@ def run_submission(
         clear_committed_runs(state)
         return EtlPlotResult(
             output=mo.md("Selected manifest rows do not contain any protocols."),
-            selected_manifest=selected_manifest,
-            group_values=group_values,
         )
 
     protocols = selected_protocols
@@ -480,72 +431,14 @@ def run_submission(
         max_points_per_figure=100_000,
         max_batch_rows=500_000,
     )
-    plot_widgets = tuple(mo.ui.anywidget(widget.show()) for widget in widgets)
+    plot_widgets = wrap_anywidget_blocks(widgets)
     widget_view = mo.vstack(list(plot_widgets))
     result = EtlPlotResult(
         view=widget_view,
-        run=widget_run,
-        widgets=widgets,
         plot_widgets=plot_widgets,
-        selected_manifest=selected_manifest,
-        group_values=group_values,
-        protocols=protocols,
     )
-    state["plot_widgets"] = plot_widgets
     state["widget_view"] = widget_view
-    state["plot_result"] = result
     return result
-
-
-def make_inspection_result(
-    mo: Any,
-    *,
-    plot_widgets: tuple[Any, ...],
-    offset: int,
-    limit: int,
-    controls: tuple[Any, ...],
-) -> EtlInspectionResult:
-    frames = []
-    total_rows = 0
-    remaining = limit
-    plot_widget_values = tuple(plot_widget.value for plot_widget in plot_widgets)
-    for widget_index, (plot_widget, widget_value) in enumerate(
-        zip(plot_widgets, plot_widget_values, strict=True),
-    ):
-        selection = widget_value.get("selection", {})
-        if remaining <= 0:
-            frame, widget_rows = plot_widget.widget.selected_data(
-                selection=selection,
-                widget_index=widget_index,
-                offset=0,
-                limit=1,
-            )
-        else:
-            frame, widget_rows = plot_widget.widget.selected_data(
-                selection=selection,
-                widget_index=widget_index,
-                offset=max(0, offset - total_rows),
-                limit=remaining,
-            )
-        total_rows += widget_rows
-        if frame.height:
-            frames.append(frame)
-            remaining -= frame.height
-
-    data = pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
-    end = min(offset + data.height, total_rows)
-    table = mo.ui.table(data, selection=None)
-    view = mo.vstack(
-        [
-            mo.md("## Inspection").style(margin_top="1em"),
-            mo.hstack(list(controls), justify="start"),
-            mo.md(f"Rows `{offset:,}` to `{end:,}` of `{total_rows:,}` selected plot rows."),
-            table,
-        ]
-    )
-    return EtlInspectionResult(
-        data=data, table=table, total_rows=total_rows, offset=offset, end=end, view=view
-    )
 
 
 def etl_lttb_resampling(
@@ -618,23 +511,3 @@ def etl_source_cache_key(
             for selector in group_values
         ),
     )
-
-
-def _table_rows(value: object) -> list[dict[str, object]]:
-    if value is None:
-        return []
-    if isinstance(value, pl.DataFrame):
-        return list(value.iter_rows(named=True))
-    if isinstance(value, Iterable) and not isinstance(value, str):
-        return [
-            {str(key): item for key, item in row.items()}
-            for row in value
-            if isinstance(row, Mapping)
-        ]
-    return []
-
-
-def _row_id(value: object) -> int:
-    if isinstance(value, str | bytes | bytearray | SupportsInt):
-        return int(value)
-    raise TypeError(f"Expected row id to be int-like or string, got {type(value).__name__}")
