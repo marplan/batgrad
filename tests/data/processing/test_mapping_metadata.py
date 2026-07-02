@@ -41,7 +41,7 @@ def test_build_manifest_groups_rows_and_merges_segments() -> None:
     layout = MetadataLayout(
         required=(
             BaseColumns.raw_paths,
-            BaseColumns.parq_segs,
+            BaseColumns.ingest_segs,
             BaseColumns.row_n,
             BaseColumns.proto,
         ),
@@ -49,20 +49,20 @@ def test_build_manifest_groups_rows_and_merges_segments() -> None:
     rows = [
         {
             BaseColumns.raw_paths: ["a.csv"],
-            BaseColumns.parq_segs: [{"file path": "a.parquet", "row start": 0, "row count": 2}],
+            BaseColumns.ingest_segs: [{"file path": "a.parquet", "row start": 0, "row count": 2}],
             BaseColumns.row_n: 2,
             BaseColumns.proto: "cycling",
         },
         {
             BaseColumns.raw_paths: ["a.csv"],
-            BaseColumns.parq_segs: [{"file path": "b.parquet", "row start": 0, "row count": 3}],
+            BaseColumns.ingest_segs: [{"file path": "b.parquet", "row start": 0, "row count": 3}],
             BaseColumns.row_n: 3,
             BaseColumns.proto: "cycling",
         },
     ]
-    manifest = build_manifest(layout, BaseColumns.parq_segs, rows)
+    manifest = build_manifest(layout, BaseColumns.ingest_segs, rows)
     assert manifest.height == 1
     row = manifest.row(0, named=True)
     assert row[str(BaseColumns.row_n)] == 5
     assert row[str(BaseColumns.raw_paths)] == ["a.csv"]
-    assert len(row[str(BaseColumns.parq_segs)]) == 2
+    assert len(row[str(BaseColumns.ingest_segs)]) == 2

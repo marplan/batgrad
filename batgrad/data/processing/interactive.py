@@ -6,18 +6,14 @@ from typing import TYPE_CHECKING, Protocol, cast
 import polars as pl
 
 from batgrad.contracts.mapping import BaseColumns, DatasetStageId, MappingSpec
-from batgrad.data.processing.io import (
-    SegmentSource,
-    collect_frame,
-    scan_segment_frames,
-    segment_values,
-)
+from batgrad.contracts.segments import segment_values
 from batgrad.data.processing.selection import (
     StageSelection,
     all_group_columns,
     normalize_selector_values,
 )
 from batgrad.data.processing.stage import validate_scratch_run_root
+from batgrad.storage.segments import SegmentSource, collect_frame, scan_segment_frames
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -291,7 +287,7 @@ def stage_group_columns(stage_spec: InteractiveStageSpec) -> tuple[MappingSpec, 
 def _protocol_group_columns(spec: InteractiveProtocolSpec) -> tuple[MappingSpec, ...]:
     group_by = getattr(spec, "group_by", None)
     if group_by is None:
-        group_by = spec.protocol.metadata.task_key
+        group_by = spec.protocol.task_key
     return tuple(group_by)
 
 
@@ -304,7 +300,7 @@ def _stage_protocol_order(stage_spec: InteractiveStageSpec, protocols: object) -
 
 def _stage_segment_col(source: DatasetStageId) -> MappingSpec:
     if source == DatasetStageId.ingested:
-        return BaseColumns.parq_segs
+        return BaseColumns.ingest_segs
     if source == DatasetStageId.normalized:
         return BaseColumns.norm_segs
     raise ValueError(f"Stage {source!r} does not have interactive parquet segments")

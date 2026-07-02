@@ -51,6 +51,7 @@ def test_min_max_lttb_full_and_bounded_are_deterministic() -> None:
                 frame.slice(5, 5).with_columns(pl.Series("rid", np.arange(5, 10))),
             )
         )
+
     bounded = pl.concat(
         list(spec.apply_bounded(chunks, row_count=10, max_batch_rows=5, row_id_col="rid"))
     )

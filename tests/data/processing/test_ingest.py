@@ -8,7 +8,6 @@ import pytest
 
 from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId, DatasetStageId, MappingSpec
 from batgrad.contracts.protocols import BatteryProtocols
-from batgrad.data.processing.io import SegmentSource
 from batgrad.data.processing.raw import (
     IngestBatch,
     IngestProtocolSpec,
@@ -18,6 +17,7 @@ from batgrad.data.processing.raw import (
     run_ingest,
     validate_raw_batch_metadata,
 )
+from batgrad.storage.segments import SegmentSource
 from tests.fixtures import SyntheticAdapter, dataset_spec, raw_stage_spec, synthetic_raw_frame
 
 
@@ -131,7 +131,7 @@ def test_run_ingest_writes_expected_shard_data_and_footer_metadata(local_store) 
     manifest = local_store.scan_table(spec.manifest(DatasetStageId.ingested)).collect()
     segments = tuple(
         segment
-        for row_segments in manifest[str(BaseColumns.parq_segs)].to_list()
+        for row_segments in manifest[str(BaseColumns.ingest_segs)].to_list()
         for segment in row_segments
     )
     frame = SegmentSource.from_values(local_store, segments).scan().collect()
@@ -154,8 +154,9 @@ def test_run_ingest_writes_expected_shard_data_and_footer_metadata(local_store) 
     assert footer is not None
     assert footer[str(BaseColumns.set_id).encode()] == spec.dataset_id.encode()
     assert footer[str(BaseColumns.stage).encode()] == b"ingested"
-    assert footer[str(BaseColumns.manifest).encode()] == spec.manifest(
-        DatasetStageId.ingested
-    ).encode()
+    assert (
+        footer[str(BaseColumns.manifest).encode()]
+        == spec.manifest(DatasetStageId.ingested).encode()
+    )
     assert footer[str(BaseColumns.git_status).encode()] in {b"clean", b"dirty", b"na"}
     assert str(BaseColumns.git_commit).encode() in footer

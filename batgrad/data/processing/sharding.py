@@ -89,7 +89,7 @@ class ShardWriter:
         data: pl.DataFrame,
         metadata: dict[MappingSpec, object],
         source_paths: tuple[str, ...],
-    ) -> None:
+    ) -> dict[MappingSpec, object] | None:
         """Append a data chunk to its shard and record a manifest segment.
 
         Args:
@@ -99,7 +99,7 @@ class ShardWriter:
             source_paths: Raw source paths represented by the chunk.
         """
         if data.height == 0:
-            return
+            return None
         shard_key = str(metadata[self.shard_key_col])
         state = self._state_for_key(shard_key, data)
         for column in self.footer_metadata.columns:
@@ -111,19 +111,19 @@ class ShardWriter:
         row_start = state.row_count
         state.writer.write_table(data, row_group_size=self.config.row_group_size)
         state.row_count += data.height
-        self._manifest_rows.append(
-            manifest_row(
-                self.segment_col,
-                self.source_paths_col,
-                state.path,
-                row_start,
-                data.height,
-                source_paths,
-                metadata,
-            ),
+        row = manifest_row(
+            self.segment_col,
+            self.source_paths_col,
+            state.path,
+            row_start,
+            data.height,
+            source_paths,
+            metadata,
         )
+        self._manifest_rows.append(row)
         if self._should_roll(state):
             self._close_state(shard_key)
+        return row
 
     def close(self, *, manifest: Literal["write", "error", "skip"] = "write") -> None:
         """Close open shards and write, error-write, or skip the manifest.

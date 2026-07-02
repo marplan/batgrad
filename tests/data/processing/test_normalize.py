@@ -6,7 +6,6 @@ import polars as pl
 import pyarrow.parquet as pq
 
 from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId, DatasetStageId
-from batgrad.data.processing.io import SegmentSource
 from batgrad.data.processing.normalize import (
     NormalizeStageConfig,
     _task_metadata,
@@ -16,6 +15,7 @@ from batgrad.data.processing.normalize import (
 from batgrad.data.processing.raw import IngestBatch, IngestStageConfig, IngestTask, run_ingest
 from batgrad.data.transforms.checks import ColumnBoundsCheckSpec, MissingCheckSpec, TimeCheckSpec
 from batgrad.data.transforms.transforms import CRateTransformSpec
+from batgrad.storage.segments import SegmentSource
 from tests.fixtures import SyntheticAdapter, dataset_spec
 
 
@@ -138,9 +138,10 @@ def test_run_normalize_writes_footer_metadata(local_store) -> None:
     assert footer is not None
     assert footer[str(BaseColumns.set_id).encode()] == spec.dataset_id.encode()
     assert footer[str(BaseColumns.stage).encode()] == b"normalized"
-    assert footer[str(BaseColumns.manifest).encode()] == spec.manifest(
-        DatasetStageId.normalized
-    ).encode()
+    assert (
+        footer[str(BaseColumns.manifest).encode()]
+        == spec.manifest(DatasetStageId.normalized).encode()
+    )
     assert footer[str(BaseColumns.time_conv).encode()] == b"start_of_interval"
 
 
@@ -253,7 +254,7 @@ def test_normalize_resolves_alias_columns_and_constants(local_store) -> None:
         pl.DataFrame(
             {
                 str(BaseColumns.raw_paths): [["raw/a.csv"]],
-                str(BaseColumns.parq_segs): [
+                str(BaseColumns.ingest_segs): [
                     [
                         {
                             str(BaseColumns.path): "ingested/cycling/cycling_part-000000.parquet",
@@ -279,10 +280,14 @@ def test_normalize_resolves_alias_columns_and_constants(local_store) -> None:
         NormalizeStageConfig(chunk_rows=3, row_group_size=3, max_shard_size_bytes=0),
     )
     manifest = local_store.scan_table(spec.manifest(DatasetStageId.normalized)).collect()
-    frame = SegmentSource.from_values(
-        local_store,
-        tuple(manifest.row(0, named=True)[str(BaseColumns.norm_segs)]),
-    ).scan().collect()
+    frame = (
+        SegmentSource.from_values(
+            local_store,
+            tuple(manifest.row(0, named=True)[str(BaseColumns.norm_segs)]),
+        )
+        .scan()
+        .collect()
+    )
 
     assert frame[str(BaseColumns.curr)].to_list() == [1.0, 2.0]
     assert frame[str(BaseColumns.cap_nom)].to_list() == [2.0, 2.0]
@@ -306,7 +311,7 @@ def test_run_normalize_missing_required_input_writes_error_manifest(local_store)
         pl.DataFrame(
             {
                 str(BaseColumns.raw_paths): [["raw/a.csv"]],
-                str(BaseColumns.parq_segs): [
+                str(BaseColumns.ingest_segs): [
                     [
                         {
                             str(BaseColumns.path): "ingested/cycling/cycling_part-000000.parquet",
@@ -404,8 +409,10 @@ def test_plan_normalize_tasks_returns_no_tasks_for_unknown_protocol(local_store)
     )
     assert spec.manifest(DatasetStageId.normalized) in local_store.list_files()
 
-    bad = local_store.scan_table(spec.manifest(DatasetStageId.ingested)).collect().with_columns(
-        pl.lit("bad").alias(str(BaseColumns.proto))
+    bad = (
+        local_store.scan_table(spec.manifest(DatasetStageId.ingested))
+        .collect()
+        .with_columns(pl.lit("bad").alias(str(BaseColumns.proto)))
     )
     local_store.delete_file(spec.manifest(DatasetStageId.ingested))
     local_store.write_table(bad, spec.manifest(DatasetStageId.ingested))

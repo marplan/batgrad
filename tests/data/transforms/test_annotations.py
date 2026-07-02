@@ -20,9 +20,7 @@ def test_annotations_are_added_and_finalized_to_structs() -> None:
     finalized = finalize_annotations(annotated, include_annotations=True)
     assert str(BaseColumns.anns) in finalized.columns
     assert str(BaseColumns.ann_cols) not in finalized.columns
-    assert finalized[str(BaseColumns.anns)].to_list()[1] == [
-        {"column": "x", "reason": "missing"}
-    ]
+    assert finalized[str(BaseColumns.anns)].to_list()[1] == [{"column": "x", "reason": "missing"}]
 
 
 def test_finalize_annotations_can_be_disabled() -> None:

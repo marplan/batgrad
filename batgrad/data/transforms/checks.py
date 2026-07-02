@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, cast, overload
+from typing import Protocol, overload
 
 import numpy as np
 import polars as pl
@@ -600,7 +600,7 @@ def _apply_or_validate_updates_lazy(
         return data, ()
     if annotate:
         return add_annotations_lazy(ensure_annotation_columns_lazy(data), updates), ()
-    frame = cast("pl.DataFrame", data.select(_violation_exprs(updates)).collect())
+    frame = data.select(_violation_exprs(updates)).collect()
     row = frame.row(0, named=True)
     return data, _violations_from_row(row)
 

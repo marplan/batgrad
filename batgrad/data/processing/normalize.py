@@ -8,23 +8,19 @@ import polars as pl
 
 from batgrad.contracts.mapping import BaseColumns, DatasetStageId
 from batgrad.contracts.metadata import NORMALIZE_STAGE_METADATA, MetadataLayout
-from batgrad.data.processing.interactive import InteractiveStageRun
-from batgrad.data.processing.io import (
+from batgrad.contracts.segments import (
     ParquetSegment,
-    ResolvedColumns,
-    SegmentSource,
-    add_metadata_columns,
-    coalesce_frames,
-    collect_frame,
-    frame_columns,
-    iter_data_chunks,
-    iter_segment_frames,
-    mapping_column_exprs,
     normalize_segments,
-    resolve_mapping_columns_for_segments,
-    scan_segment_frames,
     segment_manifest_dicts,
     segment_values,
+)
+from batgrad.data.processing.interactive import InteractiveStageRun
+from batgrad.data.processing.io import (
+    ResolvedColumns,
+    add_metadata_columns,
+    frame_columns,
+    mapping_column_exprs,
+    resolve_mapping_columns_for_segments,
     select_and_cast_columns,
 )
 from batgrad.data.processing.metadata import (
@@ -57,7 +53,6 @@ from batgrad.data.processing.stage import (
     iter_stage_task_results,
     protocol_spec_by_id,
     run_stage_task_outputs,
-    stage_output_spec,
     stage_temp_path,
 )
 from batgrad.data.transforms.annotations import finalize_annotations
@@ -72,6 +67,14 @@ from batgrad.data.transforms.resampling import (
     run_resampling,
 )
 from batgrad.logging import get_logger
+from batgrad.storage.chunks import iter_data_chunks
+from batgrad.storage.segments import (
+    SegmentSource,
+    coalesce_frames,
+    collect_frame,
+    iter_segment_frames,
+    scan_segment_frames,
+)
 
 logger = get_logger(__name__)
 _DOWNSAMPLE_ROW_ID = "__normalize_downsample_row_id"
@@ -209,7 +212,7 @@ class NormalizeProtocolSpec:
     @property
     def group_by(self) -> tuple[MappingSpec, ...]:
         """Task grouping columns inherited from protocol metadata."""
-        return self.protocol.metadata.task_key
+        return self.protocol.task_key
 
     @property
     def output_columns(self) -> tuple[MappingSpec, ...]:
@@ -315,10 +318,10 @@ class NormalizeStageSpec:
     def _expanded_metadata(self) -> StageLayout:
         return stage_layout_with_protocol_metadata(
             self.metadata,
-            (spec.protocol.metadata for spec in self.protocol_specs),
+            (spec.protocol for spec in self.protocol_specs),
             manifest_extra=(
                 BaseColumns.raw_paths,
-                BaseColumns.parq_segs,
+                BaseColumns.ingest_segs,
                 BaseColumns.resamp,
                 BaseColumns.resamp_args,
                 BaseColumns.time_conv,
@@ -379,7 +382,7 @@ class NormalizeStageSpec:
             BaseColumns.set_id: dataset_id,
             BaseColumns.proto: task.protocol_id,
             BaseColumns.raw_paths: list(task.raw_paths),
-            BaseColumns.parq_segs: list(segment_manifest_dicts(task.parquet_segments)),
+            BaseColumns.ingest_segs: list(segment_manifest_dicts(task.parquet_segments)),
             BaseColumns.time_conv: self.time_convention,
             **task.group_values,
         }
@@ -403,7 +406,7 @@ class NormalizeStageSpec:
         """
         output_root = output_root or dataset_spec.source_root(self.metadata.stage_id)
         manifest_path = manifest_path or dataset_spec.manifest(self.metadata.stage_id)
-        return stage_output_spec(
+        return StageOutputSpec(
             dataset_spec=dataset_spec,
             stage_id=self.metadata.stage_id,
             output_root=output_root,
@@ -600,18 +603,17 @@ def run_normalize_interactive(
             group_values=group_values,
             annotate=annotate,
         )
-    tasks = _select_interactive_tasks(
-        plan_normalize_tasks(
-            dataset_spec,
-            input_store,
-            normalize_spec,
-            protocols=protocols,
-            group_values=group_values,
-        ),
+    tasks = plan_normalize_tasks(
+        dataset_spec,
+        input_store,
         normalize_spec,
-        protocols,
-        group_values,
+        protocols=protocols,
+        group_values=group_values,
     )
+    if not tasks:
+        raise ValueError(
+            f"No normalize task matched protocols={protocols!r} group_values={group_values!r}",
+        )
     run_root = interactive_run_root(dataset_spec, normalize_spec.metadata.stage_id)
     manifest_path = f"{run_root}/manifest.parquet"
     _run_normalize_to_root(
@@ -716,6 +718,8 @@ def _run_normalize_direct_to_root(
             try:
                 context = _normalize_task_context(task, input_store, normalize_spec)
                 task_rows = 0
+                task_stats: dict[str, tuple[float, float]] = {}
+                task_manifest_rows: list[dict[MappingSpec, object]] = []
                 metadata = _task_metadata(dataset_spec.dataset_id, normalize_spec, task, config)
                 for chunk in coalesce_frames(
                     _iter_task_output_chunks(
@@ -730,8 +734,14 @@ def _run_normalize_direct_to_root(
                 ):
                     if chunk.height == 0:
                         continue
-                    writer.append(chunk, metadata, task.raw_paths)
+                    _update_normalized_stats(task_stats, chunk)
+                    row = writer.append(chunk, metadata, task.raw_paths)
+                    if row is not None:
+                        task_manifest_rows.append(row)
                     task_rows += chunk.height
+                stats_value = _normalized_stats_value(task_stats)
+                for row in task_manifest_rows:
+                    row[BaseColumns.norm_stats] = stats_value
                 if task_rows == 0:
                     logger.warning(
                         "%s task produced no rows task_id=%s",
@@ -842,6 +852,8 @@ def _run_source_run_resampling_to_root(
             task = _source_manifest_row_task(row, protocol_spec)
             metadata = _task_metadata(dataset_spec.dataset_id, normalize_spec, task, config)
             task_rows = 0
+            task_stats: dict[str, tuple[float, float]] = {}
+            task_manifest_rows: list[dict[MappingSpec, object]] = []
             for chunk in coalesce_frames(
                 _iter_source_run_output_chunks(
                     source_run,
@@ -854,8 +866,14 @@ def _run_source_run_resampling_to_root(
             ):
                 if chunk.height == 0:
                     continue
-                writer.append(chunk, metadata, task.raw_paths)
+                _update_normalized_stats(task_stats, chunk)
+                manifest_row = writer.append(chunk, metadata, task.raw_paths)
+                if manifest_row is not None:
+                    task_manifest_rows.append(manifest_row)
                 task_rows += chunk.height
+            stats_value = _normalized_stats_value(task_stats)
+            for manifest_row in task_manifest_rows:
+                manifest_row[BaseColumns.norm_stats] = stats_value
             rows += task_rows
     except BaseException:
         aborted = True
@@ -1013,7 +1031,7 @@ def plan_normalize_tasks(
         for group_key, rows in groups.items():
             group_values = dict(zip(protocol_spec.group_by, group_key, strict=True))
             parquet_segments = normalize_segments(
-                merge_manifest_segments(rows, BaseColumns.parq_segs)
+                merge_manifest_segments(rows, BaseColumns.ingest_segs)
             )
             tasks.append(
                 NormalizeTask(
@@ -1107,6 +1125,46 @@ def _process_normalize_task(payload: _NormalizeWorkerPayload) -> TaskOutput[Norm
     )
 
 
+def _update_normalized_stats(
+    stats: dict[str, tuple[float, float]],
+    frame: pl.DataFrame,
+) -> None:
+    numeric_columns = tuple(
+        column
+        for column, dtype in frame.schema.items()
+        if _is_stats_numeric_dtype(dtype) and column != _DOWNSAMPLE_ROW_ID
+    )
+    if not numeric_columns:
+        return
+    observed = frame.select(
+        *(pl.col(column).min().alias(f"{column}__min") for column in numeric_columns),
+        *(pl.col(column).max().alias(f"{column}__max") for column in numeric_columns),
+    ).row(0, named=True)
+    for column in numeric_columns:
+        min_value = observed[f"{column}__min"]
+        max_value = observed[f"{column}__max"]
+        if min_value is None or max_value is None:
+            continue
+        current = stats.get(column)
+        next_min = float(min_value)
+        next_max = float(max_value)
+        stats[column] = (
+            next_min if current is None else min(current[0], next_min),
+            next_max if current is None else max(current[1], next_max),
+        )
+
+
+def _normalized_stats_value(stats: dict[str, tuple[float, float]]) -> list[dict[str, object]]:
+    return [
+        {"column": column, "min": values[0], "max": values[1]}
+        for column, values in sorted(stats.items())
+    ]
+
+
+def _is_stats_numeric_dtype(dtype: pl.DataType) -> bool:
+    return dtype.is_numeric() and dtype != pl.Boolean
+
+
 def _iter_normalize_task_results(
     dataset_spec: DatasetSpec,
     input_store: DataProcessingStore,
@@ -1164,6 +1222,7 @@ def _process_normalize_task_output(
     temp_path = stage_temp_path(scratch_root, task_index)
     writer = None
     rows_written = 0
+    stats: dict[str, tuple[float, float]] = {}
     try:
         for chunk in _iter_task_output_chunks(
             context,
@@ -1180,6 +1239,7 @@ def _process_normalize_task_output(
                     config.compression,
                     use_content_defined_chunking=config.use_content_defined_chunking,
                 )
+            _update_normalized_stats(stats, chunk)
             writer.write_table(chunk, row_group_size=config.row_group_size)
             rows_written += chunk.height
     finally:
@@ -1188,12 +1248,14 @@ def _process_normalize_task_output(
     if rows_written == 0:
         scratch_store.delete_file(temp_path, missing_ok=True)
         return TaskOutput(task=task, tables=())
+    metadata = _task_metadata(dataset_spec.dataset_id, normalize_spec, task, config)
+    metadata[BaseColumns.norm_stats] = _normalized_stats_value(stats)
     return TaskOutput(
         task=task,
         tables=(
             PreparedTable(
                 temp_path=temp_path,
-                metadata=_task_metadata(dataset_spec.dataset_id, normalize_spec, task, config),
+                metadata=metadata,
                 source_paths=task.raw_paths,
             ),
         ),
@@ -1237,6 +1299,7 @@ def _task_input_resolution(
         requested,
         protocol_spec.required_input_columns,
         context=f"Normalize task {task.task_id!r} raw shards",
+        one_of_col_groups=protocol_spec.protocol.one_of_col_groups,
     )
     _log_coalesced_aliases(task, resolved_columns)
     return input_columns, resolved_columns
@@ -1483,7 +1546,7 @@ def _output_resolved_columns(resolved_columns: ResolvedColumns) -> ResolvedColum
     return {
         column: sources
         for column, sources in resolved_columns.items()
-        if column not in (BaseColumns.ann_cols, BaseColumns.ann_reasons)
+        if sources is not None and column not in (BaseColumns.ann_cols, BaseColumns.ann_reasons)
     }
 
 
@@ -1576,6 +1639,12 @@ def _iter_task_resampling_bounded_chunks(
             chunk_rows,
         )
 
+    # TODO: Avoid this second bounded pass if it becomes a bottleneck. The
+    # current annotate=False path is correct and avoids scratch IO, but it
+    # replays the checked stream once to count rows before bounded resampling.
+    # Fix either by materializing checked chunks to scratch parquet, or by
+    # teaching bounded resampling to own row counting for replayable streams.
+    # Do not fix by collecting all chunks in memory.
     rows_in = sum(chunk.height for chunk in checked_chunks())
     if rows_in == 0:
         return
@@ -1735,26 +1804,6 @@ def _task_metadata(
     values[BaseColumns.resamp] = method
     values[BaseColumns.resamp_args] = params
     return values
-
-
-def _select_interactive_tasks(
-    tasks: tuple[NormalizeTask, ...],
-    normalize_spec: NormalizeStageSpec,
-    protocols: object,
-    group_values: object,
-) -> tuple[NormalizeTask, ...]:
-    selection = _normalize_selection(normalize_spec, protocols, group_values)
-    matches = tuple(
-        task
-        for task in tasks
-        if selection.matches_protocol(task.protocol_id)
-        and selection.matches_group_values(task.group_values)
-    )
-    if not matches:
-        raise ValueError(
-            f"No normalize task matched protocols={protocols!r} group_values={group_values!r}",
-        )
-    return matches
 
 
 def _normalize_selection(

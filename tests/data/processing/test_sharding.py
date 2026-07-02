@@ -20,7 +20,7 @@ class ShardConfig:
 
 def test_manifest_row_records_segment_and_sources() -> None:
     row = manifest_row(
-        BaseColumns.parq_segs,
+        BaseColumns.ingest_segs,
         BaseColumns.raw_paths,
         "out/a.parquet",
         2,
@@ -29,7 +29,7 @@ def test_manifest_row_records_segment_and_sources() -> None:
         {BaseColumns.proto: "cycling"},
     )
     assert row[BaseColumns.raw_paths] == ["a.csv"]
-    assert row[BaseColumns.parq_segs] == [
+    assert row[BaseColumns.ingest_segs] == [
         {"file path": "out/a.parquet", "row start": 2, "row count": 3}
     ]
     assert row[BaseColumns.row_n] == 3
@@ -46,7 +46,7 @@ def test_shard_writer_rolls_over_and_writes_manifest(local_store) -> None:
         manifest_metadata=INGEST_STAGE_METADATA.manifest,
         footer_metadata=INGEST_STAGE_METADATA.footer,
         shard_key_col=BaseColumns.proto,
-        segment_col=BaseColumns.parq_segs,
+        segment_col=BaseColumns.ingest_segs,
         source_paths_col=BaseColumns.raw_paths,
         config=ShardConfig(),
     )
@@ -66,7 +66,7 @@ def test_shard_writer_rolls_over_and_writes_manifest(local_store) -> None:
     assert manifest[str(BaseColumns.row_n)].sum() == 5
     cycling = manifest.filter(pl.col(BaseColumns.proto) == "cycling").row(0, named=True)
     assert cycling[str(BaseColumns.raw_paths)] == ["a.csv"]
-    assert len(cycling[str(BaseColumns.parq_segs)]) == 2
+    assert len(cycling[str(BaseColumns.ingest_segs)]) == 2
 
 
 def test_shard_writer_error_and_skip_manifest(local_store) -> None:
@@ -81,7 +81,7 @@ def test_shard_writer_error_and_skip_manifest(local_store) -> None:
             manifest_metadata=INGEST_STAGE_METADATA.manifest,
             footer_metadata=INGEST_STAGE_METADATA.footer,
             shard_key_col=BaseColumns.proto,
-            segment_col=BaseColumns.parq_segs,
+            segment_col=BaseColumns.ingest_segs,
             source_paths_col=BaseColumns.raw_paths,
             config=ShardConfig(max_shard_size_bytes=0),
         )

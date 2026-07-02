@@ -7,7 +7,7 @@ import pytest
 from batgrad.contracts.mapping import BaseColumns, DatasetStageId
 from batgrad.contracts.metadata import INGEST_STAGE_METADATA
 from batgrad.data.processing.runtime import ProcessTaskResult
-from batgrad.data.processing.stage import TaskOutput, run_stage_task_outputs, stage_output_spec
+from batgrad.data.processing.stage import StageOutputSpec, TaskOutput, run_stage_task_outputs
 from tests.fixtures import dataset_spec
 
 
@@ -35,7 +35,7 @@ class Logger:
 
 def test_run_stage_task_outputs_writes_error_manifest_and_cleans_scratch(local_store) -> None:
     spec = dataset_spec()
-    output_spec = stage_output_spec(
+    output_spec = StageOutputSpec(
         dataset_spec=spec,
         stage_id=DatasetStageId.ingested,
         output_root="stage-out",
@@ -43,7 +43,7 @@ def test_run_stage_task_outputs_writes_error_manifest_and_cleans_scratch(local_s
         manifest_metadata=INGEST_STAGE_METADATA.manifest,
         footer_metadata=INGEST_STAGE_METADATA.footer,
         shard_key_col=BaseColumns.proto,
-        segment_col=BaseColumns.parq_segs,
+        segment_col=BaseColumns.ingest_segs,
         source_paths_col=BaseColumns.raw_paths,
     )
 
@@ -68,7 +68,7 @@ def test_run_stage_task_outputs_writes_error_manifest_and_cleans_scratch(local_s
 
 def test_run_stage_task_outputs_cleans_scratch_on_interrupt(local_store) -> None:
     spec = dataset_spec()
-    output_spec = stage_output_spec(
+    output_spec = StageOutputSpec(
         dataset_spec=spec,
         stage_id=DatasetStageId.ingested,
         output_root="stage-interrupt",
@@ -76,7 +76,7 @@ def test_run_stage_task_outputs_cleans_scratch_on_interrupt(local_store) -> None
         manifest_metadata=INGEST_STAGE_METADATA.manifest,
         footer_metadata=INGEST_STAGE_METADATA.footer,
         shard_key_col=BaseColumns.proto,
-        segment_col=BaseColumns.parq_segs,
+        segment_col=BaseColumns.ingest_segs,
         source_paths_col=BaseColumns.raw_paths,
     )
 
