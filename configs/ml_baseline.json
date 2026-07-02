@@ -1,0 +1,156 @@
+{
+  "data": {
+    "store_root": "/data/loc_datasets",
+    "manifest_paths": {
+      "type=published/dataset=pozzato-2022/source=normalized/manifest.parquet": "1f5c354"
+    },
+    "protocols": ["cycling"],
+    "input_columns": [
+      "Time diff [s]",
+      "Current [C-rate]",
+      "Terminal voltage [V]",
+      "Surface temperature [degC]",
+      "Ambient temperature [degC]"
+    ],
+    "target_columns": ["Terminal voltage [V]", "Surface temperature [degC]"],
+    "feedback_columns": ["Terminal voltage [V]", "Surface temperature [degC]"],
+    "teacher_forced_columns": ["Time diff [s]", "Current [C-rate]", "Ambient temperature [degC]"],
+    "scaling": [
+      {"column": "Time diff [s]", "input_min": 0.0, "input_max": 10000.0, "transform": "log1p"},
+      {"column": "Current [C-rate]", "input_min": -6.0, "input_max": 6.0},
+      {"column": "Terminal voltage [V]", "input_min": 2.3, "input_max": 4.6},
+      {"column": "Surface temperature [degC]", "input_min": 5.0, "input_max": 65.0},
+      {"column": "Ambient temperature [degC]", "input_min": 0.0, "input_max": 50.0}
+    ]
+  },
+  "loader": {
+    "batch_size": 32,
+    "seq_len": 1024,
+    "strategy": "shuffled_protocol_groups",
+    "stateful_n_windows": 1,
+    "data_access": "full_in_mem",
+    "num_workers": 0,
+    "prefetch_to_device": false
+  },
+  "model": {
+    "d_model": 256,
+    "n_heads": 8,
+    "mlp_ratio": 4.0,
+    "dropout": 0.0,
+    "norm": "rmsnorm",
+    "num_bins": 64,
+    "input_sigma": 0.0,
+    "output_sigma": 0.0,
+    "feedback_mode": "probabilities",
+    "mamba": {
+      "d_state": 128,
+      "expand": 2,
+      "headdim": 64,
+      "ngroups": 1,
+      "is_mimo": false,
+      "mimo_rank": 1,
+      "chunk_size": 64
+    },
+    "layers": [
+      {"kind": "reduce", "mode": "sum_pool", "residual": false},
+      {"kind": "attention"},
+      {"kind": "ffn"},
+      {"kind": "mamba", "residual": {"kind": "standard"}},
+      {"kind": "ffn"},
+      {"kind": "attention"},
+      {"kind": "ffn"},
+      {"kind": "mamba", "residual": {"kind": "standard"}},
+      {"kind": "ffn"},
+      {"kind": "attention"},
+      {"kind": "ffn"},
+      {"kind": "mamba", "residual": {"kind": "standard"}},
+      {"kind": "ffn"},
+      {"kind": "attention"},
+      {"kind": "ffn"},
+      {"kind": "mamba", "residual": {"kind": "standard"}},
+      {"kind": "ffn"}
+    ],
+    "head_layers": [
+      {"kind": "attention"},
+      {"kind": "ffn"},
+      {"kind": "mamba", "residual": {"kind": "standard"}},
+      {"kind": "ffn"}
+    ],
+    "output": {"parameterization": "shared"}
+  },
+  "train": {
+    "epochs": 4.0,
+    "log_every_steps": 10,
+    "validate_every_steps": 1181,
+    "loss": "categorical_ce",
+    "grad_clip_norm": 1.0,
+    "masked_suffix": {
+      "enabled": true,
+      "channels": ["Terminal voltage [V]", "Surface temperature [degC]"],
+      "suffix_steps": 128,
+      "fill_value": 0.0,
+      "loss_on_masked_only": true,
+      "carry_mamba_state": true,
+      "carry_final_mamba_state": false,
+      "detach_between_windows": true,
+      "roll_forward_steps": 896
+    }
+  },
+  "validation": {
+    "split": {
+      "strategy": "merge",
+      "fraction": 0.2,
+      "group_by": ["dataset id", "cell id", "cycle index", "protocol"],
+      "groups": [
+        {
+          "match": {
+            "dataset id": "pozzato-2022",
+            "cell id": "G1",
+            "cycle index": 1,
+            "protocol": "cycling"
+          },
+          "rollout_start_offsets": [10778, 48973]
+        }
+      ]
+    },
+    "max_tf_batches": 1,
+    "rollout_steps": 2048,
+    "log_rollout_plots": true,
+    "rollout_extension": {
+      "enabled": true,
+      "steps": 2000,
+      "input_values": {
+        "Time diff [s]": 100.0,
+        "Current [C-rate]": 0.5
+      }
+    }
+  },
+  "optim": {
+    "kind": "adamw",
+    "lr": 0.0001,
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "eps": 1e-8
+  },
+  "scheduler": {
+    "kind": "linear_warmup_cosine",
+    "warmup_ratio": 0.05,
+    "min_lr_ratio": 0.01
+  },
+  "run": {
+    "device": "cuda",
+    "use_amp": true,
+    "compile_model": false,
+    "output_dir": "/workspace/ubuntu/batgrad/.cache/ml_baseline_runs",
+    "name": null
+  },
+  "logging": {
+    "backend": "wandb",
+    "mode": "online",
+    "mirror_stdout": false,
+    "wandb": {"project": "bathub", "entity": "personal_marplan", "group": "batgrad-baseline", "name": null, "tags": []}
+  },
+  "checkpoint": {"enabled": true, "save_per_epoch": 1},
+  "seed": 69
+}
