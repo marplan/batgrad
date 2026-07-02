@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING
 
 import polars as pl
+import torch
 
 from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId
 from batgrad.contracts.protocols import BatteryProtocols
@@ -12,9 +13,11 @@ from batgrad.ml.data.config import LoaderConfig, ScalingRule, WindowConfig
 from batgrad.ml.data.index import sort_index_frame
 from batgrad.ml.data.materialization import materialize_batch_plan
 from batgrad.ml.data.planning import iter_batch_plans
-from batgrad.ml.data.scaling import scale_data
+from batgrad.ml.data.scaling import inverse_scale_tensor, scale_data
+from batgrad.ml.train_utils import scaling_rules
 from batgrad.storage.segments import SegmentSource, collect_segment_window_frames
 from batgrad.viz.plotting import (
+    COLORWAY,
     EIS_COLUMNS,
     EIS_NEG_IMAG,
     add_registered_xy_trace,
@@ -30,6 +33,7 @@ if TYPE_CHECKING:
     import plotly.graph_objects as go
 
     from batgrad.contracts.segments import ParquetSegment
+    from batgrad.ml.config import ExperimentConfig
     from batgrad.ml.data.batch import Batch
     from batgrad.ml.data.index import MlDatasetIndex
     from batgrad.ml.data.planning import WindowRef
@@ -79,6 +83,17 @@ class _PreviewSelection:
 
 
 _TRACE_LABELS = ("stream", "input batch", "target batch")
+PLOT_SEQUENCE_RANK = 2
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutPlotSeries:
+    inputs: torch.Tensor
+    context_prediction: torch.Tensor
+    prediction: torch.Tensor
+    target: torch.Tensor
+    match: dict[str, object]
+    anchor: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +104,132 @@ class _BatchPlotSpec:
     col: int
     input: bool
     target: bool
+
+
+def build_rollout_figure(
+    config: ExperimentConfig,
+    series: list[RolloutPlotSeries],
+    context_len: int,
+    run_name: str | None,
+) -> object:
+    import plotly.graph_objects as go  # noqa: PLC0415 - only needed for plot payloads.
+    from plotly.subplots import make_subplots  # noqa: PLC0415
+
+    figure = make_subplots(
+        rows=len(config.data.target_columns),
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+    )
+    scaling = scaling_rules(config)
+    for channel_idx, channel_name in enumerate(config.data.target_columns, start=1):
+        value_idx = channel_idx - 1
+        for series_idx, item in enumerate(series):
+            input_cpu = inverse_scale_tensor(
+                item.inputs.detach().cpu(), config.data.input_columns, scaling
+            )
+            target_cpu = inverse_scale_tensor(
+                item.target.detach().cpu(), config.data.target_columns, scaling
+            )
+            context_prediction_cpu = inverse_scale_tensor(
+                item.context_prediction.detach().cpu(), config.data.target_columns, scaling
+            )
+            prediction_cpu = inverse_scale_tensor(
+                item.prediction.detach().cpu(), config.data.target_columns, scaling
+            )
+            if target_cpu.ndim != PLOT_SEQUENCE_RANK or prediction_cpu.ndim != PLOT_SEQUENCE_RANK:
+                raise ValueError(
+                    "rollout plot expects prediction/target tensors shaped (T, C), got "
+                    f"prediction={tuple(prediction_cpu.shape)} target={tuple(target_cpu.shape)}"
+                )
+            total_steps = int(target_cpu.shape[0])
+            pred_steps = int(prediction_cpu.shape[0])
+            x_values = _rollout_time_axis(config, input_cpu)
+            pred_full = torch.full(
+                (total_steps, int(prediction_cpu.shape[1])),
+                float("nan"),
+                dtype=prediction_cpu.dtype,
+            )
+            pred_full[:context_len, :] = context_prediction_cpu[:context_len, :]
+            pred_full[context_len : context_len + pred_steps, :] = prediction_cpu
+            color = COLORWAY[series_idx % len(COLORWAY)]
+            cell_id = item.match.get("cell id", "unknown-cell")
+            cycle = item.match.get("cycle index", "unknown-cycle")
+            group_id = f"{cell_id}:{cycle}:{item.anchor}"
+            label = f"{cell_id} cycle={cycle} anchor={item.anchor}"
+            figure.add_trace(
+                go.Scatter(
+                    x=x_values,
+                    y=target_cpu[:, value_idx].tolist(),
+                    mode="lines",
+                    line={"color": color},
+                    name=f"{label} target",
+                    legendgroup=group_id,
+                    showlegend=channel_idx == 1,
+                ),
+                row=channel_idx,
+                col=1,
+            )
+            figure.add_trace(
+                go.Scatter(
+                    x=x_values,
+                    y=pred_full[:, value_idx].tolist(),
+                    mode="lines",
+                    line={"color": color, "dash": "dash"},
+                    name=f"{label} prediction",
+                    legendgroup=group_id,
+                    showlegend=channel_idx == 1,
+                ),
+                row=channel_idx,
+                col=1,
+            )
+            context_x = x_values[min(context_len, len(x_values) - 1)]
+            y_values = torch.cat((target_cpu[:, value_idx], pred_full[:, value_idx]))
+            finite = y_values[torch.isfinite(y_values)]
+            if int(finite.numel()) > 0:
+                y_min = float(finite.min().item())
+                y_max = float(finite.max().item())
+                if y_min == y_max:
+                    y_min -= 1.0
+                    y_max += 1.0
+                figure.add_trace(
+                    go.Scatter(
+                        x=[context_x, context_x],
+                        y=[y_min, y_max],
+                        mode="lines",
+                        line={"color": color, "dash": "dot"},
+                        name=f"{label} context",
+                        legendgroup=group_id,
+                        showlegend=False,
+                    ),
+                    row=channel_idx,
+                    col=1,
+                )
+        figure.update_yaxes(title_text=channel_name, row=channel_idx, col=1)
+    first_match = series[0].match
+    dataset_id = first_match.get("dataset id", "unknown-dataset")
+    protocol = first_match.get("protocol", config.data.protocols[0])
+    display_name = run_name or config.run.name or "local-run"
+    figure.update_layout(
+        title=(
+            f"rollout | run={display_name} | protocol={protocol} | dataset={dataset_id} | "
+            f"context={context_len}"
+        ),
+        xaxis_title="Time [s]",
+        legend={"groupclick": "togglegroup"},
+        height=max(360, 260 * len(config.data.target_columns)),
+    )
+    return figure
+
+
+def _rollout_time_axis(config: ExperimentConfig, inputs: torch.Tensor) -> list[float]:
+    try:
+        dt_idx = config.data.input_columns.index("Time diff [s]")
+    except ValueError:
+        return [float(idx) for idx in range(int(inputs.shape[0]))]
+    dt = inputs[:, dt_idx].to(dtype=torch.float32).clamp_min(0.0)
+    elapsed = torch.cumsum(dt, dim=0) - dt[0]
+    return [float(value) for value in elapsed.tolist()]
 
 
 def build_ml_batch_preview(

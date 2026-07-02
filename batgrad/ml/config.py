@@ -44,7 +44,6 @@ class DataConfig:
     input_columns: tuple[str, ...]
     target_columns: tuple[str, ...]
     feedback_columns: tuple[str, ...] = ()
-    teacher_forced_columns: tuple[str, ...] = ()
     scaling: tuple[ScalingRuleConfig, ...] = ()
 
     def __post_init__(self) -> None:
@@ -87,12 +86,6 @@ def _validate_data_columns(config: DataConfig) -> None:
         raise ValueError(
             "data.feedback_columns must be present in both input_columns and target_columns. "
             f"Missing inputs={missing_feedback_inputs} missing targets={missing_feedback_targets}"
-        )
-    missing_teacher_forced = sorted(set(config.teacher_forced_columns) - input_columns)
-    if missing_teacher_forced:
-        raise ValueError(
-            "data.teacher_forced_columns must be present in input_columns: "
-            f"{missing_teacher_forced}"
         )
 
 
@@ -299,6 +292,7 @@ class ExperimentConfig:
     def __post_init__(self) -> None:
         _validate_protocol_strategy(self)
         _validate_mamba_state(self)
+        _validate_masked_suffix_channels(self)
         _validate_rollout_extension(self)
         _validate_prefetch(self)
         _validate_output_mode(self)
@@ -331,6 +325,25 @@ def _validate_mamba_state(config: ExperimentConfig) -> None:
         for layer in (*config.model.layers, *config.model.head_layers)
     ):
         raise ValueError("Mamba state carry currently requires Mamba layers with is_mimo=false")
+
+
+def _validate_masked_suffix_channels(config: ExperimentConfig) -> None:
+    suffix = config.train.masked_suffix
+    if not suffix.enabled:
+        return
+    input_columns = set(config.data.input_columns)
+    target_columns = set(config.data.target_columns)
+    feedback_columns = set(config.data.feedback_columns)
+    missing_inputs = sorted(set(suffix.channels) - input_columns)
+    missing_targets = sorted(set(suffix.channels) - target_columns)
+    missing_feedback = sorted(set(suffix.channels) - feedback_columns)
+    if missing_inputs or missing_targets or missing_feedback:
+        raise ValueError(
+            "train.masked_suffix.channels must be present in data.input_columns, "
+            "data.target_columns, and data.feedback_columns. "
+            f"Missing inputs={missing_inputs} targets={missing_targets} "
+            f"feedback={missing_feedback}"
+        )
 
 
 def _validate_rollout_extension(config: ExperimentConfig) -> None:
