@@ -4,10 +4,11 @@ from typing import TYPE_CHECKING
 
 import polars as pl
 
-from batgrad.data.processing.io import collect_frame
+from batgrad.contracts import row_ids
+from batgrad.storage.segments import collect_frame
 
-MANIFEST_ROW_ID_COLUMN = "__manifest_row_id"
-MANIFEST_ROW_IDS_COLUMN = "__manifest_row_ids"
+MANIFEST_ROW_ID_COLUMN = row_ids.MANIFEST_ROW_ID_COLUMN
+MANIFEST_ROW_IDS_COLUMN = row_ids.MANIFEST_ROW_IDS_COLUMN
 
 if TYPE_CHECKING:
     from batgrad.contracts.mapping import DatasetStageId

@@ -1,20 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast, overload
+from typing import TYPE_CHECKING, overload
 
 import polars as pl
 
-from batgrad.contracts.mapping import BaseColumns, MappingSpec
-from batgrad.data.processing.metadata import as_int
+from batgrad.contracts.mapping import MappingSpec
+from batgrad.storage.segments import scan_segment_frames
 
 type ResolvedColumns = dict[MappingSpec, tuple[str, ...] | None]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
-    from pathlib import Path
+    from collections.abc import Mapping, Sequence
 
+    from batgrad.contracts.segments import SegmentLike
     from batgrad.storage.store import DataProcessingStore
 
 
@@ -30,111 +28,6 @@ def add_metadata_columns(
     data: pl.LazyFrame,
     metadata: dict[MappingSpec, object],
 ) -> pl.LazyFrame: ...
-
-
-@dataclass(frozen=True, slots=True)
-class ParquetSegment:
-    """Contiguous row slice inside a generated parquet file."""
-
-    path: str
-    row_start: int
-    row_count: int
-
-    @classmethod
-    def from_value(cls, value: ParquetSegment | Mapping[Any, Any]) -> ParquetSegment:
-        """Normalize an existing segment or manifest segment mapping."""
-        if isinstance(value, ParquetSegment):
-            return value
-        return cls(
-            path=str(value[str(BaseColumns.path)]),
-            row_start=as_int(value[str(BaseColumns.row0)]),
-            row_count=as_int(value[str(BaseColumns.row_n)]),
-        )
-
-    def as_manifest_dict(self) -> dict[str, object]:
-        """Return this segment in manifest-compatible dictionary form."""
-        return {
-            str(BaseColumns.path): self.path,
-            str(BaseColumns.row0): self.row_start,
-            str(BaseColumns.row_n): self.row_count,
-        }
-
-
-type SegmentLike = ParquetSegment | Mapping[Any, Any]
-
-
-@dataclass(frozen=True, slots=True)
-class SegmentSource:
-    """Store plus segment list used to scan or chunk selected data."""
-
-    store: DataProcessingStore
-    segments: tuple[ParquetSegment, ...]
-    row_count: int | None = None
-
-    @classmethod
-    def from_values(
-        cls,
-        store: DataProcessingStore,
-        segments: tuple[SegmentLike, ...],
-        *,
-        row_count: int | None = None,
-    ) -> SegmentSource:
-        """Build a segment source from manifest segment values."""
-        normalized = normalize_segments(segments)
-        return cls(
-            store=store,
-            segments=normalized,
-            row_count=segment_row_count(normalized) if row_count is None else row_count,
-        )
-
-    def scan(self) -> pl.LazyFrame:
-        """Scan all referenced segments as one lazy frame."""
-        return scan_segment_frames(self.store, self.segments)
-
-    def iter_chunks(
-        self,
-        chunk_rows: int,
-        *,
-        columns: tuple[str, ...] | None = None,
-    ) -> Iterator[pl.DataFrame]:
-        """Iterate referenced segments as dataframe chunks."""
-        yield from iter_segment_frames(self.store, self.segments, chunk_rows, columns=columns)
-
-
-def normalize_segments(segments: tuple[SegmentLike, ...]) -> tuple[ParquetSegment, ...]:
-    """Normalize segment mappings to `ParquetSegment` objects."""
-    return tuple(ParquetSegment.from_value(segment) for segment in segments)
-
-
-def segment_values(value: object) -> tuple[SegmentLike, ...]:
-    """Return manifest segment values as segment-like objects."""
-    if not isinstance(value, list | tuple):
-        return ()
-    segments: list[SegmentLike] = []
-    for segment in value:
-        if isinstance(segment, ParquetSegment):
-            segments.append(segment)
-            continue
-        if isinstance(segment, Mapping):
-            segments.append(ParquetSegment.from_value(segment))
-            continue
-        raise TypeError(f"Expected parquet segment mapping, got {type(segment).__name__}")
-    return tuple(segments)
-
-
-def segment_row_count(segments: tuple[ParquetSegment, ...]) -> int:
-    return sum(segment.row_count for segment in segments)
-
-
-def segment_manifest_dicts(segments: tuple[ParquetSegment, ...]) -> tuple[dict[str, object], ...]:
-    """Return segments as manifest-compatible dictionaries."""
-    return tuple(segment.as_manifest_dict() for segment in segments)
-
-
-def collect_frame(data: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame:
-    if isinstance(data, pl.LazyFrame):
-        return cast("pl.DataFrame", data.collect())
-    return data
 
 
 def add_metadata_columns(
@@ -236,7 +129,7 @@ def resolve_mapping_columns_for_segments(
     required: tuple[MappingSpec, ...],
     *,
     context: str,
-    alias_count_chunk_rows: int = 500_000,
+    one_of_col_groups: tuple[tuple[MappingSpec, ...], ...] = (),
 ) -> tuple[tuple[str, ...], ResolvedColumns]:
     """Resolve source columns needed to read requested mappings from segments.
 
@@ -244,7 +137,6 @@ def resolve_mapping_columns_for_segments(
     specs to alias sources when the source differs from the canonical name.
     """
     available = set(_scan_segments_schema(store, segments))
-    del alias_count_chunk_rows
     input_columns: list[str] = []
     resolved_columns: ResolvedColumns = {}
     for column in requested:
@@ -252,45 +144,21 @@ def resolve_mapping_columns_for_segments(
         if len(sources) != 1 or (sources and sources[0] != str(column)):
             resolved_columns[column] = sources or None
         input_columns.extend(sources)
-    missing = [column for column in required if not mapping_column_sources(column, available)]
+    one_of_columns = {column for group in one_of_col_groups for column in group}
+    missing = [
+        column
+        for column in required
+        if column not in one_of_columns and not mapping_column_sources(column, available)
+    ]
+    if one_of_col_groups and not any(
+        all(mapping_column_sources(column, available) for column in group)
+        for group in one_of_col_groups
+    ):
+        expected = [tuple(str(column) for column in group) for group in one_of_col_groups]
+        missing.append(MappingSpec(f"one of column groups {expected}", dtype=pl.String))
     if missing:
         raise ValueError(f"{context} is missing required columns: {missing}")
     return tuple(dict.fromkeys(input_columns)), resolved_columns
-
-
-def iter_segment_frames(
-    store: DataProcessingStore,
-    segments: tuple[SegmentLike, ...],
-    chunk_rows: int,
-    columns: tuple[str, ...] | None = None,
-) -> Iterator[pl.DataFrame]:
-    """Iterate parquet segment slices as dataframe chunks."""
-    for segment in normalize_segments(segments):
-        if segment.row_count <= 0:
-            continue
-        yield from store.iter_table_slices(
-            segment.path,
-            ((segment.row_start, segment.row_count),),
-            chunk_rows,
-            columns=columns,
-        )
-
-
-def scan_segment_frames(
-    store: DataProcessingStore,
-    segments: tuple[SegmentLike, ...],
-) -> pl.LazyFrame:
-    """Scan parquet segment slices and concatenate them lazily."""
-    frames = [
-        store.scan_table(segment.path).slice(
-            segment.row_start,
-            segment.row_count,
-        )
-        for segment in normalize_segments(segments)
-    ]
-    if not frames:
-        raise ValueError("No table segments to scan")
-    return frames[0] if len(frames) == 1 else pl.concat(frames)
 
 
 def _scan_segments_schema(
@@ -300,59 +168,6 @@ def _scan_segments_schema(
     if not segments:
         return ()
     return tuple(scan_segment_frames(store, segments).collect_schema().names())
-
-
-def consume_temp_table(
-    store: DataProcessingStore,
-    location: str | Path,
-    *,
-    chunk_rows: int,
-    on_chunk: Callable[[pl.DataFrame], None],
-    delete: bool = True,
-) -> None:
-    """Consume a temporary table by chunks and optionally delete it."""
-    try:
-        for chunk in store.iter_table_chunks(location, chunk_rows):
-            on_chunk(chunk)
-    finally:
-        if delete:
-            store.delete_file(location, missing_ok=True)
-
-
-def iter_data_chunks(data: pl.DataFrame, chunk_rows: int) -> Iterator[pl.DataFrame]:
-    """Yield non-empty chunks from an in-memory dataframe."""
-    if data.height <= chunk_rows:
-        if data.height > 0:
-            yield data
-        return
-    for offset in range(0, data.height, chunk_rows):
-        chunk = data.slice(offset, chunk_rows)
-        if chunk.height > 0:
-            yield chunk
-
-
-def coalesce_frames(
-    frames: Iterator[pl.DataFrame],
-    chunk_rows: int,
-) -> Iterator[pl.DataFrame]:
-    """Coalesce small frames into chunks with up to `chunk_rows` rows."""
-    pending: list[pl.DataFrame] = []
-    pending_rows = 0
-    for frame in frames:
-        if frame.height == 0:
-            continue
-        pending.append(frame)
-        pending_rows += frame.height
-        if pending_rows < chunk_rows:
-            continue
-        combined = pl.concat(pending, how="vertical")
-        while combined.height >= chunk_rows:
-            yield combined.slice(0, chunk_rows)
-            combined = combined.slice(chunk_rows)
-        pending = [combined] if combined.height > 0 else []
-        pending_rows = combined.height
-    if pending:
-        yield from iter_data_chunks(pl.concat(pending, how="vertical"), chunk_rows)
 
 
 def frame_columns(data: pl.DataFrame | pl.LazyFrame) -> tuple[str, ...]:

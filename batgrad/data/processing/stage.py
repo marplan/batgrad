@@ -7,13 +7,13 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal, Protocol
 
-from batgrad.data.processing.io import coalesce_frames
 from batgrad.data.processing.runtime import (
     ProcessTaskSpec,
     iter_process_task_results,
     log_task_progress_if_due,
 )
 from batgrad.data.processing.sharding import ShardWriter
+from batgrad.storage.segments import coalesce_frames
 
 if TYPE_CHECKING:
     import logging
@@ -159,32 +159,6 @@ def protocol_spec_by_id[SpecT](
         if str(protocol_id) == str(protocol):
             return spec
     raise ValueError(f"Protocol {protocol!r} is not declared in stage protocol specs")
-
-
-def stage_output_spec(
-    *,
-    dataset_spec: DatasetSpec,
-    stage_id: DatasetStageId,
-    output_root: str,
-    manifest_path: str,
-    manifest_metadata: MetadataLayout,
-    footer_metadata: MetadataLayout,
-    shard_key_col: MappingSpec,
-    segment_col: MappingSpec,
-    source_paths_col: MappingSpec,
-) -> StageOutputSpec:
-    """Construct a stage output spec from resolved dataset and metadata paths."""
-    return StageOutputSpec(
-        dataset_spec=dataset_spec,
-        stage_id=stage_id,
-        output_root=output_root,
-        manifest_path=manifest_path,
-        manifest_metadata=manifest_metadata,
-        footer_metadata=footer_metadata,
-        shard_key_col=shard_key_col,
-        segment_col=segment_col,
-        source_paths_col=source_paths_col,
-    )
 
 
 def close_stage_writer(

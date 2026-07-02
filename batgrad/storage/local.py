@@ -9,7 +9,7 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from batgrad.data.processing.io import iter_data_chunks
+from batgrad.storage.chunks import iter_data_chunks
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

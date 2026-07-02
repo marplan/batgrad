@@ -23,27 +23,15 @@ class TableWriter(Protocol):
         ...
 
 
-class DataProcessingStore(Protocol):
-    """Storage interface used by data processing stages.
+class DatasetStoreReader(Protocol):
+    """Read-only storage interface for dataset consumers.
 
-    A data processing store resolves logical dataset locations to a concrete
-    storage backend and provides the file, parquet scanning, chunk iteration, and
-    table writing operations required by ingest, normalization, and sharding.
+    This is the subset needed by ML, visualization, and notebook inspection code.
+    Processing stages use `DataProcessingStore`, which extends this with write and
+    delete operations.
     """
 
     root: str
-
-    def create_dir(self, location: str | Path) -> None:
-        """Create a directory location, including missing parents."""
-        ...
-
-    def delete_dir(self, location: str | Path, *, missing_ok: bool = True) -> None:
-        """Delete a directory location."""
-        ...
-
-    def delete_file(self, location: str | Path, *, missing_ok: bool = True) -> None:
-        """Delete a file location."""
-        ...
 
     def list_files(
         self,
@@ -87,6 +75,31 @@ class DataProcessingStore(Protocol):
         """Yield chunks from selected row ranges in one parquet table."""
         ...
 
+    def table_size_bytes(self, location: str | Path) -> int | None:
+        """Return a table size in bytes, or `None` when it is unavailable."""
+        ...
+
+
+class DataProcessingStore(DatasetStoreReader, Protocol):
+    """Storage interface used by data processing stages.
+
+    A data processing store resolves logical dataset locations to a concrete
+    storage backend and provides the file, parquet scanning, chunk iteration, and
+    table writing operations required by ingest, normalization, and sharding.
+    """
+
+    def create_dir(self, location: str | Path) -> None:
+        """Create a directory location, including missing parents."""
+        ...
+
+    def delete_dir(self, location: str | Path, *, missing_ok: bool = True) -> None:
+        """Delete a directory location."""
+        ...
+
+    def delete_file(self, location: str | Path, *, missing_ok: bool = True) -> None:
+        """Delete a file location."""
+        ...
+
     def write_table(
         self,
         data: pl.DataFrame | pl.LazyFrame,
@@ -106,8 +119,4 @@ class DataProcessingStore(Protocol):
         use_content_defined_chunking: bool = False,
     ) -> TableWriter:
         """Open a writer for chunked output to one table location."""
-        ...
-
-    def table_size_bytes(self, location: str | Path) -> int | None:
-        """Return a table size in bytes, or `None` when it is unavailable."""
         ...
