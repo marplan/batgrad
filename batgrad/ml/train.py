@@ -18,7 +18,7 @@ from batgrad.ml.config import (
 )
 from batgrad.ml.data.loader import MlDataIterable, create_dataloader
 from batgrad.ml.loggers import build_logger
-from batgrad.ml.masked_suffix import batch_loss
+from batgrad.ml.masked_suffix import backward_batch_loss, batch_loss
 from batgrad.ml.nn import SequenceMixer
 from batgrad.ml.rollout import run_rollouts
 from batgrad.ml.train_utils import (
@@ -88,15 +88,15 @@ def train_from_config(path: str | Path) -> Path | None:
             for epoch_step, batch in enumerate(train_loader, start=1):
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
-                loss = batch_loss(
+                loss = backward_batch_loss(
                     config,
                     model,
                     batch.active.inputs,
                     batch.active.targets,
                     batch.active.mask,
                     device,
+                    scaler,
                 )
-                scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.train.grad_clip_norm)
                 scaler.step(optimizer)
