@@ -14,6 +14,7 @@ from batgrad.data.processing.raw import (
     IngestProtocolSpec,
     IngestStageSpec,
     IngestTask,
+    plan_file_tasks,
 )
 
 if TYPE_CHECKING:
@@ -60,17 +61,7 @@ class Pozzato2022RawAdapter:
         raw_spec: IngestStageSpec,
     ) -> tuple[IngestTask, ...]:
         raw_root = self.spec.source_root(DatasetStageId.raw)
-        paths: list[str] = []
-        for pattern in raw_spec.included_file_patterns:
-            paths.extend(
-                path
-                for path in input_store.list_files(raw_root, pattern=pattern)
-                if raw_spec.is_included_file(path)
-            )
-        return tuple(
-            IngestTask(task_id=path, source_paths=(path,))
-            for path in sorted(set(paths), key=self._source_sort_key)
-        )
+        return plan_file_tasks(input_store, raw_root, raw_spec, sort_key=self._source_sort_key)
 
     def load_raw_task(
         self,

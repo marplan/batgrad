@@ -2,15 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import polars as pl
 
 from batgrad.contracts.mapping import BaseColumns, DatasetStageId
-from batgrad.data.processing.io import (
-    collect_frame,
-    frame_columns,
-)
+from batgrad.data.processing.io import frame_columns
 from batgrad.data.processing.metadata import stage_layout_with_protocol_metadata
 from batgrad.data.processing.runtime import (
     ProcessTaskResult,
@@ -18,25 +15,25 @@ from batgrad.data.processing.runtime import (
 )
 from batgrad.data.processing.stage import (
     PreparedTable,
+    StageOutputSpec,
     TaskOutput,
     iter_stage_task_results,
     protocol_spec_by_id,
     run_stage_task_outputs,
-    stage_output_spec,
     stage_temp_path,
 )
 from batgrad.logging import get_logger
+from batgrad.storage.segments import collect_frame
 
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from batgrad.contracts.mapping import DatasetProtocolId, MappingSpec
     from batgrad.contracts.metadata import MetadataLayout, ProtocolMetadata, StageLayout
     from batgrad.contracts.protocols import BatteryProtocolSpec
     from batgrad.data.datasets.config import DatasetSpec
-    from batgrad.data.processing.stage import StageOutputSpec
     from batgrad.storage.store import DataProcessingStore
 
 
@@ -132,6 +129,12 @@ class IngestProtocolSpec:
         return self.columns
 
     @property
+    def task_key(self) -> tuple[MappingSpec, ...]:
+        if self.metadata is not None:
+            return self.metadata.task_key
+        return self.protocol.task_key
+
+    @property
     def manifest_columns(self) -> tuple[MappingSpec, ...]:
         """Protocol task and manifest metadata columns expected from batches.
 
@@ -143,6 +146,7 @@ class IngestProtocolSpec:
             dict.fromkeys(
                 (
                     *self.protocol_metadata.task_key,
+                    *self.task_key,
                     *self.protocol_metadata.manifest_extra.columns,
                 ),
             ),
@@ -159,6 +163,7 @@ class IngestProtocolSpec:
             dict.fromkeys(
                 (
                     *self.protocol_metadata.task_key,
+                    *self.task_key,
                     *self.protocol_metadata.manifest_extra.required,
                 ),
             ),
@@ -212,7 +217,10 @@ class IngestStageSpec:
     def _expanded_metadata(self) -> StageLayout:
         return stage_layout_with_protocol_metadata(
             self.metadata,
-            (spec.protocol_metadata for spec in self.protocol_specs),
+            (
+                spec.protocol if spec.metadata is None else spec.protocol_metadata
+                for spec in self.protocol_specs
+            ),
         )
 
     def protocol_spec(self, protocol: object) -> IngestProtocolSpec:
@@ -287,7 +295,7 @@ class IngestStageSpec:
             Stage writer configuration for protocol-sharded ingested output.
         """
         output_root = dataset_spec.source_root(self.metadata.stage_id)
-        return stage_output_spec(
+        return StageOutputSpec(
             dataset_spec=dataset_spec,
             stage_id=self.metadata.stage_id,
             output_root=output_root,
@@ -295,7 +303,7 @@ class IngestStageSpec:
             manifest_metadata=self.manifest_metadata,
             footer_metadata=self.footer_metadata,
             shard_key_col=BaseColumns.proto,
-            segment_col=BaseColumns.parq_segs,
+            segment_col=BaseColumns.ingest_segs,
             source_paths_col=BaseColumns.raw_paths,
         )
 
@@ -311,6 +319,24 @@ class IngestTask:
 
     task_id: str
     source_paths: tuple[str, ...]
+
+
+def plan_file_tasks(
+    input_store: DataProcessingStore,
+    raw_root: str,
+    raw_spec: IngestStageSpec,
+    *,
+    sort_key: Callable[[str], Any] | None = None,
+) -> tuple[IngestTask, ...]:
+    paths: list[str] = []
+    for pattern in raw_spec.included_file_patterns:
+        paths.extend(
+            path
+            for path in input_store.list_files(raw_root, pattern=pattern)
+            if raw_spec.is_included_file(path)
+        )
+    sorted_paths = sorted(set(paths)) if sort_key is None else sorted(set(paths), key=sort_key)
+    return tuple(IngestTask(task_id=path, source_paths=(path,)) for path in sorted_paths)
 
 
 @dataclass(frozen=True)

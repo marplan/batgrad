@@ -3,14 +3,18 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Literal
 
 from batgrad.data.datasets.pozzato_2022.config import DATASET as POZZATO_2022
+from batgrad.data.datasets.synthetic_pozzato_2022.config import (
+    DATASET as SYNTHETIC_POZZATO_2022,
+)
 
 if TYPE_CHECKING:
     from batgrad.data.datasets.config import Dataset
 
-DatasetId = Literal["pozzato-2022"]
+DatasetId = Literal["pozzato-2022", "synthetic-pozzato-2022-m50t"]
 
 _DATASETS: dict[str, Dataset] = {
     POZZATO_2022.spec.dataset_id: POZZATO_2022,
+    SYNTHETIC_POZZATO_2022.spec.dataset_id: SYNTHETIC_POZZATO_2022,
 }
 
 

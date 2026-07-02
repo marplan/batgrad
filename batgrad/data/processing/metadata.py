@@ -8,13 +8,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from batgrad.contracts.mapping import BaseColumns
-from batgrad.contracts.metadata import MetadataLayout
+from batgrad.contracts.metadata import MetadataLayout, ProtocolMetadata
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from batgrad.contracts.mapping import DatasetStageId, MappingSpec
-    from batgrad.contracts.metadata import ProtocolMetadata, StageLayout
+    from batgrad.contracts.metadata import StageLayout
+    from batgrad.contracts.protocols import BatteryProtocolSpec
     from batgrad.data.datasets.config import DatasetSpec
 
 
@@ -42,7 +43,7 @@ def stage_manifest_metadata(spec: DatasetSpec, stage_id: DatasetStageId) -> Meta
 
 def stage_layout_with_protocol_metadata(
     layout: StageLayout,
-    protocol_metadata: Iterable[ProtocolMetadata],
+    protocols: Iterable[ProtocolMetadata | BatteryProtocolSpec],
     *,
     manifest_extra: Iterable[MappingSpec] = (),
     footer_extra: Iterable[MappingSpec] = (),
@@ -54,14 +55,18 @@ def stage_layout_with_protocol_metadata(
     extras are merged first so dataset-specific configuration can declare values
     without duplicating protocol metadata.
     """
-    protocol_metadata = tuple(protocol_metadata)
+    protocols = tuple(protocols)
     return layout.with_manifest(
         _new_optional_columns(
             layout.manifest,
             (
                 *manifest_extra,
-                *(column for item in protocol_metadata for column in item.task_key),
-                *(column for item in protocol_metadata for column in item.manifest_extra.columns),
+                *(column for item in protocols for column in _protocol_task_key(item)),
+                *(
+                    column
+                    for item in protocols
+                    for column in _protocol_metadata(item).manifest_extra.columns
+                ),
             ),
         ),
     ).with_footer(
@@ -69,10 +74,26 @@ def stage_layout_with_protocol_metadata(
             layout.footer,
             (
                 *footer_extra,
-                *(column for item in protocol_metadata for column in item.footer_extra.columns),
+                *(
+                    column
+                    for item in protocols
+                    for column in _protocol_metadata(item).footer_extra.columns
+                ),
             ),
         ),
     )
+
+
+def _protocol_metadata(item: ProtocolMetadata | BatteryProtocolSpec) -> ProtocolMetadata:
+    if isinstance(item, ProtocolMetadata):
+        return item
+    return item.metadata
+
+
+def _protocol_task_key(item: ProtocolMetadata | BatteryProtocolSpec) -> tuple[MappingSpec, ...]:
+    if isinstance(item, ProtocolMetadata):
+        return item.task_key
+    return item.task_key
 
 
 def _new_optional_columns(
