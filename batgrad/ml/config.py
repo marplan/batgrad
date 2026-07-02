@@ -146,11 +146,25 @@ class RolloutExtensionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidationMaskedSuffixConfig:
+    enabled: bool | None = None
+    suffix_steps: int | None = None
+    carry_mamba_state: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.suffix_steps is not None and self.suffix_steps <= 0:
+            raise ValueError("validation.masked_suffix.suffix_steps must be > 0")
+
+
+@dataclass(frozen=True, slots=True)
 class ValidationConfig:
     split: ValidationSplitConfig = field(default_factory=ValidationSplitConfig)
     max_tf_batches: int = 1
     rollout_steps: int = 0
     log_rollout_plots: bool = True
+    masked_suffix: ValidationMaskedSuffixConfig = field(
+        default_factory=ValidationMaskedSuffixConfig
+    )
     rollout_extension: RolloutExtensionConfig = field(default_factory=RolloutExtensionConfig)
 
     def __post_init__(self) -> None:
@@ -197,7 +211,6 @@ class MaskedSuffixConfig:
     fill_value: float = 0.0
     loss_on_masked_only: bool = True
     carry_mamba_state: bool = True
-    carry_final_mamba_state: bool = False
     detach_between_windows: bool = True
     roll_forward_steps: int = 0
 

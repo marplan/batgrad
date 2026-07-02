@@ -45,7 +45,8 @@ class RunLogger(Protocol):
         epoch: int | None = None,
         epoch_pct: int | None = None,
     ) -> None: ...
-    def log_payload(self, step: int, name: str, payload: dict[str, object]) -> None: ...
+    def log_payload(self, step: int, name: str, payload: object) -> None: ...
+    def run_name(self) -> str | None: ...
     def finish(self) -> None: ...
 
 
@@ -63,8 +64,12 @@ class StdoutRunLogger:
         )
         logger.info("step=%03d%s %s", step, _format_progress(epoch, epoch_pct), rendered)
 
-    def log_payload(self, step: int, name: str, payload: dict[str, object]) -> None:
-        logger.info("step=%03d payload=%s keys=%s", step, name, sorted(payload))
+    def log_payload(self, step: int, name: str, payload: object) -> None:
+        keys = sorted(payload) if isinstance(payload, dict) else type(payload).__name__
+        logger.info("step=%03d payload=%s keys=%s", step, name, keys)
+
+    def run_name(self) -> str | None:
+        return None
 
     def finish(self) -> None:
         return
@@ -72,6 +77,7 @@ class StdoutRunLogger:
 
 class JsonlRunLogger:
     def __init__(self, run_dir: Path) -> None:
+        self._run_name = run_dir.name
         log_dir = run_dir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_file = (log_dir / "metrics.jsonl").open("a", encoding="utf-8")
@@ -89,9 +95,14 @@ class JsonlRunLogger:
         self.metrics_file.write(json.dumps({"step": step, **progress, **metrics}) + "\n")
         self.metrics_file.flush()
 
-    def log_payload(self, step: int, name: str, payload: dict[str, object]) -> None:
-        self.payload_file.write(json.dumps({"step": step, "name": name, "payload": payload}) + "\n")
+    def log_payload(self, step: int, name: str, payload: object) -> None:
+        self.payload_file.write(
+            json.dumps({"step": step, "name": name, "payload": _json_payload(payload)}) + "\n"
+        )
         self.payload_file.flush()
+
+    def run_name(self) -> str | None:
+        return self._run_name
 
     def finish(self) -> None:
         self.metrics_file.close()
@@ -125,8 +136,12 @@ class WandbRunLogger:
     ) -> None:
         self.run.log({**_progress_payload(epoch, epoch_pct), **metrics}, step=step)
 
-    def log_payload(self, step: int, name: str, payload: dict[str, object]) -> None:
+    def log_payload(self, step: int, name: str, payload: object) -> None:
         self.run.log({name: payload}, step=step)
+
+    def run_name(self) -> str | None:
+        name = getattr(self.run, "name", None)
+        return str(name) if name else None
 
     def finish(self) -> None:
         self.run.finish()
@@ -147,9 +162,16 @@ class CompositeRunLogger:
         for logger in self.loggers:
             logger.log_metrics(step, metrics, epoch=epoch, epoch_pct=epoch_pct)
 
-    def log_payload(self, step: int, name: str, payload: dict[str, object]) -> None:
+    def log_payload(self, step: int, name: str, payload: object) -> None:
         for logger in self.loggers:
             logger.log_payload(step, name, payload)
+
+    def run_name(self) -> str | None:
+        for logger in reversed(self.loggers):
+            name = logger.run_name()
+            if name:
+                return name
+        return None
 
     def finish(self) -> None:
         for logger in self.loggers:
@@ -185,6 +207,15 @@ def _progress_payload(epoch: int | None, epoch_pct: int | None) -> dict[str, int
         payload["epoch"] = epoch
     if epoch_pct is not None:
         payload["epoch_pct"] = epoch_pct
+    return payload
+
+
+def _json_payload(payload: object) -> object:
+    to_plotly_json = getattr(payload, "to_plotly_json", None)
+    if callable(to_plotly_json):
+        from plotly.utils import PlotlyJSONEncoder  # noqa: PLC0415
+
+        return json.loads(json.dumps(to_plotly_json(), cls=PlotlyJSONEncoder))
     return payload
 
 

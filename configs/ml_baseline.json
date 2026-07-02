@@ -1,8 +1,8 @@
 {
   "data": {
-    "store_root": "/data/loc_datasets",
+    "store_root": "/data",
     "manifest_paths": {
-      "type=published/dataset=pozzato-2022/source=normalized/manifest.parquet": "1f5c354"
+      "type=synthetic/dataset=synthetic-pozzato-2022-m50t/source=normalized/manifest.parquet": "1f5c354"
     },
     "protocols": ["cycling"],
     "input_columns": [
@@ -16,15 +16,15 @@
     "feedback_columns": ["Terminal voltage [V]", "Surface temperature [degC]"],
     "teacher_forced_columns": ["Time diff [s]", "Current [C-rate]", "Ambient temperature [degC]"],
     "scaling": [
-      {"column": "Time diff [s]", "input_min": 0.0, "input_max": 10000.0, "transform": "log1p"},
-      {"column": "Current [C-rate]", "input_min": -6.0, "input_max": 6.0},
-      {"column": "Terminal voltage [V]", "input_min": 2.3, "input_max": 4.6},
-      {"column": "Surface temperature [degC]", "input_min": 5.0, "input_max": 65.0},
-      {"column": "Ambient temperature [degC]", "input_min": 0.0, "input_max": 50.0}
+      { "column": "Time diff [s]", "input_min": 0.0, "input_max": 10000.0, "transform": "log1p" },
+      { "column": "Current [C-rate]", "input_min": -6.0, "input_max": 6.0 },
+      { "column": "Terminal voltage [V]", "input_min": 2.3, "input_max": 4.6 },
+      { "column": "Surface temperature [degC]", "input_min": 5.0, "input_max": 65.0 },
+      { "column": "Ambient temperature [degC]", "input_min": 0.0, "input_max": 50.0 }
     ]
   },
   "loader": {
-    "batch_size": 32,
+    "batch_size": 8,
     "seq_len": 1024,
     "strategy": "shuffled_protocol_groups",
     "stateful_n_windows": 1,
@@ -52,31 +52,31 @@
       "chunk_size": 64
     },
     "layers": [
-      {"kind": "reduce", "mode": "sum_pool", "residual": false},
-      {"kind": "attention"},
-      {"kind": "ffn"},
-      {"kind": "mamba", "residual": {"kind": "standard"}},
-      {"kind": "ffn"},
-      {"kind": "attention"},
-      {"kind": "ffn"},
-      {"kind": "mamba", "residual": {"kind": "standard"}},
-      {"kind": "ffn"},
-      {"kind": "attention"},
-      {"kind": "ffn"},
-      {"kind": "mamba", "residual": {"kind": "standard"}},
-      {"kind": "ffn"},
-      {"kind": "attention"},
-      {"kind": "ffn"},
-      {"kind": "mamba", "residual": {"kind": "standard"}},
-      {"kind": "ffn"}
+      { "kind": "reduce", "mode": "sum_pool", "residual": false },
+      { "kind": "attention" },
+      { "kind": "ffn" },
+      { "kind": "mamba", "residual": { "kind": "standard" } },
+      { "kind": "ffn" },
+      { "kind": "attention" },
+      { "kind": "ffn" },
+      { "kind": "mamba", "residual": { "kind": "standard" } },
+      { "kind": "ffn" },
+      { "kind": "attention" },
+      { "kind": "ffn" },
+      { "kind": "mamba", "residual": { "kind": "standard" } },
+      { "kind": "ffn" },
+      { "kind": "attention" },
+      { "kind": "ffn" },
+      { "kind": "mamba", "residual": { "kind": "standard" } },
+      { "kind": "ffn" }
     ],
     "head_layers": [
-      {"kind": "attention"},
-      {"kind": "ffn"},
-      {"kind": "mamba", "residual": {"kind": "standard"}},
-      {"kind": "ffn"}
+      { "kind": "attention" },
+      { "kind": "ffn" },
+      { "kind": "mamba", "residual": { "kind": "standard" } },
+      { "kind": "ffn" }
     ],
-    "output": {"parameterization": "shared"}
+    "output": { "parameterization": "shared" }
   },
   "train": {
     "epochs": 4.0,
@@ -91,7 +91,6 @@
       "fill_value": 0.0,
       "loss_on_masked_only": true,
       "carry_mamba_state": true,
-      "carry_final_mamba_state": false,
       "detach_between_windows": true,
       "roll_forward_steps": 896
     }
@@ -104,18 +103,32 @@
       "groups": [
         {
           "match": {
-            "dataset id": "pozzato-2022",
-            "cell id": "G1",
+            "dataset id": "synthetic-pozzato-2022-m50t",
+            "cell id": "M50T_T10C_CR100_A005_S0016",
             "cycle index": 1,
             "protocol": "cycling"
           },
           "rollout_start_offsets": [10778, 48973]
+        },
+        {
+          "match": {
+            "dataset id": "synthetic-pozzato-2022-m50t",
+            "cell id": "M50T_T30C_CR025_A020_S0043",
+            "cycle index": 12,
+            "protocol": "cycling"
+          },
+          "rollout_start_offsets": [41659, 192110]
         }
       ]
     },
     "max_tf_batches": 1,
     "rollout_steps": 2048,
     "log_rollout_plots": true,
+    "masked_suffix": {
+      "enabled": null,
+      "suffix_steps": null,
+      "carry_mamba_state": null
+    },
     "rollout_extension": {
       "enabled": true,
       "steps": 2000,
@@ -142,15 +155,21 @@
     "device": "cuda",
     "use_amp": true,
     "compile_model": false,
-    "output_dir": "/workspace/ubuntu/batgrad/.cache/ml_baseline_runs",
+    "output_dir": "/workspace/ubuntu/batgrad/output/ml_baseline_runs",
     "name": null
   },
   "logging": {
     "backend": "wandb",
     "mode": "online",
-    "mirror_stdout": false,
-    "wandb": {"project": "bathub", "entity": "personal_marplan", "group": "batgrad-baseline", "name": null, "tags": []}
+    "mirror_stdout": true,
+    "wandb": {
+      "project": "batgrad",
+      "entity": "personal_marplan",
+      "group": "batgrad-baseline",
+      "name": null,
+      "tags": []
+    }
   },
-  "checkpoint": {"enabled": true, "save_per_epoch": 1},
+  "checkpoint": { "enabled": true, "save_per_epoch": 1 },
   "seed": 69
 }

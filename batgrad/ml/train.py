@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 import shutil
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -20,14 +20,15 @@ from batgrad.ml.data.config import (
     ValidationConfig as DataValidationConfig,
     WindowConfig,
 )
-from batgrad.ml.data.loader import MlDataIterable, create_dataloader, dataloader_for_split
+from batgrad.ml.data.loader import MlDataIterable, create_dataloader
 from batgrad.ml.data.materialization import materialize_window_ref
 from batgrad.ml.data.planning import WindowRef, build_stream_plans
-from batgrad.ml.data.scaling import scale_data
+from batgrad.ml.data.scaling import inverse_scale_tensor, scale_data
 from batgrad.ml.loggers import build_logger
 from batgrad.ml.nn import (
     SequenceMixer,
     categorical_ce_loss,
+    categorical_ce_loss_components,
     decode_categorical_logits,
     encode_categorical_values,
 )
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from batgrad.ml.nn import MambaCarryState
 
 logger = get_logger(__name__)
+PLOT_SEQUENCE_RANK = 2
 
 
 def train_from_config(path: str | Path) -> Path | None:
@@ -154,13 +156,24 @@ def _create_loaders(
         active_protocol=config.data.protocols[0],
         validation=_data_validation_config(config),
         scaling=_scaling_rules(config),
-        config=_loader_config(config, BaseColumns.split.values.train),
+        config=_loader_config(
+            config, BaseColumns.split.values.train, expand_roll_forward=True
+        ),
     )
-    return (
-        train_loader,
-        dataloader_for_split(train_loader, BaseColumns.split.values.val),
-        _dataset(train_loader),
+    val_loader = create_dataloader(
+        store=store,
+        manifest_paths=config.data.manifest_paths,
+        input_columns=config.data.input_columns,
+        target_columns=config.data.target_columns,
+        protocols=config.data.protocols,
+        active_protocol=config.data.protocols[0],
+        validation=_data_validation_config(config),
+        scaling=_scaling_rules(config),
+        config=_loader_config(
+            config, BaseColumns.split.values.val, expand_roll_forward=False
+        ),
     )
+    return (train_loader, val_loader, _dataset(train_loader))
 
 
 def _prepare_run_dir(config: ExperimentConfig) -> Path | None:
@@ -268,13 +281,14 @@ def _masked_suffix_loss(
     target_indices = tuple(config.data.target_columns.index(name) for name in suffix.channels)
     input_indices = tuple(config.data.input_columns.index(name) for name in suffix.channels)
     windows = _masked_suffix_windows(suffix.suffix_steps, suffix.roll_forward_steps, context_len)
-    losses: list[torch.Tensor] = []
+    total_loss = torch.zeros((), dtype=targets.dtype, device=device)
+    total_count = torch.zeros((), dtype=targets.dtype, device=device)
     feedback_bin_overrides = torch.zeros(
         (*feedback.shape, config.model.num_bins), dtype=feedback.dtype, device=feedback.device
     )
     feedback_bin_override_mask = torch.zeros_like(feedback_bin_overrides, dtype=torch.bool)
-    states = None
-    for start, current_suffix_steps in windows:
+    states: dict[str, MambaCarryState] | None = None
+    for start, current_suffix_steps, next_shift_steps in windows:
         window_inputs = feedback[:, start : start + context_len, :].clone()
         window_targets = targets[:, start : start + context_len, :]
         window_mask = mask[:, start : start + context_len]
@@ -284,7 +298,11 @@ def _masked_suffix_loss(
             window_inputs[:, suffix_slice, input_idx] = suffix.fill_value
             masked_input_mask[:, suffix_slice, input_idx] = True
         loss_mask = _masked_suffix_loss_mask(
-            window_mask, suffix_slice, loss_on_masked_only=suffix.loss_on_masked_only
+            window_mask,
+            suffix_slice,
+            target_indices,
+            len(config.data.target_columns),
+            loss_on_masked_only=suffix.loss_on_masked_only,
         )
         with torch.autocast(
             device_type=device.type, enabled=config.run.use_amp and device.type == "cuda"
@@ -305,18 +323,20 @@ def _masked_suffix_loss(
                 return_states=suffix.carry_mamba_state,
             )
             if suffix.carry_mamba_state:
-                logits, states = cast("tuple[torch.Tensor, dict[str, MambaCarryState]]", result)
+                logits, _final_states = cast(
+                    "tuple[torch.Tensor, dict[str, MambaCarryState]]", result
+                )
             else:
                 logits = cast("torch.Tensor", result)
-            losses.append(
-                categorical_ce_loss(
-                    logits,
-                    window_targets,
-                    loss_mask,
-                    config.model.output_sigma,
-                    _target_ranges(config, device),
-                )
+            loss_sum, loss_count = categorical_ce_loss_components(
+                logits,
+                window_targets,
+                loss_mask,
+                config.model.output_sigma,
+                _target_ranges(config, device),
             )
+            total_loss = total_loss + loss_sum
+            total_count = total_count + loss_count
         write_slice = slice(start + context_len - current_suffix_steps, start + context_len)
         _write_masked_suffix_feedback(
             config,
@@ -330,32 +350,79 @@ def _masked_suffix_loss(
             input_indices,
             device,
         )
-        if states is not None and suffix.detach_between_windows:
-            states = {key: value.detach() for key, value in states.items()}
-    return torch.stack(losses).mean()
+        if suffix.carry_mamba_state and next_shift_steps > 0:
+            with torch.autocast(
+                device_type=device.type, enabled=config.run.use_amp and device.type == "cuda"
+            ):
+                states = _prefix_mamba_states(
+                    model,
+                    encoded_window_inputs,
+                    window_mask,
+                    states,
+                    next_shift_steps,
+                )
+            if suffix.detach_between_windows:
+                states = {key: value.detach() for key, value in states.items()}
+        else:
+            states = None
+    if bool((total_count <= 0).item()):
+        return torch.zeros((), dtype=targets.dtype, device=device)
+    return total_loss / total_count
 
 
 def _masked_suffix_windows(
     suffix_steps: int, roll_forward_steps: int, context_len: int
-) -> list[tuple[int, int]]:
-    windows: list[tuple[int, int]] = [(0, min(suffix_steps, context_len))]
+) -> list[tuple[int, int, int]]:
+    windows: list[tuple[int, int, int]] = [
+        (0, min(suffix_steps, context_len), min(suffix_steps, roll_forward_steps))
+    ]
     remaining = roll_forward_steps
     start = 0
     while remaining > 0:
         shift = min(suffix_steps, remaining)
         start += shift
         remaining -= shift
-        windows.append((start, min(suffix_steps, context_len)))
+        next_shift_steps = min(suffix_steps, remaining)
+        windows.append((start, min(suffix_steps, context_len), next_shift_steps))
     return windows
 
 
+def _prefix_mamba_states(
+    model: torch.nn.Module,
+    encoded_inputs: torch.Tensor,
+    mask: torch.Tensor,
+    states: dict[str, MambaCarryState] | None,
+    prefix_steps: int,
+) -> dict[str, MambaCarryState]:
+    if prefix_steps <= 0:
+        raise ValueError(f"prefix_steps must be > 0, got {prefix_steps}")
+    _logits, next_states = cast(
+        "tuple[torch.Tensor, dict[str, MambaCarryState]]",
+        model(
+            encoded_inputs[:, :prefix_steps, :, :],
+            mask=mask[:, :prefix_steps],
+            states=states,
+            return_states=True,
+        ),
+    )
+    return next_states
+
+
 def _masked_suffix_loss_mask(
-    window_mask: torch.Tensor, suffix_slice: slice, *, loss_on_masked_only: bool
+    window_mask: torch.Tensor,
+    suffix_slice: slice,
+    target_indices: tuple[int, ...],
+    target_count: int,
+    *,
+    loss_on_masked_only: bool,
 ) -> torch.Tensor:
     if not loss_on_masked_only:
         return window_mask
-    loss_mask = torch.zeros_like(window_mask, dtype=torch.bool)
-    loss_mask[:, suffix_slice] = window_mask[:, suffix_slice]
+    loss_mask = torch.zeros(
+        (*window_mask.shape, target_count), dtype=torch.bool, device=window_mask.device
+    )
+    for target_idx in target_indices:
+        loss_mask[:, suffix_slice, target_idx] = window_mask[:, suffix_slice]
     return loss_mask
 
 
@@ -399,6 +466,54 @@ def _write_masked_suffix_feedback(
         feedback[:, write_slice, input_idx] = pred[:, suffix_slice, selected_idx]
 
 
+def _validation_masked_suffix_enabled(config: ExperimentConfig) -> bool:
+    enabled = config.validation.masked_suffix.enabled
+    return config.train.masked_suffix.enabled if enabled is None else enabled
+
+
+def _validation_suffix_steps(config: ExperimentConfig) -> int:
+    return config.validation.masked_suffix.suffix_steps or config.train.masked_suffix.suffix_steps
+
+
+def _validation_carry_mamba_state(config: ExperimentConfig) -> bool:
+    carry = config.validation.masked_suffix.carry_mamba_state
+    return config.train.masked_suffix.carry_mamba_state if carry is None else carry
+
+
+def _validation_loss_config(config: ExperimentConfig) -> ExperimentConfig:
+    suffix = replace(
+        config.train.masked_suffix,
+        enabled=_validation_masked_suffix_enabled(config),
+        suffix_steps=_validation_suffix_steps(config),
+        carry_mamba_state=_validation_carry_mamba_state(config),
+        roll_forward_steps=0,
+    )
+    return replace(config, train=replace(config.train, masked_suffix=suffix))
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutResult:
+    prediction: torch.Tensor
+    loss_sum: torch.Tensor
+    loss_count: torch.Tensor
+
+    @property
+    def loss(self) -> torch.Tensor | None:
+        if bool((self.loss_count <= 0).item()):
+            return None
+        return self.loss_sum / self.loss_count
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutPlotSeries:
+    inputs: torch.Tensor
+    context_prediction: torch.Tensor
+    prediction: torch.Tensor
+    target: torch.Tensor
+    match: dict[str, object]
+    anchor: int
+
+
 @torch.no_grad()
 def _validate(
     config: ExperimentConfig,
@@ -414,10 +529,21 @@ def _validate(
 ) -> None:
     model.eval()
     if config.validation.max_tf_batches > 0:
+        val_loss_config = _validation_loss_config(config)
+        loss_name = (
+            "val/tf/suffix_loss"
+            if val_loss_config.train.masked_suffix.enabled
+            else "val/tf/full_loss"
+        )
         losses: list[float] = []
         for idx, batch in enumerate(val_loader):
             loss = _batch_loss(
-                config, model, batch.active.inputs, batch.active.targets, batch.active.mask, device
+                val_loss_config,
+                model,
+                batch.active.inputs,
+                batch.active.targets,
+                batch.active.mask,
+                device,
             )
             losses.append(float(loss.detach().cpu()))
             if idx + 1 >= config.validation.max_tf_batches:
@@ -425,7 +551,7 @@ def _validate(
         if losses:
             logger.log_metrics(
                 step,
-                {"val_tf/loss": sum(losses) / len(losses)},
+                {loss_name: sum(losses) / len(losses)},
                 epoch=epoch,
                 epoch_pct=epoch_pct,
             )
@@ -458,6 +584,9 @@ def _run_rollouts(
     )
     stream_plans = build_stream_plans(val_index, protocol, window_config)
     scaling = _scaling_rules(config)
+    rollout_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+    rollout_loss_count = torch.zeros((), dtype=torch.float32, device=device)
+    plot_series: list[RolloutPlotSeries] = []
     for group in config.validation.split.groups:
         if not group.rollout_start_offsets:
             continue
@@ -484,60 +613,415 @@ def _run_rollouts(
             )
             inputs = batch.active.inputs.to(device=device)
             targets = batch.active.targets.to(device=device)
+            rollout_mask = batch.active.mask.to(device=device)
             if config.validation.rollout_extension.enabled:
                 inputs = _append_rollout_extension(config, inputs)
                 targets = torch.cat(
                     (
                         targets,
-                        targets[:, -1:, :].repeat(1, config.validation.rollout_extension.steps, 1),
+                        torch.full(
+                            (
+                                targets.shape[0],
+                                config.validation.rollout_extension.steps,
+                                targets.shape[2],
+                            ),
+                            float("nan"),
+                            dtype=targets.dtype,
+                            device=device,
+                        ),
                     ),
                     dim=1,
                 )
-            current = _encode_inputs(config, inputs[:, :context_len, :].clone(), device)
-            future_inputs = inputs[:, context_len:, :]
-            predictions: list[torch.Tensor] = []
+                rollout_mask = torch.cat(
+                    (
+                        rollout_mask,
+                        torch.zeros(
+                            (rollout_mask.shape[0], config.validation.rollout_extension.steps),
+                            dtype=torch.bool,
+                            device=device,
+                        ),
+                    ),
+                    dim=1,
+                )
             feedback_pairs = [
                 (config.data.target_columns.index(name), config.data.input_columns.index(name))
                 for name in config.data.feedback_columns
                 if name in config.data.target_columns and name in config.data.input_columns
             ]
-            for future_idx in range(min(total_rollout_len, int(future_inputs.shape[1]))):
-                logits = cast(
-                    "torch.Tensor",
-                    model(
-                        current, mask=torch.ones(current.shape[:2], dtype=torch.bool, device=device)
-                    ),
-                )
-                pred = decode_categorical_logits(
-                    logits[:, -1:, :, :], _target_ranges(config, device)
-                )
-                predictions.append(pred.cpu())
-                next_scalar = future_inputs[:, future_idx : future_idx + 1, :].clone()
-                next_input = _rollout_next_input_bins(
+            if _validation_masked_suffix_enabled(config):
+                rollout_result = _masked_suffix_rollout_predictions(
                     config,
-                    next_scalar,
-                    logits[:, -1:, :, :],
-                    pred,
+                    model,
+                    inputs,
+                    targets,
+                    rollout_mask,
+                    context_len,
+                    total_rollout_len,
                     feedback_pairs,
                     device,
                 )
-                current = torch.cat((current[:, 1:, :, :], next_input), dim=1)
-            if predictions and config.validation.log_rollout_plots:
-                pred_tensor = torch.cat(predictions, dim=1)[0]
-                target_tensor = targets[
-                    :, context_len : context_len + pred_tensor.shape[0], :
-                ].cpu()[0]
-                logger.log_payload(
-                    step,
-                    "validation/rollout",
-                    {
-                        "match": group.match,
-                        "anchor": anchor,
-                        "target_columns": list(config.data.target_columns),
-                        "prediction": pred_tensor.tolist(),
-                        "target": target_tensor.tolist(),
-                    },
+            else:
+                rollout_result = _one_step_rollout_predictions(
+                    config,
+                    model,
+                    inputs,
+                    targets,
+                    rollout_mask,
+                    context_len,
+                    total_rollout_len,
+                    feedback_pairs,
+                    device,
                 )
+            rollout_loss_sum = rollout_loss_sum + rollout_result.loss_sum
+            rollout_loss_count = rollout_loss_count + rollout_result.loss_count
+            pred_tensor = rollout_result.prediction
+            if int(pred_tensor.shape[0]) > 0 and config.validation.log_rollout_plots:
+                context_prediction = _context_predictions(
+                    config, model, inputs, context_len, device
+                )
+                input_tensor = inputs[
+                    :, : context_len + pred_tensor.shape[0], :
+                ].cpu()[0]
+                target_tensor = targets[
+                    :, : context_len + pred_tensor.shape[0], :
+                ].cpu()[0]
+                plot_series.append(
+                    RolloutPlotSeries(
+                        inputs=input_tensor,
+                        context_prediction=context_prediction,
+                        prediction=pred_tensor,
+                        target=target_tensor,
+                        match=group.match,
+                        anchor=anchor,
+                    )
+                )
+    if bool((rollout_loss_count > 0).item()):
+        logger.log_metrics(
+            step,
+            {"val/rollout/loss": float((rollout_loss_sum / rollout_loss_count).detach().cpu())},
+        )
+    if plot_series:
+        logger.log_payload(
+            step,
+            "val/rollout/plot",
+            _build_rollout_figure(config, plot_series, context_len, logger.run_name()),
+        )
+
+
+def _build_rollout_figure(
+    config: ExperimentConfig,
+    series: list[RolloutPlotSeries],
+    context_len: int,
+    run_name: str | None,
+) -> object:
+    import plotly.graph_objects as go  # noqa: PLC0415 - only needed for plot payloads.
+    from plotly.subplots import make_subplots  # noqa: PLC0415
+
+    figure = make_subplots(
+        rows=len(config.data.target_columns),
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+    )
+    colors = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b")
+    scaling = _scaling_rules(config)
+    for channel_idx, channel_name in enumerate(config.data.target_columns, start=1):
+        value_idx = channel_idx - 1
+        for series_idx, item in enumerate(series):
+            input_cpu = inverse_scale_tensor(
+                item.inputs.detach().cpu(), config.data.input_columns, scaling
+            )
+            target_cpu = inverse_scale_tensor(
+                item.target.detach().cpu(), config.data.target_columns, scaling
+            )
+            context_prediction_cpu = inverse_scale_tensor(
+                item.context_prediction.detach().cpu(), config.data.target_columns, scaling
+            )
+            prediction_cpu = inverse_scale_tensor(
+                item.prediction.detach().cpu(), config.data.target_columns, scaling
+            )
+            if target_cpu.ndim != PLOT_SEQUENCE_RANK or prediction_cpu.ndim != PLOT_SEQUENCE_RANK:
+                raise ValueError(
+                    "rollout plot expects prediction/target tensors shaped (T, C), got "
+                    f"prediction={tuple(prediction_cpu.shape)} target={tuple(target_cpu.shape)}"
+                )
+            total_steps = int(target_cpu.shape[0])
+            pred_steps = int(prediction_cpu.shape[0])
+            x_values = _rollout_time_axis(config, input_cpu)
+            pred_full = torch.full(
+                (total_steps, int(prediction_cpu.shape[1])),
+                float("nan"),
+                dtype=prediction_cpu.dtype,
+            )
+            pred_full[:context_len, :] = context_prediction_cpu[:context_len, :]
+            pred_full[context_len : context_len + pred_steps, :] = prediction_cpu
+            color = colors[series_idx % len(colors)]
+            cell_id = item.match.get("cell id", "unknown-cell")
+            cycle = item.match.get("cycle index", "unknown-cycle")
+            group_id = f"{cell_id}:{cycle}:{item.anchor}"
+            label = f"{cell_id} cycle={cycle} anchor={item.anchor}"
+            figure.add_trace(
+                go.Scatter(
+                    x=x_values,
+                    y=target_cpu[:, value_idx].tolist(),
+                    mode="lines",
+                    line={"color": color},
+                    name=f"{label} target",
+                    legendgroup=group_id,
+                    showlegend=channel_idx == 1,
+                ),
+                row=channel_idx,
+                col=1,
+            )
+            figure.add_trace(
+                go.Scatter(
+                    x=x_values,
+                    y=pred_full[:, value_idx].tolist(),
+                    mode="lines",
+                    line={"color": color, "dash": "dash"},
+                    name=f"{label} prediction",
+                    legendgroup=group_id,
+                    showlegend=channel_idx == 1,
+                ),
+                row=channel_idx,
+                col=1,
+            )
+            context_x = x_values[min(context_len, len(x_values) - 1)]
+            y_values = torch.cat((target_cpu[:, value_idx], pred_full[:, value_idx]))
+            finite = y_values[torch.isfinite(y_values)]
+            if int(finite.numel()) > 0:
+                y_min = float(finite.min().item())
+                y_max = float(finite.max().item())
+                if y_min == y_max:
+                    y_min -= 1.0
+                    y_max += 1.0
+                figure.add_trace(
+                    go.Scatter(
+                        x=[context_x, context_x],
+                        y=[y_min, y_max],
+                        mode="lines",
+                        line={"color": color, "dash": "dot"},
+                        name=f"{label} context",
+                        legendgroup=group_id,
+                        showlegend=False,
+                    ),
+                    row=channel_idx,
+                    col=1,
+                )
+        figure.update_yaxes(title_text=channel_name, row=channel_idx, col=1)
+    first_match = series[0].match
+    dataset_id = first_match.get("dataset id", "unknown-dataset")
+    protocol = first_match.get("protocol", config.data.protocols[0])
+    display_name = run_name or config.run.name or "local-run"
+    figure.update_layout(
+        title=(
+            f"rollout | run={display_name} | protocol={protocol} | dataset={dataset_id} | "
+            f"context={context_len}"
+        ),
+        xaxis_title="Time [s]",
+        legend={"groupclick": "togglegroup"},
+        height=max(360, 260 * len(config.data.target_columns)),
+    )
+    return figure
+
+
+def _rollout_time_axis(config: ExperimentConfig, inputs: torch.Tensor) -> list[float]:
+    try:
+        dt_idx = config.data.input_columns.index("Time diff [s]")
+    except ValueError:
+        return [float(idx) for idx in range(int(inputs.shape[0]))]
+    dt = inputs[:, dt_idx].to(dtype=torch.float32).clamp_min(0.0)
+    elapsed = torch.cumsum(dt, dim=0) - dt[0]
+    return [float(value) for value in elapsed.tolist()]
+
+
+def _context_predictions(
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    context_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    encoded = _encode_inputs(config, inputs[:, :context_len, :].clone(), device)
+    logits = cast(
+        "torch.Tensor",
+        model(encoded, mask=torch.ones(encoded.shape[:2], dtype=torch.bool, device=device)),
+    )
+    return decode_categorical_logits(logits, _target_ranges(config, device)).cpu()[0]
+
+
+def _one_step_rollout_predictions(
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    context_len: int,
+    rollout_len: int,
+    feedback_pairs: list[tuple[int, int]],
+    device: torch.device,
+) -> RolloutResult:
+    current = _encode_inputs(config, inputs[:, :context_len, :].clone(), device)
+    future_inputs = inputs[:, context_len:, :]
+    predictions: list[torch.Tensor] = []
+    total_loss = torch.zeros((), dtype=torch.float32, device=device)
+    total_count = torch.zeros((), dtype=torch.float32, device=device)
+    states: dict[str, MambaCarryState] | None = None
+    carry_mamba_state = _validation_carry_mamba_state(config)
+    for future_idx in range(min(rollout_len, int(future_inputs.shape[1]))):
+        window_mask = torch.ones(current.shape[:2], dtype=torch.bool, device=device)
+        result = model(
+            current,
+            mask=window_mask,
+            states=states,
+            return_states=carry_mamba_state,
+        )
+        if carry_mamba_state:
+            logits, _final_states = cast(
+                "tuple[torch.Tensor, dict[str, MambaCarryState]]", result
+            )
+        else:
+            logits = cast("torch.Tensor", result)
+        pred = decode_categorical_logits(logits[:, -1:, :, :], _target_ranges(config, device))
+        predictions.append(pred.cpu())
+        target_slice = slice(context_len + future_idx, context_len + future_idx + 1)
+        loss_sum, loss_count = categorical_ce_loss_components(
+            logits[:, -1:, :, :],
+            targets[:, target_slice, :],
+            mask[:, target_slice],
+            config.model.output_sigma,
+            _target_ranges(config, device),
+        )
+        total_loss = total_loss + loss_sum
+        total_count = total_count + loss_count
+        next_scalar = future_inputs[:, future_idx : future_idx + 1, :].clone()
+        next_input = _rollout_next_input_bins(
+            config,
+            next_scalar,
+            logits[:, -1:, :, :],
+            pred,
+            feedback_pairs,
+            device,
+        )
+        if carry_mamba_state:
+            states = _prefix_mamba_states(
+                model, current[:, :1, :, :], window_mask[:, :1], states, 1
+            )
+        current = torch.cat((current[:, 1:, :, :], next_input), dim=1)
+    if not predictions:
+        prediction = torch.empty((0, len(config.data.target_columns)), dtype=inputs.dtype)
+    else:
+        prediction = torch.cat(predictions, dim=1).cpu()[0]
+    return RolloutResult(prediction=prediction, loss_sum=total_loss, loss_count=total_count)
+
+
+def _masked_suffix_rollout_predictions(
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    context_len: int,
+    rollout_len: int,
+    feedback_pairs: list[tuple[int, int]],
+    device: torch.device,
+) -> RolloutResult:
+    suffix_steps = _validation_suffix_steps(config)
+    feedback = inputs.clone()
+    rollout_len = min(rollout_len, max(0, int(feedback.shape[1]) - context_len))
+    predictions: list[torch.Tensor] = []
+    total_loss = torch.zeros((), dtype=torch.float32, device=device)
+    total_count = torch.zeros((), dtype=torch.float32, device=device)
+    feedback_bin_overrides = torch.zeros(
+        (*feedback.shape, config.model.num_bins), dtype=feedback.dtype, device=feedback.device
+    )
+    feedback_bin_override_mask = torch.zeros_like(feedback_bin_overrides, dtype=torch.bool)
+    target_indices = tuple(target_idx for target_idx, _input_idx in feedback_pairs)
+    input_indices = tuple(input_idx for _target_idx, input_idx in feedback_pairs)
+    states: dict[str, MambaCarryState] | None = None
+    carry_mamba_state = _validation_carry_mamba_state(config)
+    completed = 0
+    while completed < rollout_len:
+        current_suffix_steps = min(suffix_steps, rollout_len - completed)
+        window_end = context_len + completed + current_suffix_steps
+        start = window_end - context_len
+        window_inputs = feedback[:, start:window_end, :].clone()
+        if int(window_inputs.shape[1]) < context_len:
+            break
+        suffix_slice = slice(context_len - current_suffix_steps, context_len)
+        masked_input_mask = torch.zeros_like(window_inputs, dtype=torch.bool)
+        for _target_idx, input_idx in feedback_pairs:
+            window_inputs[:, suffix_slice, input_idx] = config.train.masked_suffix.fill_value
+            masked_input_mask[:, suffix_slice, input_idx] = True
+        encoded_window_inputs = _encode_inputs(
+            config, window_inputs, device, masked_input_mask=masked_input_mask
+        )
+        encoded_window_inputs = _apply_binned_feedback_overrides(
+            encoded_window_inputs,
+            feedback_bin_overrides,
+            feedback_bin_override_mask,
+            slice(start, window_end),
+        )
+        window_mask = torch.ones(encoded_window_inputs.shape[:2], dtype=torch.bool, device=device)
+        result = model(
+            encoded_window_inputs,
+            mask=window_mask,
+            states=states,
+            return_states=carry_mamba_state,
+        )
+        if carry_mamba_state:
+            logits, _final_states = cast(
+                "tuple[torch.Tensor, dict[str, MambaCarryState]]", result
+            )
+        else:
+            logits = cast("torch.Tensor", result)
+        pred = decode_categorical_logits(
+            logits[:, suffix_slice, :, :], _target_ranges(config, device)
+        )
+        predictions.append(pred.cpu())
+        write_slice = slice(window_end - current_suffix_steps, window_end)
+        loss_mask = torch.zeros(
+            (*mask[:, write_slice].shape, len(config.data.target_columns)),
+            dtype=torch.bool,
+            device=device,
+        )
+        for target_idx in target_indices:
+            loss_mask[:, :, target_idx] = mask[:, write_slice]
+        loss_sum, loss_count = categorical_ce_loss_components(
+            logits[:, suffix_slice, :, :],
+            targets[:, write_slice, :],
+            loss_mask,
+            config.model.output_sigma,
+            _target_ranges(config, device),
+        )
+        total_loss = total_loss + loss_sum
+        total_count = total_count + loss_count
+        _write_masked_suffix_feedback(
+            config,
+            feedback,
+            feedback_bin_overrides,
+            feedback_bin_override_mask,
+            logits,
+            suffix_slice,
+            write_slice,
+            target_indices,
+            input_indices,
+            device,
+        )
+        completed += current_suffix_steps
+        if carry_mamba_state and completed < rollout_len:
+            states = _prefix_mamba_states(
+                model,
+                encoded_window_inputs,
+                window_mask,
+                states,
+                current_suffix_steps,
+            )
+    if not predictions:
+        prediction = torch.empty((0, len(config.data.target_columns)), dtype=inputs.dtype)
+    else:
+        prediction = torch.cat(predictions, dim=1).cpu()[0]
+    return RolloutResult(prediction=prediction, loss_sum=total_loss, loss_count=total_count)
 
 
 def _stream_matches(
@@ -652,11 +1136,16 @@ def _append_rollout_extension(config: ExperimentConfig, inputs: torch.Tensor) ->
     return torch.cat((inputs, suffix), dim=1)
 
 
-def _loader_config(config: ExperimentConfig, split: str) -> DataLoaderConfig:
+def _loader_config(
+    config: ExperimentConfig, split: str, *, expand_roll_forward: bool = False
+) -> DataLoaderConfig:
+    seq_len = config.loader.seq_len
+    if expand_roll_forward and config.train.masked_suffix.enabled:
+        seq_len += config.train.masked_suffix.roll_forward_steps
     return DataLoaderConfig(
         split=split,
         default_window=WindowConfig(
-            batch_size=config.loader.batch_size, seq_len=config.loader.seq_len
+            batch_size=config.loader.batch_size, seq_len=seq_len
         ),
         strategy=config.loader.strategy,
         active_protocol=DatasetProtocolId(config.data.protocols[0]),

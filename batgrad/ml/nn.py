@@ -513,14 +513,40 @@ def categorical_ce_loss(
     sigma: float,
     target_ranges: torch.Tensor,
 ) -> torch.Tensor:
+    loss_sum, count = categorical_ce_loss_components(logits, target, mask, sigma, target_ranges)
+    if bool((count <= 0).item()):
+        return torch.zeros((), dtype=loss_sum.dtype, device=loss_sum.device)
+    return loss_sum / count
+
+
+def categorical_ce_loss_components(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None,
+    sigma: float,
+    target_ranges: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    target = target.to(device=logits.device)
+    valid: torch.Tensor | None = None
+    if mask is not None:
+        valid = mask.to(dtype=torch.bool, device=logits.device)
+        if valid.shape == target.shape[:-1]:
+            valid = valid.unsqueeze(-1).expand(target.shape)
+        elif valid.shape != target.shape:
+            raise ValueError(
+                "categorical CE mask must have shape target.shape[:-1] or target.shape, "
+                f"got mask={tuple(valid.shape)} target={tuple(target.shape)}"
+            )
+        target = torch.where(valid, target, torch.zeros_like(target))
     target_dist = categorical_target_distribution(
         target, int(logits.shape[-1]), sigma, target_ranges
     )
     loss = -(target_dist * torch.log_softmax(logits.float(), dim=-1)).sum(dim=-1)
-    if mask is None:
-        return loss.mean()
-    valid = mask.to(dtype=torch.bool, device=loss.device).unsqueeze(-1)
-    return loss.masked_select(valid.expand_as(loss)).mean()
+    if valid is None:
+        return loss.sum(), torch.tensor(float(loss.numel()), dtype=loss.dtype, device=loss.device)
+    selected = loss.masked_select(valid)
+    count = torch.tensor(float(selected.numel()), dtype=loss.dtype, device=loss.device)
+    return selected.sum(), count
 
 
 def decode_categorical_logits(logits: torch.Tensor, target_ranges: torch.Tensor) -> torch.Tensor:

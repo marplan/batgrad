@@ -1,8 +1,8 @@
 {
   "data": {
-    "store_root": "/data/loc_datasets",
+    "store_root": "/data",
     "manifest_paths": {
-      "type=published/dataset=pozzato-2022/source=normalized/manifest.parquet": "1f5c354"
+      "type=synthetic/dataset=synthetic-pozzato-2022-m50t/source=normalized/manifest.parquet": "1f5c354"
     },
     "protocols": ["cycling"],
     "input_columns": [
@@ -66,7 +66,6 @@
       "fill_value": 0.0,
       "loss_on_masked_only": true,
       "carry_mamba_state": false,
-      "carry_final_mamba_state": false,
       "detach_between_windows": true,
       "roll_forward_steps": 128
     }
