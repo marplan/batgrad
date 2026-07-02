@@ -6,19 +6,19 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from batgrad.contracts.mapping import BaseColumns, DatasetStageId, MappingSpec
+from batgrad.contracts.segments import segment_values
 from batgrad.data.processing.interactive import InteractiveProtocolSpec, run_load_interactive
 from batgrad.data.processing.io import (
-    SegmentSource,
     mapping_column_expr,
     mapping_column_exprs,
     mapping_column_sources,
-    segment_values,
 )
 from batgrad.data.transforms.checks import (
     TimeCheckState,
     rebuild_time_axis_chunk,
     rebuild_time_axis_lazy,
 )
+from batgrad.storage.segments import SegmentSource
 from batgrad.viz.viewport import viewport_expr
 
 if TYPE_CHECKING:
@@ -244,8 +244,10 @@ def protocol_group_by(protocol_spec: InteractiveProtocolSpec) -> tuple[MappingSp
     group_by = getattr(protocol_spec, "group_by", None)
     if group_by is not None:
         return tuple(group_by)
-    metadata = getattr(protocol_spec, "protocol_metadata", None) or protocol_spec.protocol.metadata
-    return tuple(metadata.task_key)
+    metadata = getattr(protocol_spec, "protocol_metadata", None)
+    if metadata is not None:
+        return tuple(metadata.task_key)
+    return tuple(protocol_spec.protocol.task_key)
 
 
 def has_sources(entry: RunEntry, column: MappingSpec) -> bool:

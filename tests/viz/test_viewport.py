@@ -4,8 +4,8 @@ import polars as pl
 import pytest
 
 from batgrad.contracts.mapping import BaseColumns
-from batgrad.data.processing.io import SegmentSource
 from batgrad.data.transforms.resampling import MinMaxLTTBResamplingSpec
+from batgrad.storage.segments import SegmentSource
 from batgrad.viz.viewport import (
     AnnotationSource,
     TraceSource,

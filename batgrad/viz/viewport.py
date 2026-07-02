@@ -5,13 +5,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 import polars as pl
 
-from batgrad.contracts.mapping import BaseColumns
-from batgrad.data.processing.io import SegmentSource, collect_frame
+from batgrad.contracts.mapping import BaseColumns, MappingSpec
+from batgrad.storage.segments import SegmentSource, collect_frame
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from batgrad.contracts.mapping import MappingSpec
     from batgrad.data.transforms.resampling import ResamplingSpec
 
 
@@ -24,17 +23,20 @@ _ANNOTATION_BOUNDARY = "__batgrad_annotation_boundary"
 class TraceSource:
     trace_idx: int
     lf: pl.LazyFrame
-    x_col: MappingSpec
-    y_col: MappingSpec
+    x_col: str | MappingSpec
+    y_col: str | MappingSpec
     resampling: ResamplingSpec
-    customdata_cols: tuple[MappingSpec, ...] = ()
+    customdata_cols: tuple[str | MappingSpec, ...] = ()
     segment_source: SegmentSource | None = None
     extra_exprs: tuple[pl.Expr, ...] = ()
     row_count: int | None = None
-    chunk_iter: Callable[
-        [TraceSource, tuple[float, float] | None, tuple[float, float] | None, int, str],
-        Iterator[pl.DataFrame],
-    ] | None = None
+    chunk_iter: (
+        Callable[
+            [TraceSource, tuple[float, float] | None, tuple[float, float] | None, int, str],
+            Iterator[pl.DataFrame],
+        ]
+        | None
+    ) = None
 
 
 @dataclass(frozen=True)
@@ -57,8 +59,8 @@ class AnnotationSource:
     trace_idx: int
     parent_trace_idx: int
     lf: pl.LazyFrame
-    x_col: MappingSpec
-    y_col: MappingSpec
+    x_col: str | MappingSpec
+    y_col: str | MappingSpec
     annotation_columns: tuple[str, ...]
     annotation_reason: str
     segment_source: SegmentSource | None = None
@@ -181,8 +183,8 @@ def sample_annotation_viewport(
 
 def _filter_viewport(
     lf: pl.LazyFrame,
-    x_col: MappingSpec,
-    y_col: MappingSpec,
+    x_col: str | MappingSpec,
+    y_col: str | MappingSpec,
     x_range: tuple[float, float] | None,
     y_range: tuple[float, float] | None,
 ) -> pl.LazyFrame:
@@ -192,8 +194,8 @@ def _filter_viewport(
 
 def _filter_viewport_frame(
     frame: pl.DataFrame,
-    x_col: MappingSpec,
-    y_col: MappingSpec,
+    x_col: str | MappingSpec,
+    y_col: str | MappingSpec,
     x_range: tuple[float, float] | None,
     y_range: tuple[float, float] | None,
 ) -> pl.DataFrame:
@@ -202,8 +204,8 @@ def _filter_viewport_frame(
 
 
 def viewport_expr(
-    x_col: MappingSpec,
-    y_col: MappingSpec,
+    x_col: str | MappingSpec,
+    y_col: str | MappingSpec,
     x_range: tuple[float, float] | None,
     y_range: tuple[float, float] | None,
 ) -> pl.Expr | None:
@@ -245,19 +247,19 @@ def _iter_bounded_chunks(
         yield chunk
 
 
-def _sample_columns(source: TraceSource) -> list[MappingSpec]:
+def _sample_columns(source: TraceSource) -> list[str | MappingSpec]:
     columns = [source.x_col, source.y_col]
     columns.extend(column for column in source.customdata_cols if column not in columns)
     return list(dict.fromkeys(columns))
 
 
-def _annotation_sample_columns(source: AnnotationSource) -> list[MappingSpec]:
+def _annotation_sample_columns(source: AnnotationSource) -> list[str | MappingSpec]:
     return list(dict.fromkeys((source.x_col, source.y_col, BaseColumns.anns)))
 
 
 def _customdata_rows(
     sampled: pl.DataFrame,
-    customdata_cols: tuple[MappingSpec, ...],
+    customdata_cols: tuple[str | MappingSpec, ...],
 ) -> list[list[object]] | None:
     cols = [column for column in customdata_cols if column in sampled.columns]
     if not cols:

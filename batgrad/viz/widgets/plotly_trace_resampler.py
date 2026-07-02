@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
 import anywidget
 import polars as pl
 import traitlets
 
-from batgrad.data.processing.io import collect_frame
+from batgrad.storage.segments import collect_frame
 from batgrad.viz.viewport import (
     AnnotationSource,
     TraceSample,
@@ -25,8 +26,8 @@ if TYPE_CHECKING:
     import plotly.graph_objects as go
 
     from batgrad.contracts.mapping import MappingSpec
-    from batgrad.data.processing.io import SegmentSource
     from batgrad.data.transforms.resampling import ResamplingSpec
+    from batgrad.storage.segments import SegmentSource
 
 
 _ESM = Path(__file__).with_suffix(".js")
@@ -69,6 +70,8 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         self._trace_axes: dict[int, tuple[str, str]] = {}
         self._initial_samples: dict[int, TraceSample] = {}
         self._initial_annotation_samples: dict[int, TraceSample] = {}
+        self._last_axes: dict[str, object] = {}
+        self._last_request_id = 0
         self._max_points_per_trace = int(max_points_per_trace)
         self._max_points_per_figure = int(max_points_per_figure)
         self._max_batch_rows = max_batch_rows
@@ -80,11 +83,11 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         self,
         trace_idx: int,
         lf: pl.LazyFrame,
-        x_col: MappingSpec,
-        y_col: MappingSpec,
+        x_col: str | MappingSpec,
+        y_col: str | MappingSpec,
         resampling: ResamplingSpec,
         *,
-        customdata_cols: tuple[MappingSpec, ...] = (),
+        customdata_cols: tuple[str | MappingSpec, ...] = (),
         segment_source: SegmentSource | None = None,
         extra_exprs: tuple[pl.Expr, ...] = (),
         row_count: int | None = None,
@@ -125,13 +128,9 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
             resampling=resampling,
             customdata_cols=customdata_cols,
             segment_source=(
-                segment_source
-                if inspection_segment_source is None
-                else inspection_segment_source
+                segment_source if inspection_segment_source is None else inspection_segment_source
             ),
-            extra_exprs=(
-                extra_exprs if inspection_extra_exprs is None else inspection_extra_exprs
-            ),
+            extra_exprs=(extra_exprs if inspection_extra_exprs is None else inspection_extra_exprs),
             row_count=row_count if inspection_row_count is None else inspection_row_count,
             chunk_iter=chunk_iter if inspection_chunk_iter is None else inspection_chunk_iter,
         )
@@ -142,8 +141,8 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         trace_idx: int,
         parent_trace_idx: int,
         lf: pl.LazyFrame,
-        x_col: MappingSpec,
-        y_col: MappingSpec,
+        x_col: str | MappingSpec,
+        y_col: str | MappingSpec,
         *,
         annotation_columns: tuple[str, ...],
         annotation_reason: str,
@@ -184,10 +183,46 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         self._fig_json = fig_json
         self._status = _status_text(samples)
         self._update = {"updates": [], "status": self._status, "_rid": 0}
+        self._last_request_id = 0
         self.selection = {}
         return self
 
-    def selected_data(  # noqa: C901, PLR0912
+    def update_registered_traces(
+        self,
+        updates: tuple[tuple[int, pl.LazyFrame, int | None], ...],
+    ) -> None:
+        """Replace registered trace sources and push one atomic resampled update."""
+        if not updates:
+            return
+        trace_indices = []
+        for trace_idx, lf, row_count in updates:
+            source = self._sources.get(trace_idx)
+            if source is None:
+                raise ValueError(f"trace_idx {trace_idx} is not registered")
+            self._sources[trace_idx] = replace(source, lf=lf, row_count=row_count)
+            inspection_source = self._inspection_sources.get(trace_idx)
+            if inspection_source is not None:
+                self._inspection_sources[trace_idx] = replace(
+                    inspection_source,
+                    lf=lf,
+                    row_count=row_count,
+                )
+            self._initial_samples.pop(trace_idx, None)
+            trace_indices.append(trace_idx)
+
+        samples = self._sample_traces(trace_indices, axes=self._last_axes)
+        status = _status_text(samples)
+        self._status = status
+        self._update = {
+            "updates": [_sample_payload(sample) for sample in samples],
+            "status": status,
+            # `_rid` is owned by frontend viewport requests. Backend-initiated
+            # trace updates must not advance beyond the frontend counter, or the
+            # next zoom response can be incorrectly dropped as stale.
+            "_rid": self._last_request_id,
+        }
+
+    def selected_data(
         self,
         *,
         selection: Mapping[str, object] | None = None,
@@ -212,56 +247,47 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         for selected_trace in selected_traces:
             if remaining <= 0:
                 break
-            if not isinstance(selected_trace, Mapping):
-                continue
-            selected_trace_map = cast("Mapping[str, object]", selected_trace)
-            try:
-                trace_idx = int(cast("Any", selected_trace_map.get("trace_idx")))
-            except (TypeError, ValueError):
-                continue
-            source = self._inspection_sources.get(trace_idx, self._sources.get(trace_idx))
-            if source is None:
-                continue
-
-            lf = source.lf.with_row_index("data index")
-            if source.extra_exprs:
-                lf = lf.with_columns(source.extra_exprs)
-            expr = viewport_expr(
-                source.x_col,
-                source.y_col,
-                _numeric_range(selected_trace_map.get("x_range")),
-                _numeric_range(selected_trace_map.get("y_range")),
-            )
-            if expr is not None:
-                lf = lf.filter(expr)
-
-            columns = list(
-                dict.fromkeys((source.x_col, source.y_col, *source.customdata_cols))
-            )
-            lf = lf.select(
-                pl.lit(_figure_title(self._fig)).alias("widget title"),
-                pl.lit(_selected_trace_label(selected_trace_map, trace_idx)).alias("trace"),
-                pl.lit(str(source.x_col)).alias("x column"),
-                pl.lit(str(source.y_col)).alias("y column"),
-                "data index",
-                *columns,
-            )
-            trace_rows = int(collect_frame(lf.select(pl.len().alias("__n")))["__n"].item())
             trace_offset = max(0, offset - total_rows)
-            if trace_offset < trace_rows:
-                frame = collect_frame(lf.slice(trace_offset, remaining))
-                if frame.height:
-                    frames.append(frame)
-                    remaining -= frame.height
+            frame, trace_rows = self._selected_trace_frame(
+                selected_trace,
+                offset=trace_offset,
+                limit=remaining,
+            )
+            if frame.height:
+                frames.append(frame)
+                remaining -= frame.height
             total_rows += trace_rows
 
         if not frames:
             return pl.DataFrame(), total_rows
         return pl.concat(frames, how="diagonal_relaxed"), total_rows
 
-    def _on_evt(self, change: dict[str, Any]) -> None:
-        evt = change.get("new")
-        if not isinstance(evt, dict):
+    def _selected_trace_frame(
+        self,
+        selected_trace: object,
+        *,
+        offset: int,
+        limit: int,
+    ) -> tuple[pl.DataFrame, int]:
+        selected_trace_map = _dict_payload(selected_trace)
+        if not selected_trace_map:
+            return pl.DataFrame(), 0
+        trace_idx = _selected_trace_idx(selected_trace_map)
+        if trace_idx is None:
+            return pl.DataFrame(), 0
+        source = self._inspection_sources.get(trace_idx, self._sources.get(trace_idx))
+        if source is None:
+            return pl.DataFrame(), 0
+
+        lf = _selected_trace_lazy_frame(self._fig, source, selected_trace_map, trace_idx)
+        trace_rows = int(collect_frame(lf.select(pl.len().alias("__n")))["__n"].item())
+        if offset >= trace_rows:
+            return pl.DataFrame(), trace_rows
+        return collect_frame(lf.slice(offset, limit)), trace_rows
+
+    def _on_evt(self, change: dict[str, object]) -> None:
+        evt = _dict_payload(change.get("new"))
+        if not evt:
             return
         visible = _dict_payload(evt.get("visible"))
         indices = [idx for idx in sorted(self._sources) if bool(visible.get(str(idx), True))]
@@ -271,6 +297,8 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
             if bool(visible.get(str(source.parent_trace_idx), True))
         ]
         axes = _dict_payload(evt.get("axes"))
+        self._last_axes = axes
+        self._last_request_id = int(str(evt.get("_rid") or 0))
         samples = self._sample_traces(indices, axes=axes)
         annotation_samples = self._sample_annotations(annotation_indices, axes=axes)
         status = _status_text(samples)
@@ -278,7 +306,7 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         self._update = {
             "updates": [_sample_payload(sample) for sample in (*samples, *annotation_samples)],
             "status": status,
-            "_rid": int(evt.get("_rid") or 0),
+            "_rid": self._last_request_id,
         }
 
     def _sample_traces(
@@ -339,6 +367,41 @@ def _trace_axis_keys(trace: dict[str, object]) -> tuple[str, str]:
     )
 
 
+def _selected_trace_idx(selected_trace: Mapping[str, object]) -> int | None:
+    try:
+        return int(str(selected_trace.get("trace_idx")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _selected_trace_lazy_frame(
+    fig: go.Figure,
+    source: TraceSource,
+    selected_trace: Mapping[str, object],
+    trace_idx: int,
+) -> pl.LazyFrame:
+    lf = source.lf.with_row_index("data index")
+    if source.extra_exprs:
+        lf = lf.with_columns(source.extra_exprs)
+    expr = viewport_expr(
+        source.x_col,
+        source.y_col,
+        _numeric_range(selected_trace.get("x_range")),
+        _numeric_range(selected_trace.get("y_range")),
+    )
+    if expr is not None:
+        lf = lf.filter(expr)
+    columns = list(dict.fromkeys((source.x_col, source.y_col, *source.customdata_cols)))
+    return lf.select(
+        pl.lit(_figure_title(fig)).alias("widget title"),
+        pl.lit(_selected_trace_label(selected_trace, trace_idx)).alias("trace"),
+        pl.lit(str(source.x_col)).alias("x column"),
+        pl.lit(str(source.y_col)).alias("y column"),
+        "data index",
+        *columns,
+    )
+
+
 def _dict_payload(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping):
         return {}
@@ -352,16 +415,16 @@ def _layout_axis_key(axis_ref: str, prefix: str) -> str:
 
 
 def _axis_range(axis: object) -> tuple[float, float] | None:
-    if not isinstance(axis, Mapping):
+    axis_map = _dict_payload(axis)
+    if not axis_map:
         return None
-    axis_map: Mapping[Any, Any] = axis
     if axis_map.get("autorange") is True:
         return None
     values = axis_map.get("range")
     if not isinstance(values, list | tuple) or len(values) < _AXIS_RANGE_VALUES:
         return None
     try:
-        low, high = float(values[0]), float(values[1])
+        low, high = float(str(values[0])), float(str(values[1]))
     except (TypeError, ValueError):
         return None
     if axis_map.get("type") == "log":
@@ -372,9 +435,8 @@ def _axis_range(axis: object) -> tuple[float, float] | None:
 def _numeric_range(value: object) -> tuple[float, float] | None:
     if not isinstance(value, list | tuple) or len(value) < _AXIS_RANGE_VALUES:
         return None
-    values = cast("tuple[Any, ...] | list[Any]", value)
     try:
-        return float(values[0]), float(values[1])
+        return float(str(value[0])), float(str(value[1]))
     except (TypeError, ValueError):
         return None
 

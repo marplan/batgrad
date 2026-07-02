@@ -4,13 +4,25 @@ from typing import TYPE_CHECKING
 
 import plotly.graph_objects as go
 import polars as pl
-from plotly.colors import qualitative
-from plotly.subplots import make_subplots
 
 from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId, DatasetStageId, MappingSpec
-from batgrad.data.processing.io import collect_frame, mapping_column_sources
+from batgrad.data.processing.io import mapping_column_sources
 from batgrad.data.transforms.resampling import MinMaxLTTBResamplingSpec
-from batgrad.viz.layouts import eis_subplot_kwargs, timeseries_subplot_kwargs
+from batgrad.storage.segments import collect_frame
+from batgrad.viz.plotting import (
+    DEFAULT_MARKER_SIZE,
+    EIS_COLUMNS,
+    EIS_NEG_IMAG,
+    add_plotly_trace,
+    add_registered_xy_trace,
+    annotation_hovertemplate,
+    axis_hovertemplate,
+    colors_by_label,
+    consume_showlegend,
+    make_eis_figure,
+    make_timeseries_figure,
+    make_trace_resampler,
+)
 from batgrad.viz.sources import (
     OverlayEntry as _OverlayEntry,
     RunEntry as _RunEntry,
@@ -28,22 +40,14 @@ from batgrad.viz.sources import (
     protocol_output_column as _protocol_output_column,
     source_exprs as _source_exprs,
 )
-from batgrad.viz.widgets.plotly_trace_resampler import PlotlyTraceResampler
 
 if TYPE_CHECKING:
     from batgrad.data.processing.interactive import InteractiveProtocolSpec, InteractiveStageRun
     from batgrad.data.transforms.resampling import ResamplingSpec
+    from batgrad.viz.widgets.plotly_trace_resampler import PlotlyTraceResampler
 
 
-_EIS_NEG_IMAG = "__batgrad_neg_z_imag"
-_EIS_COLS = {
-    BaseColumns.freq,
-    BaseColumns.z_real,
-    BaseColumns.z_imag,
-    BaseColumns.z_mag,
-    BaseColumns.z_phase,
-}
-_COLORWAY = tuple(qualitative.Plotly)
+_EIS_COLS = set(EIS_COLUMNS)
 
 
 def make_widgets(
@@ -101,21 +105,17 @@ def make_timeseries_widget(
     if not y_cols:
         return None
 
-    fig = make_subplots(**timeseries_subplot_kwargs(len(y_cols)))
-    fig.update_layout(
-        height=max(350, 240 * len(y_cols)),
-        hovermode="closest",
-        paper_bgcolor="rgba(0,0,0,0)",
-        title=_protocol_title_layout(entries),
+    fig, height = make_timeseries_figure(
+        tuple(str(column) for column in y_cols),
+        str(axis_col),
+        _protocol_title_layout(entries),
     )
-    fig.update_xaxes(title_text=str(axis_col), row=len(y_cols), col=1)
-
-    widget = PlotlyTraceResampler(
+    widget = make_trace_resampler(
         fig,
+        height,
         max_points_per_trace=max_points_per_trace,
         max_points_per_figure=max_points_per_figure,
         max_batch_rows=max_batch_rows,
-        height=max(350, 240 * len(y_cols)),
     )
 
     colors = _entry_colors(entries)
@@ -143,13 +143,13 @@ def make_timeseries_widget(
                 label=display_label,
                 legendgroup=label,
                 color=color,
-                showlegend=_consume_showlegend(label, shown_labels),
-                hovertemplate=_axis_hovertemplate(display_label, axis_col, y_col, ()),
+                showlegend=consume_showlegend(label, shown_labels),
+                hovertemplate=axis_hovertemplate(display_label, axis_col, y_col, ()),
                 customdata_cols=(),
                 resampling=MinMaxLTTBResamplingSpec(
                     x_col=axis_col, y_col=y_col, points=max_points_per_trace
                 ),
-                marker={"color": color, "size": 6},
+                marker={"color": color, "size": DEFAULT_MARKER_SIZE},
             )
             for annotation_reason, annotation_columns in _annotation_overlays_for_y_col(
                 annotation_messages, output_y_col
@@ -191,10 +191,9 @@ def make_timeseries_widget(
                     col=1,
                     label="ingested",
                     legendgroup=label,
-                    showlegend=_consume_showlegend("ingested", shown_overlay_labels),
+                    showlegend=consume_showlegend("ingested", shown_overlay_labels),
                     max_points_per_trace=max_points_per_trace,
                 )
-            fig.update_yaxes(title_text=str(y_col), row=row_idx, col=1)
     return widget if fig.data else None
 
 
@@ -218,32 +217,26 @@ def _add_registered_trace(
     extra_exprs: tuple[pl.Expr, ...] = (),
 ) -> int:
     source_exprs = _source_exprs(entry, (x_col, y_col, *customdata_cols))
-    trace_idx = _add_plotly_trace(
+    return add_registered_xy_trace(
         fig,
-        go.Scattergl(
-            name=label,
-            legendgroup=legendgroup or label,
-            showlegend=showlegend,
-            line={"color": color},
-            marker=marker or {"color": color},
-            mode="lines+markers",
-            hovertemplate=hovertemplate,
-        ),
-        row,
-        col,
-    )
-    widget.register_trace(
-        trace_idx,
+        widget,
         entry.source.scan(),
-        x_col,
-        y_col,
-        resampling,
+        x_col=x_col,
+        y_col=y_col,
+        row=row,
+        col=col,
+        label=label,
+        legendgroup=legendgroup,
+        color=color,
+        showlegend=showlegend,
+        hovertemplate=hovertemplate,
+        resampling=resampling,
         customdata_cols=customdata_cols,
         segment_source=entry.source,
         extra_exprs=(*source_exprs, *extra_exprs),
         row_count=_entry_row_count(entry),
+        marker=marker,
     )
-    return trace_idx
 
 
 def _add_annotation_trace(
@@ -263,7 +256,7 @@ def _add_annotation_trace(
     showlegend: bool,
     extra_exprs: tuple[pl.Expr, ...],
 ) -> None:
-    trace_idx = _add_plotly_trace(
+    trace_idx = add_plotly_trace(
         fig,
         go.Scattergl(
             name=label,
@@ -271,7 +264,7 @@ def _add_annotation_trace(
             showlegend=showlegend,
             marker={"color": "red", "size": 8},
             mode="markers",
-            hovertemplate=_annotation_hovertemplate(label),
+            hovertemplate=annotation_hovertemplate(label),
         ),
         row,
         col,
@@ -311,15 +304,15 @@ def _add_ingested_overlay_trace(
     lf = _overlay_lazy_frame(
         overlay_entry, normalized_entry.protocol_spec, x_col, y_col, source_y_col
     )
-    trace_idx = _add_plotly_trace(
+    trace_idx = add_plotly_trace(
         fig,
         go.Scattergl(
             name=label,
             legendgroup=legendgroup,
             showlegend=showlegend,
-            marker={"color": "silver", "size": 6, "symbol": "circle-open"},
+            marker={"color": "silver", "size": DEFAULT_MARKER_SIZE, "symbol": "circle-open"},
             mode="markers",
-            hovertemplate=_axis_hovertemplate(
+            hovertemplate=axis_hovertemplate(
                 label,
                 x_col,
                 y_col,
@@ -344,18 +337,6 @@ def _add_ingested_overlay_trace(
     )
 
 
-def _add_plotly_trace(fig: go.Figure, trace: go.Scattergl, row: int, col: int) -> int:
-    trace_idx = len(fig.data)
-    fig.add_trace(trace, row=row, col=col)
-    return trace_idx
-
-
-def _consume_showlegend(label: str, shown_labels: set[str]) -> bool:
-    showlegend = label not in shown_labels
-    shown_labels.add(label)
-    return showlegend
-
-
 def _protocol_title_layout(entries: list[_RunEntry]) -> dict[str, object]:
     return {"text": _protocol_title(entries), "x": 0.5, "xanchor": "center"}
 
@@ -367,26 +348,13 @@ def make_eis_widget(
     max_points_per_figure: int,
     max_batch_rows: int | None,
 ) -> PlotlyTraceResampler | None:
-    fig = make_subplots(**eis_subplot_kwargs())
-    fig.update_layout(
-        height=650,
-        hovermode="closest",
-        paper_bgcolor="rgba(0,0,0,0)",
-        title=_protocol_title_layout(entries),
-    )
-    fig.update_xaxes(title_text=str(BaseColumns.z_real), row=1, col=1)
-    fig.update_yaxes(title_text=f"-{BaseColumns.z_imag}", row=1, col=1)
-    fig.update_xaxes(title_text=str(BaseColumns.freq), type="log", row=1, col=2)
-    fig.update_yaxes(title_text=str(BaseColumns.z_mag), row=1, col=2)
-    fig.update_xaxes(title_text=str(BaseColumns.freq), type="log", row=2, col=2)
-    fig.update_yaxes(title_text=str(BaseColumns.z_phase), row=2, col=2)
-
-    widget = PlotlyTraceResampler(
+    fig, height = make_eis_figure(_protocol_title_layout(entries))
+    widget = make_trace_resampler(
         fig,
+        height,
         max_points_per_trace=max_points_per_trace,
         max_points_per_figure=max_points_per_figure,
         max_batch_rows=max_batch_rows,
-        height=650,
     )
 
     colors = _entry_colors(entries)
@@ -397,8 +365,8 @@ def make_eis_widget(
         label = _entry_label(entry)
         color = colors[label]
         group_cols = _available_group_cols(entry)
-        neg_imag_expr = (-pl.col(BaseColumns.z_imag)).alias(_EIS_NEG_IMAG)
-        neg_imag_col = MappingSpec(_EIS_NEG_IMAG, dtype=BaseColumns.z_imag.dtype)
+        neg_imag_expr = (-pl.col(BaseColumns.z_imag)).alias(EIS_NEG_IMAG)
+        neg_imag_col = MappingSpec(EIS_NEG_IMAG, dtype=BaseColumns.z_imag.dtype)
         _add_registered_trace(
             fig,
             widget,
@@ -409,8 +377,8 @@ def make_eis_widget(
             col=1,
             label=label,
             color=color,
-            showlegend=_consume_showlegend(label, shown_labels),
-            hovertemplate=_axis_hovertemplate(
+            showlegend=consume_showlegend(label, shown_labels),
+            hovertemplate=axis_hovertemplate(
                 label,
                 BaseColumns.z_real,
                 neg_imag_col,
@@ -435,7 +403,7 @@ def make_eis_widget(
             label=label,
             color=color,
             showlegend=False,
-            hovertemplate=_axis_hovertemplate(
+            hovertemplate=axis_hovertemplate(
                 label, BaseColumns.freq, BaseColumns.z_mag, group_cols
             ),
             customdata_cols=group_cols,
@@ -454,7 +422,7 @@ def make_eis_widget(
             label=label,
             color=color,
             showlegend=False,
-            hovertemplate=_axis_hovertemplate(
+            hovertemplate=axis_hovertemplate(
                 label, BaseColumns.freq, BaseColumns.z_phase, group_cols
             ),
             customdata_cols=group_cols,
@@ -514,7 +482,7 @@ def _protocol_title(entries: list[_RunEntry]) -> str:
 
 def _entry_colors(entries: list[_RunEntry]) -> dict[str, str]:
     labels = list(dict.fromkeys(_entry_label(entry) for entry in entries))
-    return {label: _COLORWAY[idx % len(_COLORWAY)] for idx, label in enumerate(labels)}
+    return colors_by_label(tuple(labels))
 
 
 def _available_group_cols(entry: _RunEntry) -> tuple[MappingSpec, ...]:
@@ -575,31 +543,6 @@ def _annotation_overlays_for_y_col(
     return tuple(
         (reason, tuple(dict.fromkeys(columns))) for reason, columns in sorted(by_reason.items())
     )
-
-
-def _axis_hovertemplate(
-    title: str,
-    x_col: MappingSpec,
-    y_col: MappingSpec,
-    customdata_cols: tuple[MappingSpec, ...],
-    *,
-    x_label: str | None = None,
-    y_label: str | None = None,
-    custom_labels: tuple[str, ...] = (),
-) -> str:
-    rows = [
-        f"<b>{title}</b>",
-        f"{x_label or x_col}: %{{x}}",
-        f"{y_label or y_col}: %{{y}}",
-    ]
-    for idx, column in enumerate(customdata_cols):
-        label = custom_labels[idx] if idx < len(custom_labels) else str(column)
-        rows.append(f"{label}: %{{customdata[{idx}]}}")
-    return "<br>".join(rows) + "<extra></extra>"
-
-
-def _annotation_hovertemplate(title: str) -> str:
-    return f"<b>{title}</b><extra></extra>"
 
 
 def _entry_label(entry: _RunEntry) -> str:
