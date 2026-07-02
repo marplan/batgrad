@@ -11,6 +11,11 @@ from batgrad.contracts.metadata import (
     ProtocolMetadata,
 )
 
+EIS_IMPEDANCE_COLUMN_GROUPS = (
+    (BaseColumns.z_mag, BaseColumns.z_phase),
+    (BaseColumns.z_real, BaseColumns.z_imag),
+)
+
 
 @dataclass(frozen=True, slots=True)
 class BatteryProtocolSpec:
@@ -20,6 +25,8 @@ class BatteryProtocolSpec:
     `metadata` defines protocol-specific task grouping and metadata additions.
     `one_of_col_groups` lists alternative required column groups for protocols
     that accept more than one representation, such as EIS impedance columns.
+    `task_key_group` selects a protocol metadata task-key alternative for this
+    concrete dataset/protocol use.
 
     Attributes:
         protocol_id: Canonical protocol label used in manifests, paths, and
@@ -28,12 +35,33 @@ class BatteryProtocolSpec:
         metadata: Protocol-specific metadata extensions and task grouping keys.
         one_of_col_groups: Alternative accepted required column groups. When set,
             a dataset must provide at least one full group.
+        task_key_group: Selected task-key suffix from
+            `metadata.one_of_task_key_groups`.
     """
 
     protocol_id: DatasetProtocolId
     axis_col: MappingSpec
     metadata: ProtocolMetadata
+    task_key_group: tuple[MappingSpec, ...] = ()
     one_of_col_groups: tuple[tuple[MappingSpec, ...], ...] = ()
+
+    def __post_init__(self) -> None:
+        groups = self.metadata.one_of_task_key_groups
+        if groups and self.task_key_group not in groups:
+            raise ValueError(
+                f"Protocol {self.protocol_id!r} requires task_key_group to be one of "
+                f"{groups}, got {self.task_key_group}"
+            )
+        if not groups and self.task_key_group:
+            raise ValueError(
+                f"Protocol {self.protocol_id!r} does not declare task-key alternatives, "
+                f"got {self.task_key_group}"
+            )
+
+    @property
+    def task_key(self) -> tuple[MappingSpec, ...]:
+        """Concrete task grouping columns for this dataset/protocol use."""
+        return (*self.metadata.task_key, *self.task_key_group)
 
 
 class BatteryProtocols:
@@ -61,8 +89,6 @@ class BatteryProtocols:
         protocol_id=DatasetProtocolId.eis,
         axis_col=BaseColumns.freq,
         metadata=EIS_PROTOCOL_METADATA,
-        one_of_col_groups=(
-            (BaseColumns.z_mag, BaseColumns.z_phase),
-            (BaseColumns.z_real, BaseColumns.z_imag),
-        ),
+        task_key_group=(BaseColumns.soc_pct,),
+        one_of_col_groups=EIS_IMPEDANCE_COLUMN_GROUPS,
     )

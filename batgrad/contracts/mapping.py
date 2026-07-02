@@ -354,8 +354,8 @@ class BaseColumns:
         dtype=pl.List(pl.String),
         description="Raw files for a task.",
     )
-    parq_segs = MappingSpec(
-        "parquet segments",
+    ingest_segs = MappingSpec(
+        "ingested segments",
         dtype=pl.List(
             pl.Struct(
                 {
@@ -365,7 +365,7 @@ class BaseColumns:
                 },
             ),
         ),
-        description="Parquet file segments backing a task.",
+        description="Ingested file segments backing a task.",
     )
     norm_segs = MappingSpec(
         "normalized segments",
@@ -380,6 +380,19 @@ class BaseColumns:
         ),
         description="Normalized file segments backing a task.",
     )
+    norm_stats = MappingSpec(
+        "normalized stats",
+        dtype=pl.List(
+            pl.Struct(
+                {
+                    "column": pl.String,
+                    "min": pl.Float64,
+                    "max": pl.Float64,
+                },
+            ),
+        ),
+        description="Per-task min/max statistics for normalized numeric output columns.",
+    )
     proto = MappingSpec("protocol", dtype=pl.String, description="Battery protocol label.")
     row0 = MappingSpec(
         "row start",
@@ -392,6 +405,11 @@ class BaseColumns:
         description="Stable raw ingest ordering key.",
     )
     soc_pct = MappingSpec("SOC [%]", dtype=pl.Float64)
+    soc_v = MappingSpec(
+        "EIS voltage [V]",
+        dtype=pl.Float64,
+        description="Voltage state used for EIS task grouping when SOC is unavailable.",
+    )
     resamp = MappingSpec(
         "resampling method",
         dtype=pl.String,

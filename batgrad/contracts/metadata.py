@@ -138,7 +138,7 @@ INGEST_STAGE_METADATA = StageLayout(
     manifest=MetadataLayout(
         required=(
             BaseColumns.raw_paths,
-            BaseColumns.parq_segs,
+            BaseColumns.ingest_segs,
             BaseColumns.row_n,
             BaseColumns.proto,
         ),
@@ -162,6 +162,7 @@ NORMALIZE_STAGE_METADATA = StageLayout(
             BaseColumns.row_n,
             BaseColumns.proto,
         ),
+        optional={BaseColumns.norm_stats: None},
     ),
     footer=MetadataLayout(
         required=(
@@ -189,7 +190,9 @@ class ProtocolMetadata:
             manifest rows.
         footer_extra: Protocol-specific metadata required or defaulted in
             generated parquet footers.
-        task_key: Columns used to group manifest rows into processing tasks.
+    task_key: Columns used to group manifest rows into processing tasks.
+        one_of_task_key_groups: Alternative task-key suffixes. Concrete protocol
+            specs must select one of these groups when declared.
 
     Examples:
         >>> metadata = cycle_key_protocol_metadata()
@@ -203,6 +206,7 @@ class ProtocolMetadata:
     manifest_extra: MetadataLayout
     footer_extra: MetadataLayout
     task_key: tuple[MappingSpec, ...] = ()
+    one_of_task_key_groups: tuple[tuple[MappingSpec, ...], ...] = ()
 
 
 def cycle_key_protocol_metadata() -> ProtocolMetadata:
@@ -229,8 +233,8 @@ EIS_PROTOCOL_METADATA = ProtocolMetadata(
     task_key=(
         BaseColumns.cell_id,
         BaseColumns.cidx,
-        BaseColumns.soc_pct,
     ),
+    one_of_task_key_groups=((BaseColumns.soc_pct,), (BaseColumns.soc_v,)),
     manifest_extra=MetadataLayout(required=(BaseColumns.proto,)),
     footer_extra=MetadataLayout(),
 )
