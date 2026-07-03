@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 
 from batgrad.logging import get_logger
 from batgrad.ml.config import (
@@ -19,13 +20,23 @@ from batgrad.ml.config import (
     resolve_store_root,
 )
 from batgrad.ml.data.loader import MlDataIterable, create_dataloader
-from batgrad.ml.loggers import build_logger
+from batgrad.ml.distributed import (
+    DistributedContext,
+    all_reduce_mean,
+    all_reduce_sum,
+    barrier,
+    cleanup_distributed,
+    init_distributed,
+    unwrap_model,
+)
+from batgrad.ml.loggers import NoOpRunLogger, build_logger
 from batgrad.ml.masked_suffix import (
     backward_batch_loss_with_metrics,
     batch_loss_with_metrics,
     masked_suffix_windows,
 )
 from batgrad.ml.metrics import (
+    LossMetrics,
     accumulate_loss_metrics,
     aggregate_rmse,
     feature_metric_payload,
@@ -52,17 +63,20 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0915
+def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, PLR0915
     config = load_experiment_config(path)
-    run_dir = _prepare_run_dir(config)
-
+    dist_ctx = init_distributed(config.run.device)
+    run_dir = _prepare_run_dir(config) if dist_ctx.is_main else None
+    barrier()
     torch.manual_seed(config.run.seed)
-    device = torch.device(config.run.device)
+    device = dist_ctx.device
     store = LocalDataProcessingStore(resolve_store_root(config.data.store_root))
     logger.info("Creating data loaders")
     train_loader, val_loader, train_dataset = _create_loaders(config, store)
     logger.info("Data loaders ready")
-    max_steps = config.train.max_steps or _max_steps_for_epochs(train_dataset, config.train.epochs)
+    max_steps = config.train.max_steps or _max_steps_for_epochs(
+        train_dataset, config.train.epochs, dist_ctx
+    )
     logger.info("Creating model on %s", device)
     model: torch.nn.Module = SequenceMixer(
         config.model,
@@ -76,6 +90,14 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0915
         logger.info("Wrapping model with torch.compile")
         model = cast("torch.nn.Module", torch.compile(model))
         logger.info("Model compile wrapper ready")
+    if dist_ctx.enabled:
+        logger.info("Wrapping model with DistributedDataParallel")
+        model = DistributedDataParallel(
+            model,
+            device_ids=[dist_ctx.local_rank],
+            output_device=dist_ctx.local_rank,
+        )
+        logger.info("DistributedDataParallel wrapper ready")
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.optim.lr,
@@ -85,8 +107,10 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0915
     )
     scheduler = _build_scheduler(config, optimizer, max_steps)
     logger.info("Initializing run logger")
-    run_logger = build_logger(
-        config.logging, run_dir, _logged_config(config, model, device)
+    run_logger = (
+        build_logger(config.logging, run_dir, _logged_config(config, model, device))
+        if dist_ctx.is_main
+        else NoOpRunLogger()
     )
     logger.info("Run logger ready")
     scaler = torch.amp.GradScaler("cuda", enabled=config.run.use_amp and device.type == "cuda")
@@ -103,7 +127,7 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0915
     try:
         logger.info("Starting training loop")
         while step < max_steps:
-            steps_per_epoch = train_dataset.steps_per_epoch(epoch_idx)
+            steps_per_epoch = _local_steps_per_epoch(train_dataset, epoch_idx, dist_ctx)
             if steps_per_epoch <= 0:
                 raise ValueError("training split produced no batches")
             log_every = _cadence_steps(
@@ -137,9 +161,16 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0915
                     collect_metrics=should_log,
                     mask_all_valid=batch.active.all_valid,
                 )
-                loss = loss_metrics.loss
+                log_loss_metrics = (
+                    _reduced_loss_metrics(loss_metrics) if should_log else loss_metrics
+                )
+                loss = log_loss_metrics.loss
                 scaler.unscale_(optimizer)
-                grad_metrics = grad_norm_metrics(model, config, loss_metrics) if should_log else {}
+                grad_metrics = (
+                    grad_norm_metrics(unwrap_model(model), config, log_loss_metrics)
+                    if should_log
+                    else {}
+                )
                 total_grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), config.train.grad_clip_norm
                 )
@@ -156,7 +187,7 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0915
                 if should_log:
                     now = time.perf_counter()
                     elapsed = max(now - log_time, 1e-9)
-                    tokens_per_sec = log_token_count / elapsed
+                    tokens_per_sec = (log_token_count / elapsed) * dist_ctx.world_size
                     log_time = now
                     log_token_count = 0
                     epoch, epoch_pct = _epoch_progress(epoch_idx, epoch_step, steps_per_epoch)
@@ -189,6 +220,7 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0915
                         step,
                         epoch,
                         epoch_pct,
+                        dist_ctx,
                     )
                     _save_validation_checkpoints(
                         config,
@@ -221,6 +253,7 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0915
             )
     finally:
         run_logger.finish()
+        cleanup_distributed()
     return run_dir
 
 
@@ -262,7 +295,7 @@ def _logged_config(
     run_payload = cast("dict[str, object]", payload["run"])
     model_payload = cast("dict[str, object]", payload["model"])
     run_payload["device"] = _resolved_device_name(device)
-    model_payload.update(_model_parameter_counts(model))
+    model_payload.update(_model_parameter_counts(unwrap_model(model)))
     return payload
 
 
@@ -400,7 +433,7 @@ def _save_checkpoint(
     checkpoint_dir.mkdir(exist_ok=True)
     torch.save(
         {
-            "model": model.state_dict(),
+            "model": unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
@@ -435,13 +468,47 @@ def _cadence_steps(
     return max(1, steps_per_epoch // per_epoch)
 
 
-def _max_steps_for_epochs(dataset: MlDataIterable, epochs: float) -> int:
+def _max_steps_for_epochs(
+    dataset: MlDataIterable, epochs: float, dist_ctx: DistributedContext
+) -> int:
     full_epochs = math.floor(epochs)
     partial = epochs - full_epochs
-    total = sum(dataset.steps_per_epoch(epoch_idx) for epoch_idx in range(full_epochs))
+    total = sum(
+        _local_steps_per_epoch(dataset, epoch_idx, dist_ctx) for epoch_idx in range(full_epochs)
+    )
     if partial > 0.0:
-        total += math.ceil(dataset.steps_per_epoch(full_epochs) * partial)
+        total += math.ceil(_local_steps_per_epoch(dataset, full_epochs, dist_ctx) * partial)
     return max(1, total)
+
+
+def _local_steps_per_epoch(
+    dataset: MlDataIterable, epoch_idx: int, dist_ctx: DistributedContext
+) -> int:
+    global_steps = dataset.steps_per_epoch(epoch_idx)
+    if not dist_ctx.enabled:
+        return global_steps
+    return global_steps // dist_ctx.world_size
+
+
+def _reduced_loss_metrics(metrics: LossMetrics) -> LossMetrics:
+    loss = all_reduce_mean(metrics.loss.detach().clone())
+    feature_loss_sum = _all_reduce_optional_sum(metrics.feature_loss_sum)
+    feature_loss_count = _all_reduce_optional_sum(metrics.feature_loss_count)
+    feature_squared_error_sum = _all_reduce_optional_sum(metrics.feature_squared_error_sum)
+    feature_squared_error_count = _all_reduce_optional_sum(metrics.feature_squared_error_count)
+    return LossMetrics(
+        loss=loss,
+        feature_loss_sum=feature_loss_sum,
+        feature_loss_count=feature_loss_count,
+        feature_squared_error_sum=feature_squared_error_sum,
+        feature_squared_error_count=feature_squared_error_count,
+    )
+
+
+def _all_reduce_optional_sum(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    return all_reduce_sum(tensor.detach().clone())
 
 
 def _epoch_progress(epoch_idx: int, epoch_step: int, steps_per_epoch: int) -> tuple[int, int]:
@@ -461,12 +528,14 @@ def _validate(
     step: int,
     epoch: int | None = None,
     epoch_pct: int | None = None,
+    dist_ctx: DistributedContext | None = None,
 ) -> dict[str, float]:
     model.eval()
     logged_metrics: dict[str, float] = {}
     if config.validation.max_tf_batches > 0:
         val_loss_config = validation_loss_config(config)
-        losses: list[float] = []
+        loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+        loss_count = torch.zeros((), dtype=torch.float32, device=device)
         feature_loss_sum = torch.zeros(
             (len(config.data.target_columns),), dtype=torch.float32, device=device
         )
@@ -479,13 +548,13 @@ def _validate(
                 model,
                 batch.active.inputs,
                 batch.active.targets,
-                    batch.active.mask,
-                    device,
-                    include_rmse=True,
-                    mask_all_valid=batch.active.all_valid,
-                )
-            loss = metrics.loss
-            losses.append(float(loss.detach().cpu()))
+                batch.active.mask,
+                device,
+                include_rmse=True,
+                mask_all_valid=batch.active.all_valid,
+            )
+            loss_sum += metrics.loss.detach()
+            loss_count += 1
             accumulate_loss_metrics(
                 metrics,
                 feature_loss_sum,
@@ -495,8 +564,14 @@ def _validate(
             )
             if idx + 1 >= config.validation.max_tf_batches:
                 break
-        if losses:
-            metrics_payload = {"val/tf/loss_ce": sum(losses) / len(losses)}
+        all_reduce_sum(loss_sum)
+        all_reduce_sum(loss_count)
+        all_reduce_sum(feature_loss_sum)
+        all_reduce_sum(feature_loss_count)
+        all_reduce_sum(feature_squared_error_sum)
+        all_reduce_sum(feature_squared_error_count)
+        if bool((loss_count > 0).item()):
+            metrics_payload = {"val/tf/loss_ce": float((loss_sum / loss_count).detach().cpu())}
             rmse = aggregate_rmse(feature_squared_error_sum, feature_squared_error_count)
             if rmse is not None:
                 metrics_payload["val/tf/rmse"] = rmse
@@ -523,9 +598,9 @@ def _validate(
                 epoch_pct=epoch_pct,
             )
             logged_metrics.update(metrics_payload)
-    if config.validation.rollout_steps > 0:
+    if config.validation.rollout_steps > 0 and (dist_ctx is None or dist_ctx.is_main):
         logged_metrics.update(
-            run_rollouts(config, model, train_dataset, store, device, logger, step)
+            run_rollouts(config, unwrap_model(model), train_dataset, store, device, logger, step)
         )
     return logged_metrics
 

@@ -78,9 +78,9 @@
     "output": { "parameterization": "shared" }
   },
   "train": {
-    "epochs": 4.0,
+    "epochs": 8.0,
     "log_every_steps": 10,
-    "validate_every_steps": 1181,
+    "validate_per_epoch": 2,
     "loss": "categorical_ce",
     "grad_clip_norm": 1.0,
     "masked_suffix": {
@@ -154,7 +154,7 @@
     "device": "cuda",
     "seed": 69,
     "use_amp": true,
-    "compile_model": false,
+    "compile_model": true,
     "init_from": null,
     "output_dir": "/workspace/ubuntu/batgrad/output/ml_baseline_runs",
     "name": null

@@ -88,6 +88,27 @@ class StdoutRunLogger:
         return
 
 
+class NoOpRunLogger:
+    def log_metrics(
+        self,
+        step: int,
+        metrics: dict[str, LogValue],
+        *,
+        epoch: int | None = None,
+        epoch_pct: int | None = None,
+    ) -> None:
+        del step, metrics, epoch, epoch_pct
+
+    def log_payload(self, step: int, name: str, payload: object) -> None:
+        del step, name, payload
+
+    def run_name(self) -> str | None:
+        return None
+
+    def finish(self) -> None:
+        return
+
+
 class JsonlRunLogger:
     def __init__(self, run_dir: Path) -> None:
         self._run_name = run_dir.name

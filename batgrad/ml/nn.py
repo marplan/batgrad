@@ -354,6 +354,7 @@ class MambaBlock(nn.Module):
             return out, next_state
         return out
 
+    @torch.compiler.disable(recursive=True)
     def forward(
         self,
         x: torch.Tensor,
