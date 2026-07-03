@@ -135,6 +135,7 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0915
                     device,
                     scaler,
                     collect_metrics=should_log,
+                    mask_all_valid=batch.active.all_valid,
                 )
                 loss = loss_metrics.loss
                 scaler.unscale_(optimizer)
@@ -481,6 +482,7 @@ def _validate(
                     batch.active.mask,
                     device,
                     include_rmse=True,
+                    mask_all_valid=batch.active.all_valid,
                 )
             loss = metrics.loss
             losses.append(float(loss.detach().cpu()))

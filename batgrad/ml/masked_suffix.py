@@ -26,14 +26,20 @@ def batch_loss(
     targets: torch.Tensor,
     mask: torch.Tensor,
     device: torch.device,
+    *,
+    mask_all_valid: bool | None = None,
 ) -> torch.Tensor:
     inputs = inputs.to(device=device)
     targets = targets.to(device=device)
     mask = mask.to(device=device)
     if not config.train.masked_suffix.enabled:
-        return teacher_forced_loss(config, model, inputs, targets, mask, device)
+        return teacher_forced_loss(
+            config, model, inputs, targets, mask, device, mask_all_valid=mask_all_valid
+        )
 
-    return masked_suffix_loss(config, model, inputs, targets, mask, device)
+    return masked_suffix_loss(
+        config, model, inputs, targets, mask, device, mask_all_valid=mask_all_valid
+    )
 
 
 def batch_loss_with_metrics(
@@ -45,6 +51,7 @@ def batch_loss_with_metrics(
     device: torch.device,
     *,
     include_rmse: bool = False,
+    mask_all_valid: bool | None = None,
 ) -> LossMetrics:
     inputs = inputs.to(device=device)
     targets = targets.to(device=device)
@@ -58,6 +65,7 @@ def batch_loss_with_metrics(
             mask,
             device,
             include_rmse=include_rmse,
+            mask_all_valid=mask_all_valid,
         )
     return masked_suffix_loss_with_metrics(
         config,
@@ -67,6 +75,7 @@ def batch_loss_with_metrics(
         mask,
         device,
         include_rmse=include_rmse,
+        mask_all_valid=mask_all_valid,
     )
 
 
@@ -78,6 +87,8 @@ def backward_batch_loss(
     mask: torch.Tensor,
     device: torch.device,
     scaler: torch.amp.GradScaler,
+    *,
+    mask_all_valid: bool | None = None,
 ) -> torch.Tensor:
     return backward_batch_loss_with_metrics(
         config,
@@ -88,6 +99,7 @@ def backward_batch_loss(
         device,
         scaler,
         collect_metrics=False,
+        mask_all_valid=mask_all_valid,
     ).loss
 
 
@@ -101,6 +113,7 @@ def backward_batch_loss_with_metrics(
     scaler: torch.amp.GradScaler,
     *,
     collect_metrics: bool,
+    mask_all_valid: bool | None = None,
 ) -> LossMetrics:
     inputs = inputs.to(device=device)
     targets = targets.to(device=device)
@@ -116,8 +129,11 @@ def backward_batch_loss_with_metrics(
             device,
             backward_scaler=scaler,
             collect_metrics=collect_metrics,
+            mask_all_valid=mask_all_valid,
         )
-    metrics = batch_loss_with_metrics(config, model, inputs, targets, mask, device)
+    metrics = batch_loss_with_metrics(
+        config, model, inputs, targets, mask, device, mask_all_valid=mask_all_valid
+    )
     scaler.scale(metrics.loss).backward()
     if collect_metrics:
         return metrics
@@ -131,11 +147,16 @@ def teacher_forced_loss(
     targets: torch.Tensor,
     mask: torch.Tensor,
     device: torch.device,
+    *,
+    mask_all_valid: bool | None = None,
 ) -> torch.Tensor:
     with torch.autocast(
         device_type=device.type, enabled=config.run.use_amp and device.type == "cuda"
     ):
-        logits = model(encode_inputs(config, inputs, device), mask=mask)
+        logits = model(
+            encode_inputs(config, inputs, device),
+            mask=attention_mask_or_none(mask, all_valid=mask_all_valid),
+        )
         return categorical_ce_loss(
             cast("torch.Tensor", logits),
             targets,
@@ -154,13 +175,17 @@ def teacher_forced_loss_with_metrics(
     device: torch.device,
     *,
     include_rmse: bool = False,
+    mask_all_valid: bool | None = None,
 ) -> LossMetrics:
     with torch.autocast(
         device_type=device.type, enabled=config.run.use_amp and device.type == "cuda"
     ):
         logits = cast(
             "torch.Tensor",
-            model(encode_inputs(config, inputs, device), mask=mask),
+            model(
+                encode_inputs(config, inputs, device),
+                mask=attention_mask_or_none(mask, all_valid=mask_all_valid),
+            ),
         )
         feature_sum, feature_count = categorical_ce_loss_per_feature_components(
             logits,
@@ -196,6 +221,8 @@ def masked_suffix_loss(
     mask: torch.Tensor,
     device: torch.device,
     backward_scaler: torch.amp.GradScaler | None = None,
+    *,
+    mask_all_valid: bool | None = None,
 ) -> torch.Tensor:
     return masked_suffix_loss_with_metrics(
         config,
@@ -206,6 +233,7 @@ def masked_suffix_loss(
         device,
         backward_scaler=backward_scaler,
         collect_metrics=False,
+        mask_all_valid=mask_all_valid,
     ).loss
 
 
@@ -220,6 +248,7 @@ def masked_suffix_loss_with_metrics(  # noqa: C901, PLR0912, PLR0915
     *,
     collect_metrics: bool = True,
     include_rmse: bool = False,
+    mask_all_valid: bool | None = None,
 ) -> LossMetrics:
     suffix = config.train.masked_suffix
     context_len = int(inputs.shape[1]) - suffix.roll_forward_steps
@@ -284,7 +313,7 @@ def masked_suffix_loss_with_metrics(  # noqa: C901, PLR0912, PLR0915
             )
             result = model(
                 encoded_window_inputs,
-                mask=window_mask,
+                mask=attention_mask_or_none(window_mask, all_valid=mask_all_valid),
                 states=states,
                 return_states=suffix.carry_mamba_state,
             )
@@ -362,6 +391,7 @@ def masked_suffix_loss_with_metrics(  # noqa: C901, PLR0912, PLR0915
                     window_mask,
                     states,
                     next_shift_steps,
+                    mask_all_valid=mask_all_valid,
                 )
             if suffix.detach_between_windows:
                 states = {key: value.detach() for key, value in states.items()}
@@ -442,9 +472,11 @@ def masked_suffix_windows(
 def prefix_mamba_states(
     model: torch.nn.Module,
     encoded_inputs: torch.Tensor,
-    mask: torch.Tensor,
+    mask: torch.Tensor | None,
     states: dict[str, MambaCarryState] | None,
     prefix_steps: int,
+    *,
+    mask_all_valid: bool | None = None,
 ) -> dict[str, MambaCarryState]:
     if prefix_steps <= 0:
         raise ValueError(f"prefix_steps must be > 0, got {prefix_steps}")
@@ -452,12 +484,24 @@ def prefix_mamba_states(
         "tuple[torch.Tensor, dict[str, MambaCarryState]]",
         model(
             encoded_inputs[:, :prefix_steps, :, :],
-            mask=mask[:, :prefix_steps],
+            mask=attention_mask_or_none(
+                None if mask is None else mask[:, :prefix_steps], all_valid=mask_all_valid
+            ),
             states=states,
             return_states=True,
         ),
     )
     return next_states
+
+
+def attention_mask_or_none(
+    mask: torch.Tensor | None, *, all_valid: bool | None = None
+) -> torch.Tensor | None:
+    if mask is None:
+        return None
+    if all_valid is None:
+        all_valid = bool(mask.all().item())
+    return None if all_valid else mask
 
 
 def masked_suffix_loss_mask(

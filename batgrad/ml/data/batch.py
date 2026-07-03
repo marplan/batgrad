@@ -47,9 +47,10 @@ class ProtocolBatch:
     """Tensor payload for one protocol inside a `Batch`.
 
     `inputs`, `targets`, and `mask` have shapes `(B, T, C_in)`, `(B, T,
-    C_target)`, and `(B, T)`. Future schedules can place multiple protocol
-    payloads in the same parent `Batch`, for example cycling plus EIS for the
-    same cell/cycle alignment key.
+    C_target)`, and `(B, T)`. `all_valid` records whether `mask` is entirely
+    true so attention can skip padding masks without losing loss-mask semantics.
+    Future schedules can place multiple protocol payloads in the same parent
+    `Batch`, for example cycling plus EIS for the same cell/cycle alignment key.
 
     Examples:
         Access the active cycling tensors::
@@ -62,6 +63,7 @@ class ProtocolBatch:
     inputs: torch.Tensor
     targets: torch.Tensor
     mask: torch.Tensor
+    all_valid: bool
     state: ProtocolBatchState
 
     def pin_memory(self) -> Self:
@@ -70,6 +72,7 @@ class ProtocolBatch:
             inputs=self.inputs.pin_memory(),
             targets=self.targets.pin_memory(),
             mask=self.mask.pin_memory(),
+            all_valid=self.all_valid,
             state=self.state,
         )
 
@@ -79,6 +82,7 @@ class ProtocolBatch:
             inputs=self.inputs.to(device=device, non_blocking=non_blocking),
             targets=self.targets.to(device=device, non_blocking=non_blocking),
             mask=self.mask.to(device=device, non_blocking=non_blocking),
+            all_valid=self.all_valid,
             state=self.state,
         )
 

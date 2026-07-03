@@ -321,6 +321,7 @@ def _batch_from_protocol_tensors(
         inputs=inputs,
         targets=targets,
         mask=mask,
+        all_valid=bool(mask.all().item()),
         state=ProtocolBatchState(
             split=ref.split,
             batch_idx=batch_idx,

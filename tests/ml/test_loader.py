@@ -210,8 +210,54 @@ def test_materialize_window_ref_reads_only_requested_window(tmp_path: Path) -> N
     ]
     assert tuple(batch.active.inputs.shape) == (2, 3, 2)
     assert tuple(batch.active.targets.shape) == (2, 3, 1)
+    assert batch.active.all_valid is True
     assert batch.active.inputs[0, 0, 0].item() == 7.0
     assert batch.active.targets[0, 0, 0].item() == 108.0
+
+
+def test_materialize_window_ref_marks_padded_batch_not_all_valid(tmp_path: Path) -> None:
+    store = RecordingStore(tmp_path / "store")
+    store.write_table(
+        pl.DataFrame(
+            {
+                BaseColumns.time: [float(value) for value in range(20)],
+                BaseColumns.volt: [100.0 + value for value in range(20)],
+            }
+        ),
+        "data.parquet",
+        row_group_size=5,
+    )
+    stream = StreamPlan(
+        protocol=DatasetProtocolId.cycling,
+        split=BaseColumns.split.values.train,
+        manifest_path="manifest.parquet",
+        manifest_row_id=0,
+        stream_identity=(
+            ("set-a", "cell-a", 1, DatasetProtocolId.cycling),
+            DatasetProtocolId.cycling,
+            "manifest.parquet",
+            0,
+        ),
+        group_key=("set-a", "cell-a", 1, DatasetProtocolId.cycling),
+        alignment_key=("set-a", "cell-a", 1),
+        segments=(_segment("data.parquet", 0, 20),),
+        row_count=20,
+        phase_start=0,
+        phase_stride=1,
+    )
+
+    batch = materialize_window_ref(
+        store,
+        WindowRef(stream=stream, offset=18),
+        (BaseColumns.time,),
+        (BaseColumns.volt,),
+        (),
+        LoaderConfig(strategy="sequential", default_window=WindowConfig(batch_size=2, seq_len=3)),
+        batch_idx=0,
+    )
+
+    assert batch.active.all_valid is False
+    assert batch.active.mask.tolist() == [[True, False, False], [False, False, False]]
 
 
 def test_full_in_mem_loader_matches_windowed_loader(tmp_path: Path) -> None:

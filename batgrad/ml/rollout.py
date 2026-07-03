@@ -247,7 +247,7 @@ def context_predictions(
     encoded = encode_inputs(config, inputs[:, :context_len, :].clone(), device)
     logits = cast(
         "torch.Tensor",
-        model(encoded, mask=torch.ones(encoded.shape[:2], dtype=torch.bool, device=device)),
+        model(encoded, mask=None),
     )
     return decode_categorical_logits(logits, target_ranges(config, device)).cpu()[0]
 
@@ -277,10 +277,9 @@ def one_step_rollout_predictions(
     states: dict[str, MambaCarryState] | None = None
     carry_mamba_state = validation_carry_mamba_state(config)
     for future_idx in range(min(rollout_len, int(future_inputs.shape[1]))):
-        window_mask = torch.ones(current.shape[:2], dtype=torch.bool, device=device)
         result = model(
             current,
-            mask=window_mask,
+            mask=None,
             states=states,
             return_states=carry_mamba_state,
         )
@@ -327,9 +326,7 @@ def one_step_rollout_predictions(
             device,
         )
         if carry_mamba_state:
-            states = prefix_mamba_states(
-                model, current[:, :1, :, :], window_mask[:, :1], states, 1
-            )
+            states = prefix_mamba_states(model, current[:, :1, :, :], None, states, 1)
         current = torch.cat((current[:, 1:, :, :], next_input), dim=1)
     if not predictions:
         prediction = torch.empty((0, len(config.data.target_columns)), dtype=inputs.dtype)
@@ -399,12 +396,11 @@ def masked_suffix_rollout_predictions(  # noqa: PLR0915
             feedback_bin_override_mask,
             slice(start, window_end),
         )
-        window_mask = torch.ones(encoded_window_inputs.shape[:2], dtype=torch.bool, device=device)
         if carry_mamba_state and states is None and start > 0:
             states = seed_mamba_states(config, model, feedback[:, :start, :], device)
         result = model(
             encoded_window_inputs,
-            mask=window_mask,
+            mask=None,
             states=states,
             return_states=carry_mamba_state,
         )
@@ -467,7 +463,7 @@ def masked_suffix_rollout_predictions(  # noqa: PLR0915
             states = prefix_mamba_states(
                 model,
                 encoded_window_inputs,
-                window_mask,
+                None,
                 states,
                 current_suffix_steps,
             )
@@ -495,10 +491,9 @@ def seed_mamba_states(
     if int(inputs.shape[1]) <= 0:
         raise ValueError("Mamba state seed inputs must contain at least one timestep")
     encoded = encode_inputs(config, inputs, device)
-    mask = torch.ones(encoded.shape[:2], dtype=torch.bool, device=device)
     _logits, states = cast(
         "tuple[torch.Tensor, dict[str, MambaCarryState]]",
-        model(encoded, mask=mask, return_states=True),
+        model(encoded, mask=None, return_states=True),
     )
     return states
 
