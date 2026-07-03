@@ -264,16 +264,27 @@ class SchedulerConfig:
 @dataclass(frozen=True, slots=True)
 class RunConfig:
     device: str = "cuda"
+    seed: int = 69
     use_amp: bool = True
     compile_model: bool = False
+    init_from: str | None = None
     output_dir: str | None = "ml/runs"
     name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class CheckpointConfig:
-    enabled: bool = False
-    save_per_epoch: int = 1
+    save_latest: bool = False
+    save_best: bool = False
+    save_final: bool = False
+    monitors: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.save_best and not self.monitors:
+            raise ValueError("checkpoint.monitors must not be empty when save_best=true")
+        duplicates = sorted(name for name in set(self.monitors) if self.monitors.count(name) > 1)
+        if duplicates:
+            raise ValueError(f"checkpoint.monitors contains duplicates: {duplicates}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,7 +299,6 @@ class ExperimentConfig:
     run: RunConfig
     logging: LoggingConfig
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
-    seed: int = 69
 
     def __post_init__(self) -> None:
         _validate_protocol_strategy(self)
@@ -376,8 +386,12 @@ def _validate_output_mode(config: ExperimentConfig) -> None:
         return
     if config.logging.backend != "stdout":
         raise ValueError("run.output_dir=null requires logging.backend='stdout'")
-    if config.checkpoint.enabled:
-        raise ValueError("run.output_dir=null requires checkpoint.enabled=false")
+    if _checkpoint_enabled(config.checkpoint):
+        raise ValueError("run.output_dir=null requires checkpoint save flags to be false")
+
+
+def _checkpoint_enabled(config: CheckpointConfig) -> bool:
+    return config.save_latest or config.save_best or config.save_final
 
 
 def load_experiment_config(path: str | Path) -> ExperimentConfig:

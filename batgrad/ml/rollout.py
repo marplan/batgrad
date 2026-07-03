@@ -14,7 +14,13 @@ from batgrad.ml.masked_suffix import (
     prefix_mamba_states,
     write_masked_suffix_feedback,
 )
-from batgrad.ml.nn import categorical_ce_loss_components, decode_categorical_logits
+from batgrad.ml.metrics import aggregate_rmse, feature_metric_payload, feature_rmse_payload
+from batgrad.ml.nn import (
+    categorical_ce_loss_components,
+    categorical_ce_loss_per_feature_components,
+    categorical_rmse_per_feature_components,
+    decode_categorical_logits,
+)
 from batgrad.ml.train_utils import (
     append_rollout_extension,
     encode_inputs,
@@ -41,6 +47,10 @@ class RolloutResult:
     prediction: torch.Tensor
     loss_sum: torch.Tensor
     loss_count: torch.Tensor
+    feature_loss_sum: torch.Tensor
+    feature_loss_count: torch.Tensor
+    feature_squared_error_sum: torch.Tensor
+    feature_squared_error_count: torch.Tensor
 
     @property
     def loss(self) -> torch.Tensor | None:
@@ -50,7 +60,7 @@ class RolloutResult:
 
 
 @torch.no_grad()
-def run_rollouts(
+def run_rollouts(  # noqa: C901, PLR0915
     config: ExperimentConfig,
     model: torch.nn.Module,
     dataset: MlDataIterable,
@@ -58,7 +68,7 @@ def run_rollouts(
     device: torch.device,
     logger: RunLogger,
     step: int,
-) -> None:
+) -> dict[str, float]:
     protocol = DatasetProtocolId(config.data.protocols[0])
     val_index = dataset.full_index.filter_split(BaseColumns.split.values.val)
     context_len = config.loader.seq_len
@@ -76,6 +86,12 @@ def run_rollouts(
     scaling = scaling_rules(config)
     rollout_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
     rollout_loss_count = torch.zeros((), dtype=torch.float32, device=device)
+    feature_loss_sum = torch.zeros(
+        (len(config.data.target_columns),), dtype=torch.float32, device=device
+    )
+    feature_loss_count = torch.zeros_like(feature_loss_sum)
+    feature_squared_error_sum = torch.zeros_like(feature_loss_sum)
+    feature_squared_error_count = torch.zeros_like(feature_loss_sum)
     plot_series: list[RolloutPlotSeries] = []
     for group in config.validation.split.groups:
         if not group.rollout_start_offsets:
@@ -160,6 +176,14 @@ def run_rollouts(
                 )
             rollout_loss_sum = rollout_loss_sum + rollout_result.loss_sum
             rollout_loss_count = rollout_loss_count + rollout_result.loss_count
+            feature_loss_sum = feature_loss_sum + rollout_result.feature_loss_sum
+            feature_loss_count = feature_loss_count + rollout_result.feature_loss_count
+            feature_squared_error_sum = (
+                feature_squared_error_sum + rollout_result.feature_squared_error_sum
+            )
+            feature_squared_error_count = (
+                feature_squared_error_count + rollout_result.feature_squared_error_count
+            )
             pred_tensor = rollout_result.prediction
             if int(pred_tensor.shape[0]) > 0 and config.validation.log_rollout_plots:
                 context_prediction = context_predictions(config, model, inputs, context_len, device)
@@ -176,16 +200,41 @@ def run_rollouts(
                     )
                 )
     if bool((rollout_loss_count > 0).item()):
+        metrics = {
+            "val/rollout/loss_ce": float((rollout_loss_sum / rollout_loss_count).detach().cpu())
+        }
+        rmse = aggregate_rmse(feature_squared_error_sum, feature_squared_error_count)
+        if rmse is not None:
+            metrics["val/rollout/rmse"] = rmse
+        metrics.update(
+            feature_metric_payload(
+                "val/rollout/loss_ce",
+                config.data.target_columns,
+                feature_loss_sum,
+                feature_loss_count,
+            )
+        )
+        metrics.update(
+            feature_rmse_payload(
+                "val/rollout/rmse",
+                config.data.target_columns,
+                feature_squared_error_sum,
+                feature_squared_error_count,
+            )
+        )
         logger.log_metrics(
             step,
-            {"val/rollout/loss": float((rollout_loss_sum / rollout_loss_count).detach().cpu())},
+            metrics,
         )
+    else:
+        metrics = {}
     if plot_series:
         logger.log_payload(
             step,
             "val/rollout/plot",
             build_rollout_figure(config, plot_series, context_len, logger.run_name()),
         )
+    return metrics
 
 
 def context_predictions(
@@ -219,6 +268,12 @@ def one_step_rollout_predictions(
     predictions: list[torch.Tensor] = []
     total_loss = torch.zeros((), dtype=torch.float32, device=device)
     total_count = torch.zeros((), dtype=torch.float32, device=device)
+    feature_loss_sum = torch.zeros(
+        (len(config.data.target_columns),), dtype=torch.float32, device=device
+    )
+    feature_loss_count = torch.zeros_like(feature_loss_sum)
+    feature_squared_error_sum = torch.zeros_like(feature_loss_sum)
+    feature_squared_error_count = torch.zeros_like(feature_loss_sum)
     states: dict[str, MambaCarryState] | None = None
     carry_mamba_state = validation_carry_mamba_state(config)
     for future_idx in range(min(rollout_len, int(future_inputs.shape[1]))):
@@ -245,6 +300,23 @@ def one_step_rollout_predictions(
         )
         total_loss = total_loss + loss_sum
         total_count = total_count + loss_count
+        current_feature_sum, current_feature_count = categorical_ce_loss_per_feature_components(
+            logits[:, -1:, :, :],
+            targets[:, target_slice, :],
+            mask[:, target_slice],
+            config.model.output_sigma,
+            target_ranges(config, device),
+        )
+        current_squared_sum, current_squared_count = categorical_rmse_per_feature_components(
+            logits[:, -1:, :, :],
+            targets[:, target_slice, :],
+            mask[:, target_slice],
+            target_ranges(config, device),
+        )
+        feature_loss_sum = feature_loss_sum + current_feature_sum
+        feature_loss_count = feature_loss_count + current_feature_count
+        feature_squared_error_sum = feature_squared_error_sum + current_squared_sum
+        feature_squared_error_count = feature_squared_error_count + current_squared_count
         next_scalar = future_inputs[:, future_idx : future_idx + 1, :].clone()
         next_input = rollout_next_input_bins(
             config,
@@ -263,10 +335,18 @@ def one_step_rollout_predictions(
         prediction = torch.empty((0, len(config.data.target_columns)), dtype=inputs.dtype)
     else:
         prediction = torch.cat(predictions, dim=1).cpu()[0]
-    return RolloutResult(prediction=prediction, loss_sum=total_loss, loss_count=total_count)
+    return RolloutResult(
+        prediction=prediction,
+        loss_sum=total_loss,
+        loss_count=total_count,
+        feature_loss_sum=feature_loss_sum,
+        feature_loss_count=feature_loss_count,
+        feature_squared_error_sum=feature_squared_error_sum,
+        feature_squared_error_count=feature_squared_error_count,
+    )
 
 
-def masked_suffix_rollout_predictions(
+def masked_suffix_rollout_predictions(  # noqa: PLR0915
     config: ExperimentConfig,
     model: torch.nn.Module,
     inputs: torch.Tensor,
@@ -283,6 +363,12 @@ def masked_suffix_rollout_predictions(
     predictions: list[torch.Tensor] = []
     total_loss = torch.zeros((), dtype=torch.float32, device=device)
     total_count = torch.zeros((), dtype=torch.float32, device=device)
+    feature_loss_sum = torch.zeros(
+        (len(config.data.target_columns),), dtype=torch.float32, device=device
+    )
+    feature_loss_count = torch.zeros_like(feature_loss_sum)
+    feature_squared_error_sum = torch.zeros_like(feature_loss_sum)
+    feature_squared_error_count = torch.zeros_like(feature_loss_sum)
     feedback_bin_overrides = torch.zeros(
         (*feedback.shape, config.model.num_bins), dtype=feedback.dtype, device=feedback.device
     )
@@ -347,6 +433,23 @@ def masked_suffix_rollout_predictions(
         )
         total_loss = total_loss + loss_sum
         total_count = total_count + loss_count
+        current_feature_sum, current_feature_count = categorical_ce_loss_per_feature_components(
+            logits[:, suffix_slice, :, :],
+            targets[:, write_slice, :],
+            loss_mask,
+            config.model.output_sigma,
+            target_ranges(config, device),
+        )
+        current_squared_sum, current_squared_count = categorical_rmse_per_feature_components(
+            logits[:, suffix_slice, :, :],
+            targets[:, write_slice, :],
+            loss_mask,
+            target_ranges(config, device),
+        )
+        feature_loss_sum = feature_loss_sum + current_feature_sum
+        feature_loss_count = feature_loss_count + current_feature_count
+        feature_squared_error_sum = feature_squared_error_sum + current_squared_sum
+        feature_squared_error_count = feature_squared_error_count + current_squared_count
         write_masked_suffix_feedback(
             config,
             feedback,
@@ -372,7 +475,15 @@ def masked_suffix_rollout_predictions(
         prediction = torch.empty((0, len(config.data.target_columns)), dtype=inputs.dtype)
     else:
         prediction = torch.cat(predictions, dim=1).cpu()[0]
-    return RolloutResult(prediction=prediction, loss_sum=total_loss, loss_count=total_count)
+    return RolloutResult(
+        prediction=prediction,
+        loss_sum=total_loss,
+        loss_count=total_count,
+        feature_loss_sum=feature_loss_sum,
+        feature_loss_count=feature_loss_count,
+        feature_squared_error_sum=feature_squared_error_sum,
+        feature_squared_error_count=feature_squared_error_count,
+    )
 
 
 def seed_mamba_states(

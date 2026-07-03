@@ -146,6 +146,7 @@ def loader_config(
     return DataLoaderConfig(
         split=split,
         default_window=WindowConfig(batch_size=config.loader.batch_size, seq_len=seq_len),
+        seed=config.run.seed,
         strategy=config.loader.strategy,
         active_protocol=DatasetProtocolId(config.data.protocols[0]),
         stateful_n_windows=config.loader.stateful_n_windows,

@@ -4,9 +4,12 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from batgrad.ml.metrics import LossMetrics
 from batgrad.ml.nn import (
     categorical_ce_loss,
     categorical_ce_loss_components,
+    categorical_ce_loss_per_feature_components,
+    categorical_rmse_per_feature_components,
     decode_categorical_logits,
 )
 from batgrad.ml.train_utils import encode_inputs, target_ranges
@@ -33,6 +36,40 @@ def batch_loss(
     return masked_suffix_loss(config, model, inputs, targets, mask, device)
 
 
+def batch_loss_with_metrics(
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    device: torch.device,
+    *,
+    include_rmse: bool = False,
+) -> LossMetrics:
+    inputs = inputs.to(device=device)
+    targets = targets.to(device=device)
+    mask = mask.to(device=device)
+    if not config.train.masked_suffix.enabled:
+        return teacher_forced_loss_with_metrics(
+            config,
+            model,
+            inputs,
+            targets,
+            mask,
+            device,
+            include_rmse=include_rmse,
+        )
+    return masked_suffix_loss_with_metrics(
+        config,
+        model,
+        inputs,
+        targets,
+        mask,
+        device,
+        include_rmse=include_rmse,
+    )
+
+
 def backward_batch_loss(
     config: ExperimentConfig,
     model: torch.nn.Module,
@@ -42,12 +79,35 @@ def backward_batch_loss(
     device: torch.device,
     scaler: torch.amp.GradScaler,
 ) -> torch.Tensor:
+    return backward_batch_loss_with_metrics(
+        config,
+        model,
+        inputs,
+        targets,
+        mask,
+        device,
+        scaler,
+        collect_metrics=False,
+    ).loss
+
+
+def backward_batch_loss_with_metrics(
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    device: torch.device,
+    scaler: torch.amp.GradScaler,
+    *,
+    collect_metrics: bool,
+) -> LossMetrics:
     inputs = inputs.to(device=device)
     targets = targets.to(device=device)
     mask = mask.to(device=device)
     suffix = config.train.masked_suffix
     if suffix.enabled and suffix.detach_between_windows and suffix.roll_forward_steps > 0:
-        return masked_suffix_loss(
+        return masked_suffix_loss_with_metrics(
             config,
             model,
             inputs,
@@ -55,10 +115,13 @@ def backward_batch_loss(
             mask,
             device,
             backward_scaler=scaler,
+            collect_metrics=collect_metrics,
         )
-    loss = batch_loss(config, model, inputs, targets, mask, device)
-    scaler.scale(loss).backward()
-    return loss
+    metrics = batch_loss_with_metrics(config, model, inputs, targets, mask, device)
+    scaler.scale(metrics.loss).backward()
+    if collect_metrics:
+        return metrics
+    return LossMetrics(loss=metrics.loss)
 
 
 def teacher_forced_loss(
@@ -82,6 +145,49 @@ def teacher_forced_loss(
         )
 
 
+def teacher_forced_loss_with_metrics(
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    device: torch.device,
+    *,
+    include_rmse: bool = False,
+) -> LossMetrics:
+    with torch.autocast(
+        device_type=device.type, enabled=config.run.use_amp and device.type == "cuda"
+    ):
+        logits = cast(
+            "torch.Tensor",
+            model(encode_inputs(config, inputs, device), mask=mask),
+        )
+        feature_sum, feature_count = categorical_ce_loss_per_feature_components(
+            logits,
+            targets,
+            mask,
+            config.model.output_sigma,
+            target_ranges(config, device),
+        )
+        total_count = feature_count.sum()
+        if bool((total_count <= 0).item()):
+            loss = torch.zeros((), dtype=feature_sum.dtype, device=feature_sum.device)
+        else:
+            loss = feature_sum.sum() / total_count
+        squared_sum = squared_count = None
+        if include_rmse:
+            squared_sum, squared_count = categorical_rmse_per_feature_components(
+                logits, targets, mask, target_ranges(config, device)
+            )
+        return LossMetrics(
+            loss=loss,
+            feature_loss_sum=feature_sum,
+            feature_loss_count=feature_count,
+            feature_squared_error_sum=squared_sum,
+            feature_squared_error_count=squared_count,
+        )
+
+
 def masked_suffix_loss(
     config: ExperimentConfig,
     model: torch.nn.Module,
@@ -91,6 +197,30 @@ def masked_suffix_loss(
     device: torch.device,
     backward_scaler: torch.amp.GradScaler | None = None,
 ) -> torch.Tensor:
+    return masked_suffix_loss_with_metrics(
+        config,
+        model,
+        inputs,
+        targets,
+        mask,
+        device,
+        backward_scaler=backward_scaler,
+        collect_metrics=False,
+    ).loss
+
+
+def masked_suffix_loss_with_metrics(  # noqa: C901, PLR0912, PLR0915
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    device: torch.device,
+    backward_scaler: torch.amp.GradScaler | None = None,
+    *,
+    collect_metrics: bool = True,
+    include_rmse: bool = False,
+) -> LossMetrics:
     suffix = config.train.masked_suffix
     context_len = int(inputs.shape[1]) - suffix.roll_forward_steps
     if context_len <= suffix.suffix_steps:
@@ -110,9 +240,15 @@ def masked_suffix_loss(
             loss_on_masked_only=suffix.loss_on_masked_only,
         )
         if bool((backward_total_count <= 0).item()):
-            return torch.zeros((), dtype=targets.dtype, device=device)
+            return LossMetrics(loss=torch.zeros((), dtype=targets.dtype, device=device))
     total_loss = torch.zeros((), dtype=targets.dtype, device=device)
     total_count = torch.zeros((), dtype=targets.dtype, device=device)
+    feature_loss_sum = torch.zeros(
+        (len(config.data.target_columns),), dtype=torch.float32, device=device
+    )
+    feature_loss_count = torch.zeros_like(feature_loss_sum)
+    feature_squared_error_sum = torch.zeros_like(feature_loss_sum)
+    feature_squared_error_count = torch.zeros_like(feature_loss_sum)
     feedback_bin_overrides = torch.zeros(
         (*feedback.shape, config.model.num_bins), dtype=feedback.dtype, device=feedback.device
     )
@@ -158,13 +294,43 @@ def masked_suffix_loss(
                 )
             else:
                 logits = cast("torch.Tensor", result)
-            loss_sum, loss_count = categorical_ce_loss_components(
-                logits,
-                window_targets,
-                loss_mask,
-                config.model.output_sigma,
-                target_ranges(config, device),
-            )
+            if collect_metrics:
+                window_feature_sum, window_feature_count = (
+                    categorical_ce_loss_per_feature_components(
+                        logits,
+                        window_targets,
+                        loss_mask,
+                        config.model.output_sigma,
+                        target_ranges(config, device),
+                    )
+                )
+                loss_sum = window_feature_sum.sum()
+                loss_count = window_feature_count.sum()
+                feature_loss_sum = feature_loss_sum + window_feature_sum.detach()
+                feature_loss_count = feature_loss_count + window_feature_count.detach()
+                if include_rmse:
+                    window_squared_sum, window_squared_count = (
+                        categorical_rmse_per_feature_components(
+                            logits,
+                            window_targets,
+                            loss_mask,
+                            target_ranges(config, device),
+                        )
+                    )
+                    feature_squared_error_sum = (
+                        feature_squared_error_sum + window_squared_sum.detach()
+                    )
+                    feature_squared_error_count = (
+                        feature_squared_error_count + window_squared_count.detach()
+                    )
+            else:
+                loss_sum, loss_count = categorical_ce_loss_components(
+                    logits,
+                    window_targets,
+                    loss_mask,
+                    config.model.output_sigma,
+                    target_ranges(config, device),
+                )
             total_loss, total_count = accumulate_masked_suffix_window_loss(
                 total_loss,
                 total_count,
@@ -202,8 +368,18 @@ def masked_suffix_loss(
         else:
             states = None
     if bool((total_count <= 0).item()):
-        return torch.zeros((), dtype=targets.dtype, device=device)
-    return total_loss / total_count
+        return LossMetrics(loss=torch.zeros((), dtype=targets.dtype, device=device))
+    return LossMetrics(
+        loss=total_loss / total_count,
+        feature_loss_sum=feature_loss_sum if collect_metrics else None,
+        feature_loss_count=feature_loss_count if collect_metrics else None,
+        feature_squared_error_sum=feature_squared_error_sum
+        if collect_metrics and include_rmse
+        else None,
+        feature_squared_error_count=feature_squared_error_count
+        if collect_metrics and include_rmse
+        else None,
+    )
 
 
 def accumulate_masked_suffix_window_loss(

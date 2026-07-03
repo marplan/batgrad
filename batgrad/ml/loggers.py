@@ -12,6 +12,16 @@ logger = get_logger(__name__)
 
 LogValue = int | float | str | bool | None
 
+STDOUT_METRICS = {
+    "train/loss_ce",
+    "train/lr",
+    "train/tokens_per_sec",
+    "val/tf/loss_ce",
+    "val/tf/rmse",
+    "val/rollout/loss_ce",
+    "val/rollout/rmse",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class WandbConfig:
@@ -59,6 +69,9 @@ class StdoutRunLogger:
         epoch: int | None = None,
         epoch_pct: int | None = None,
     ) -> None:
+        metrics = {key: value for key, value in metrics.items() if key in STDOUT_METRICS}
+        if not metrics:
+            return
         rendered = " ".join(
             f"{key}={_format_metric_value(key, value)}" for key, value in metrics.items()
         )
@@ -91,8 +104,8 @@ class JsonlRunLogger:
         epoch: int | None = None,
         epoch_pct: int | None = None,
     ) -> None:
-        progress = _progress_payload(epoch, epoch_pct)
-        self.metrics_file.write(json.dumps({"step": step, **progress, **metrics}) + "\n")
+        del epoch, epoch_pct
+        self.metrics_file.write(json.dumps({"step": step, **metrics}) + "\n")
         self.metrics_file.flush()
 
     def log_payload(self, step: int, name: str, payload: object) -> None:
@@ -134,7 +147,8 @@ class WandbRunLogger:
         epoch: int | None = None,
         epoch_pct: int | None = None,
     ) -> None:
-        self.run.log({**_progress_payload(epoch, epoch_pct), **metrics}, step=step)
+        del epoch, epoch_pct
+        self.run.log(metrics, step=step)
 
     def log_payload(self, step: int, name: str, payload: object) -> None:
         self.run.log({name: payload}, step=step)
@@ -199,15 +213,6 @@ def _format_progress(epoch: int | None, epoch_pct: int | None) -> str:
     if epoch is None or epoch_pct is None:
         return ""
     return f" epoch={epoch}:{epoch_pct:3d}%"
-
-
-def _progress_payload(epoch: int | None, epoch_pct: int | None) -> dict[str, int]:
-    payload: dict[str, int] = {}
-    if epoch is not None:
-        payload["epoch"] = epoch
-    if epoch_pct is not None:
-        payload["epoch_pct"] = epoch_pct
-    return payload
 
 
 def _json_payload(payload: object) -> object:

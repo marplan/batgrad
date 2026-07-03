@@ -22,7 +22,7 @@
     ]
   },
   "loader": {
-    "batch_size": 8,
+    "batch_size": 128,
     "seq_len": 1024,
     "strategy": "shuffled_protocol_groups",
     "stateful_n_windows": 1,
@@ -91,7 +91,7 @@
       "loss_on_masked_only": true,
       "carry_mamba_state": true,
       "detach_between_windows": true,
-      "roll_forward_steps": 896
+      "roll_forward_steps": 0
     }
   },
   "validation": {
@@ -130,9 +130,9 @@
     },
     "rollout_extension": {
       "enabled": true,
-      "steps": 2000,
+      "steps": 100,
       "input_values": {
-        "Time diff [s]": 100.0,
+        "Time diff [s]": 20.0,
         "Current [C-rate]": 0.5
       }
     }
@@ -152,8 +152,10 @@
   },
   "run": {
     "device": "cuda",
+    "seed": 69,
     "use_amp": true,
     "compile_model": false,
+    "init_from": null,
     "output_dir": "/workspace/ubuntu/batgrad/output/ml_baseline_runs",
     "name": null
   },
@@ -169,6 +171,10 @@
       "tags": []
     }
   },
-  "checkpoint": { "enabled": true, "save_per_epoch": 1 },
-  "seed": 69
+  "checkpoint": {
+    "save_latest": true,
+    "save_best": true,
+    "save_final": true,
+    "monitors": ["val/rollout/loss_ce"]
+  }
 }

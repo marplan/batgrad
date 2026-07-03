@@ -122,12 +122,13 @@
   },
   "run": {
     "device": "cuda",
+    "seed": 69,
     "use_amp": true,
     "compile_model": false,
+    "init_from": null,
     "output_dir": null,
     "name": "dry-run-gpu"
   },
   "logging": {"backend": "stdout"},
-  "checkpoint": {"enabled": false},
-  "seed": 69
+  "checkpoint": {"save_latest": false, "save_best": false, "save_final": false, "monitors": []}
 }

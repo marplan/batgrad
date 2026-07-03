@@ -90,8 +90,9 @@ class MlDataIterable(IterableDataset[Batch]):
             self.active_protocol,
             source_columns_,
         )
-        stream_tensor_cache = (
-            materialization.build_stream_tensor_cache(
+        if self.config.data_access == "full_in_mem":
+            logger.info("Building full_in_mem tensor cache for split=%s", self.config.split)
+            stream_tensor_cache = materialization.build_stream_tensor_cache(
                 self.store,
                 self.stream_plans,
                 source_columns_,
@@ -100,9 +101,9 @@ class MlDataIterable(IterableDataset[Batch]):
                 self.active_scaling,
                 self.schema_by_path,
             )
-            if self.config.data_access == "full_in_mem"
-            else None
-        )
+            logger.info("Full_in_mem tensor cache ready for split=%s", self.config.split)
+        else:
+            stream_tensor_cache = None
         if self.config.data_access == "full_in_mem" and not stream_tensor_cache:
             raise ValueError("data_access='full_in_mem' could not load any active protocol streams")
         if stream_tensor_cache is not None and not stream_tensor_cache.tensors:
