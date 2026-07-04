@@ -9,7 +9,8 @@
       "Current [C-rate]",
       "Terminal voltage [V]",
       "Surface temperature [degC]",
-      "Ambient temperature [degC]"
+      "Ambient temperature [degC]",
+      "Cooling alpha [W.m-2.K-1]"
     ],
     "target_columns": ["Terminal voltage [V]", "Surface temperature [degC]"],
     "feedback_columns": ["Terminal voltage [V]", "Surface temperature [degC]"],
@@ -18,7 +19,8 @@
       { "column": "Current [C-rate]", "input_min": -6.0, "input_max": 6.0 },
       { "column": "Terminal voltage [V]", "input_min": 2.3, "input_max": 4.6 },
       { "column": "Surface temperature [degC]", "input_min": 5.0, "input_max": 65.0 },
-      { "column": "Ambient temperature [degC]", "input_min": 0.0, "input_max": 50.0 }
+      { "column": "Ambient temperature [degC]", "input_min": 0.0, "input_max": 50.0 },
+      { "column": "Cooling alpha [W.m-2.K-1]", "input_min": 0.0, "input_max": 55.0 }
     ]
   },
   "loader": {
