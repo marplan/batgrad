@@ -13,7 +13,6 @@ dependencies = [
   "plotly>=6.5.2",
   "polars[pyarrow]>=1.38.1",
   "fastexcel>=0.19.0",
-  "scipy>=1.17.0",
   "torch>=2.10.0",
   "wandb>=0.25.0",
 ]
@@ -21,8 +20,6 @@ dependencies = [
 [dependency-groups]
 dev = [
   "debugpy>=1.8.20",
-  "mkdocs>=1.6.1",
-  "mkdocs-material>=9.7.1",
   "mkdocstrings[python]>=1.0.3",
   "pytest>=9.0.2",
   "ruff>=0.15.0",
