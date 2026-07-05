@@ -120,7 +120,15 @@ def materialize_batch_plan(
         )
         for sample_ref in plan.refs
     )
-    return _batch_from_ref_tensors(plan.refs[0], plan.refs, samples, batch_idx)
+    return _batch_from_ref_tensors(
+        plan.refs[0],
+        plan.refs,
+        samples,
+        batch_idx,
+        stateful_group_idx=plan.stateful_group_idx,
+        stateful_step_idx=plan.stateful_step_idx,
+        stateful_steps=plan.stateful_steps,
+    )
 
 
 def resolve_index_schema_by_protocol(
@@ -257,7 +265,15 @@ def _materialize_batch_plan_from_cache(
         )
         for sample_ref in plan.refs
     )
-    return _batch_from_ref_tensors(plan.refs[0], plan.refs, samples, batch_idx)
+    return _batch_from_ref_tensors(
+        plan.refs[0],
+        plan.refs,
+        samples,
+        batch_idx,
+        stateful_group_idx=plan.stateful_group_idx,
+        stateful_step_idx=plan.stateful_step_idx,
+        stateful_steps=plan.stateful_steps,
+    )
 
 
 def _materialize_window_ref_from_cache(
@@ -294,6 +310,10 @@ def _batch_from_ref_tensors(
     refs: tuple[WindowRef, ...],
     samples: tuple[RefTensors, ...],
     batch_idx: int,
+    *,
+    stateful_group_idx: int | None = None,
+    stateful_step_idx: int | None = None,
+    stateful_steps: int | None = None,
 ) -> Batch:
     segments = tuple(segment for sample in samples for segment in sample.segments)
     return _batch_from_protocol_tensors(
@@ -304,6 +324,9 @@ def _batch_from_ref_tensors(
         torch.stack([sample.mask for sample in samples], dim=0),
         segments,
         batch_idx,
+        stateful_group_idx=stateful_group_idx,
+        stateful_step_idx=stateful_step_idx,
+        stateful_steps=stateful_steps,
     )
 
 
@@ -315,6 +338,10 @@ def _batch_from_protocol_tensors(
     mask: torch.Tensor,
     segments: tuple[BatchSegmentRef, ...],
     batch_idx: int,
+    *,
+    stateful_group_idx: int | None = None,
+    stateful_step_idx: int | None = None,
+    stateful_steps: int | None = None,
 ) -> Batch:
     protocol_batch = ProtocolBatch(
         protocol=ref.protocol,
@@ -340,6 +367,9 @@ def _batch_from_protocol_tensors(
             batch_idx=batch_idx,
             active_protocol=ref.protocol,
             protocol_order=(ref.protocol,),
+            stateful_group_idx=stateful_group_idx,
+            stateful_step_idx=stateful_step_idx,
+            stateful_steps=stateful_steps,
         ),
         protocols={ref.protocol: protocol_batch},
     )

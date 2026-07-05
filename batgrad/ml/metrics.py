@@ -7,6 +7,7 @@ import torch
 
 if TYPE_CHECKING:
     from batgrad.ml.config import ExperimentConfig
+    from batgrad.ml.nn import MambaCarryState
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +17,7 @@ class LossMetrics:
     feature_loss_count: torch.Tensor | None = None
     feature_squared_error_sum: torch.Tensor | None = None
     feature_squared_error_count: torch.Tensor | None = None
+    mamba_states: dict[str, MambaCarryState] | None = None
 
 
 def grad_norm_metrics(

@@ -52,6 +52,8 @@ def batch_loss_with_metrics(
     *,
     include_rmse: bool = False,
     mask_all_valid: bool | None = None,
+    initial_mamba_states: dict[str, MambaCarryState] | None = None,
+    return_mamba_states: bool = False,
 ) -> LossMetrics:
     inputs = inputs.to(device=device)
     targets = targets.to(device=device)
@@ -76,6 +78,8 @@ def batch_loss_with_metrics(
         device,
         include_rmse=include_rmse,
         mask_all_valid=mask_all_valid,
+        initial_mamba_states=initial_mamba_states,
+        return_mamba_states=return_mamba_states,
     )
 
 
@@ -114,6 +118,8 @@ def backward_batch_loss_with_metrics(
     *,
     collect_metrics: bool,
     mask_all_valid: bool | None = None,
+    initial_mamba_states: dict[str, MambaCarryState] | None = None,
+    return_mamba_states: bool = False,
 ) -> LossMetrics:
     inputs = inputs.to(device=device)
     targets = targets.to(device=device)
@@ -130,14 +136,24 @@ def backward_batch_loss_with_metrics(
             backward_scaler=scaler,
             collect_metrics=collect_metrics,
             mask_all_valid=mask_all_valid,
+            initial_mamba_states=initial_mamba_states,
+            return_mamba_states=return_mamba_states,
         )
     metrics = batch_loss_with_metrics(
-        config, model, inputs, targets, mask, device, mask_all_valid=mask_all_valid
+        config,
+        model,
+        inputs,
+        targets,
+        mask,
+        device,
+        mask_all_valid=mask_all_valid,
+        initial_mamba_states=initial_mamba_states,
+        return_mamba_states=return_mamba_states,
     )
     scaler.scale(metrics.loss).backward()
     if collect_metrics:
         return metrics
-    return LossMetrics(loss=metrics.loss)
+    return LossMetrics(loss=metrics.loss, mamba_states=metrics.mamba_states)
 
 
 def teacher_forced_loss(
@@ -249,6 +265,8 @@ def masked_suffix_loss_with_metrics(  # noqa: C901, PLR0912, PLR0915
     collect_metrics: bool = True,
     include_rmse: bool = False,
     mask_all_valid: bool | None = None,
+    initial_mamba_states: dict[str, MambaCarryState] | None = None,
+    return_mamba_states: bool = False,
 ) -> LossMetrics:
     suffix = config.train.masked_suffix
     context_len = int(inputs.shape[1]) - suffix.roll_forward_steps
@@ -282,8 +300,12 @@ def masked_suffix_loss_with_metrics(  # noqa: C901, PLR0912, PLR0915
         (*feedback.shape, config.model.num_bins), dtype=feedback.dtype, device=feedback.device
     )
     feedback_bin_override_mask = torch.zeros_like(feedback_bin_overrides, dtype=torch.bool)
-    states: dict[str, MambaCarryState] | None = None
+    states: dict[str, MambaCarryState] | None = initial_mamba_states
+    final_window_start_states: dict[str, MambaCarryState] | None = None
+    final_window_start = 0
     for start, current_suffix_steps, next_shift_steps in windows:
+        final_window_start = start
+        final_window_start_states = states
         window_inputs = feedback[:, start : start + context_len, :].clone()
         window_targets = targets[:, start : start + context_len, :]
         window_mask = mask[:, start : start + context_len]
@@ -399,6 +421,21 @@ def masked_suffix_loss_with_metrics(  # noqa: C901, PLR0912, PLR0915
             states = None
     if bool((total_count <= 0).item()):
         return LossMetrics(loss=torch.zeros((), dtype=targets.dtype, device=device))
+    final_states = None
+    if return_mamba_states:
+        final_states = refresh_mamba_states_from_feedback(
+            config,
+            model,
+            feedback,
+            feedback_bin_overrides,
+            feedback_bin_override_mask,
+            mask,
+            final_window_start,
+            context_len,
+            final_window_start_states,
+            device,
+            mask_all_valid=mask_all_valid,
+        )
     return LossMetrics(
         loss=total_loss / total_count,
         feature_loss_sum=feature_loss_sum if collect_metrics else None,
@@ -409,7 +446,47 @@ def masked_suffix_loss_with_metrics(  # noqa: C901, PLR0912, PLR0915
         feature_squared_error_count=feature_squared_error_count
         if collect_metrics and include_rmse
         else None,
+        mamba_states=final_states,
     )
+
+
+def refresh_mamba_states_from_feedback(
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+    feedback: torch.Tensor,
+    feedback_bin_overrides: torch.Tensor,
+    feedback_bin_override_mask: torch.Tensor,
+    mask: torch.Tensor,
+    start: int,
+    context_len: int,
+    states: dict[str, MambaCarryState] | None,
+    device: torch.device,
+    *,
+    mask_all_valid: bool | None = None,
+) -> dict[str, MambaCarryState]:
+    window_slice = slice(start, start + context_len)
+    window_inputs = feedback[:, window_slice, :]
+    window_mask = mask[:, window_slice]
+    with torch.no_grad(), torch.autocast(
+        device_type=device.type, enabled=config.run.use_amp and device.type == "cuda"
+    ):
+        encoded_window_inputs = encode_inputs(config, window_inputs, device)
+        encoded_window_inputs = apply_binned_feedback_overrides(
+            encoded_window_inputs,
+            feedback_bin_overrides,
+            feedback_bin_override_mask,
+            window_slice,
+        )
+        _logits, next_states = cast(
+            "tuple[torch.Tensor, dict[str, MambaCarryState]]",
+            model(
+                encoded_window_inputs,
+                mask=attention_mask_or_none(window_mask, all_valid=mask_all_valid),
+                states=states,
+                return_states=True,
+            ),
+        )
+    return next_states
 
 
 def accumulate_masked_suffix_window_loss(

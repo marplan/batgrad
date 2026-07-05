@@ -102,6 +102,9 @@ class BatchState:
     batch_idx: int
     active_protocol: DatasetProtocolId
     protocol_order: tuple[DatasetProtocolId, ...]
+    stateful_group_idx: int | None = None
+    stateful_step_idx: int | None = None
+    stateful_steps: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

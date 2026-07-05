@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 
     from batgrad.ml.data.batch import Batch
     from batgrad.ml.loggers import RunLogger
+    from batgrad.ml.nn import MambaCarryState
 
 logger = get_logger(__name__)
 
@@ -124,6 +125,9 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
     log_time = time.perf_counter()
     best_checkpoints: dict[str, float] = {}
     first_train_step = True
+    carried_mamba_states: dict[str, MambaCarryState] | None = None
+    carried_stateful_group_idx: int | None = None
+    carried_stateful_step_idx: int | None = None
     try:
         logger.info("Starting training loop")
         while step < max_steps:
@@ -150,6 +154,13 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
                 optimizer.zero_grad(set_to_none=True)
                 if first_train_step:
                     logger.info("Running first training step")
+                carried_mamba_states = _initial_mamba_states_for_batch(
+                    batch,
+                    carried_mamba_states,
+                    carried_stateful_group_idx,
+                    carried_stateful_step_idx,
+                )
+                return_mamba_states = _should_return_mamba_states(config, batch)
                 loss_metrics = backward_batch_loss_with_metrics(
                     config,
                     model,
@@ -160,7 +171,12 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
                     scaler,
                     collect_metrics=should_log,
                     mask_all_valid=batch.active.all_valid,
+                    initial_mamba_states=carried_mamba_states,
+                    return_mamba_states=return_mamba_states,
                 )
+                carried_mamba_states = _detach_mamba_states(loss_metrics.mamba_states)
+                carried_stateful_group_idx = batch.state.stateful_group_idx
+                carried_stateful_step_idx = batch.state.stateful_step_idx
                 log_loss_metrics = (
                     _reduced_loss_metrics(loss_metrics) if should_log else loss_metrics
                 )
@@ -310,6 +326,40 @@ def _model_compute_token_count(config: ExperimentConfig, batch: Batch) -> int:
         raise ValueError("masked suffix roll_forward_steps leaves no model context")
     windows = masked_suffix_windows(suffix.suffix_steps, suffix.roll_forward_steps, context_len)
     return batch_size * len(windows) * context_len
+
+
+def _initial_mamba_states_for_batch(
+    batch: Batch,
+    carried_states: dict[str, MambaCarryState] | None,
+    carried_group_idx: int | None,
+    carried_step_idx: int | None,
+) -> dict[str, MambaCarryState] | None:
+    group_idx = batch.state.stateful_group_idx
+    step_idx = batch.state.stateful_step_idx
+    if group_idx is None or step_idx is None or step_idx == 0:
+        return None
+    if carried_states is None or carried_group_idx != group_idx:
+        return None
+    if carried_step_idx is None or carried_step_idx + 1 != step_idx:
+        return None
+    return carried_states
+
+
+def _should_return_mamba_states(config: ExperimentConfig, batch: Batch) -> bool:
+    suffix = config.train.masked_suffix
+    if not suffix.enabled or not suffix.carry_mamba_state:
+        return False
+    step_idx = batch.state.stateful_step_idx
+    steps = batch.state.stateful_steps
+    return step_idx is not None and steps is not None and step_idx < steps - 1
+
+
+def _detach_mamba_states(
+    states: dict[str, MambaCarryState] | None,
+) -> dict[str, MambaCarryState] | None:
+    if states is None:
+        return None
+    return {key: value.detach() for key, value in states.items()}
 
 
 def _resolved_device_name(device: torch.device) -> str:
