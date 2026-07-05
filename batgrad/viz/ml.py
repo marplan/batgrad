@@ -344,7 +344,7 @@ def _render_ml_batch_preview(data: _PreviewSelection) -> MlBatchPreview:
     )
 
     return MlBatchPreview(
-        widget=widget.show(),
+        widget=widget,
         metadata=_metadata_frame(batch, batch_index, total_batches, sample_index, submission),
         batch_index=batch_index,
         total_batches=total_batches,
@@ -558,7 +558,7 @@ def _build_eis_batch_preview(
     )
 
     return MlBatchPreview(
-        widget=widget.show(),
+        widget=widget,
         metadata=_metadata_frame(batch, batch_index, total_batches, sample_index, submission),
         batch_index=batch_index,
         total_batches=total_batches,

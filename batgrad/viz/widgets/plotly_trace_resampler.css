@@ -9,7 +9,7 @@
 
 .batgrad-resampler-status {
   position: absolute;
-  top: 8px;
+  top: 1px;
   left: 8px;
   z-index: 10;
   padding: 3px 7px;

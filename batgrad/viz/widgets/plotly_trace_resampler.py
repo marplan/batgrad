@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -72,6 +73,7 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         self._initial_annotation_samples: dict[int, TraceSample] = {}
         self._last_axes: dict[str, object] = {}
         self._last_request_id = 0
+        self._closed = False
         self._max_points_per_trace = int(max_points_per_trace)
         self._max_points_per_figure = int(max_points_per_figure)
         self._max_batch_rows = max_batch_rows
@@ -167,6 +169,8 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         self._trace_axes[trace_idx] = _trace_axis_keys(self._fig.data[trace_idx].to_plotly_json())
 
     def show(self) -> PlotlyTraceResampler:
+        if self._closed:
+            raise RuntimeError("Cannot show a closed PlotlyTraceResampler")
         fig_json = self._fig.to_plotly_json()
         samples = self._sample_traces(sorted(self._sources), axes={})
         annotation_samples = self._sample_annotations(sorted(self._annotation_sources), axes={})
@@ -192,6 +196,8 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         updates: tuple[tuple[int, pl.LazyFrame, int | None], ...],
     ) -> None:
         """Replace registered trace sources and push one atomic resampled update."""
+        if self._closed:
+            raise RuntimeError("Cannot update a closed PlotlyTraceResampler")
         if not updates:
             return
         trace_indices = []
@@ -231,6 +237,8 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         limit: int = 100_000,
     ) -> tuple[pl.DataFrame, int]:
         del widget_index
+        if self._closed:
+            return pl.DataFrame(), 0
         if offset < 0:
             raise ValueError(f"offset must be >= 0, got {offset}")
         if limit < 1:
@@ -286,6 +294,8 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         return collect_frame(lf.slice(offset, limit)), trace_rows
 
     def _on_evt(self, change: dict[str, object]) -> None:
+        if self._closed:
+            return
         evt = _dict_payload(change.get("new"))
         if not evt:
             return
@@ -336,6 +346,24 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
                 )
             )
         return samples
+
+    def close(self) -> None:
+        """Release server-side trace sources and ignore future frontend events."""
+        if self._closed:
+            return
+        self._closed = True
+        with suppress(KeyError, ValueError):
+            self.unobserve(self._on_evt, names=["_evt"])
+        self._sources.clear()
+        self._inspection_sources.clear()
+        self._annotation_sources.clear()
+        self._trace_axes.clear()
+        self._initial_samples.clear()
+        self._initial_annotation_samples.clear()
+        self._last_axes.clear()
+        self._fig_json = {"data": [], "layout": {}}
+        self._update = {"updates": [], "status": "Closed", "_rid": self._last_request_id}
+        self._status = "Closed"
 
     def _sample_annotations(
         self,

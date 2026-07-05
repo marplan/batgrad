@@ -200,6 +200,14 @@ def build_batch_preview(
     return None, preview, wrap_anywidget_blocks((preview.widget,))[0]
 
 
+def close_batch_preview(preview: MlBatchPreview | None) -> None:
+    if preview is None:
+        return
+    close = getattr(preview.widget, "close", None)
+    if callable(close):
+        close()
+
+
 def update_batch_preview(
     *,
     preview: MlBatchPreview | None,

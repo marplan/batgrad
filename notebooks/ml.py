@@ -32,6 +32,7 @@ with app.setup:
         batch_preview_view as render_batch_preview_view,
         build_batch_preview,
         build_index_frame,
+        close_batch_preview,
         discover_normalized_manifest_status,
         make_batch_preview_submission,
         preview_group_count,
@@ -315,7 +316,14 @@ def _():
 
 
 @app.cell
+def _():
+    batch_preview_state = {"preview": None}
+    return (batch_preview_state,)
+
+
+@app.cell
 def _(
+    batch_preview_state,
     get_batch_submission,
     selected_index_frame,
     set_batch_preview,
@@ -328,9 +336,18 @@ def _(
         selected_index_frame=selected_index_frame,
         submission=submission,
     )
+    _previous_preview = batch_preview_state.get("preview")
     if batch_preview is not None:
+        if _previous_preview is not None and _previous_preview.widget is not batch_preview.widget:
+            close_batch_preview(_previous_preview)
+        batch_preview_state["preview"] = batch_preview
         set_batch_preview(batch_preview)
         set_batch_preview_view(batch_preview_view)
+    elif _previous_preview is not None and (batch_error is not None or submission is not None):
+        close_batch_preview(_previous_preview)
+        batch_preview_state["preview"] = None
+        set_batch_preview(None)
+        set_batch_preview_view(None)
     return batch_error, batch_preview, batch_preview_view
 
 
@@ -338,21 +355,30 @@ def _(
 def _(
     batch,
     batch_index,
+    batch_preview_state,
     consecutive_index,
     get_batch_preview,
     set_batch_preview,
     set_batch_preview_view,
 ):
-    preview = get_batch_preview()
+    _previous_preview = get_batch_preview()
     preview, preview_view = update_batch_preview(
-        preview=preview,
+        preview=_previous_preview,
         batch_group_index=int(batch.value),
         sample_index=int(batch_index.value),
         consecutive_step=int(consecutive_index.value),
     )
+    if (
+        _previous_preview is not None
+        and preview is not None
+        and _previous_preview.widget is not preview.widget
+    ):
+        close_batch_preview(_previous_preview)
+        batch_preview_state["preview"] = preview
     if preview_view is not None:
         set_batch_preview_view(preview_view)
     if preview is not None:
+        batch_preview_state["preview"] = preview
         set_batch_preview(preview)
     return preview, preview_view
 
