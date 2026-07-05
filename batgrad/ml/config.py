@@ -43,6 +43,7 @@ class DataConfig:
     protocols: tuple[str, ...]
     input_columns: tuple[str, ...]
     target_columns: tuple[str, ...]
+    protocol_mode: Literal["strict", "available"] = "available"
     store_root: str | None = None
     feedback_columns: tuple[str, ...] = ()
     scaling: tuple[ScalingRuleConfig, ...] = ()
@@ -54,6 +55,8 @@ class DataConfig:
             raise ValueError("data.manifest_paths must not be empty")
         if not self.protocols:
             raise ValueError("data.protocols must not be empty")
+        if self.protocol_mode not in {"strict", "available"}:
+            raise ValueError("data.protocol_mode must be 'strict' or 'available'")
         if not self.input_columns or not self.target_columns:
             raise ValueError("data.input_columns and data.target_columns must not be empty")
         for protocol in self.protocols:

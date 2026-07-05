@@ -268,8 +268,8 @@ def _validate_protocol_availability(
     empty_messages = []
     for row in available_by_dataset.iter_rows(named=True):
         available = {str(value) for value in row["__protocols"]}
-        missing = sorted(set(requested) - available)
-        present = sorted(set(requested) & available)
+        missing = [protocol for protocol in requested if protocol not in available]
+        present = [protocol for protocol in requested if protocol in available]
         dataset_id = row[BaseColumns.set_id]
         if not present:
             empty_messages.append(

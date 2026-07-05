@@ -4,6 +4,7 @@
       "type=synthetic/dataset=synthetic-pozzato-2022-m50t/source=normalized/manifest.parquet": "1f5c354"
     },
     "protocols": ["cycling", "HPPC", "RPT"],
+    "protocol_mode": "available",
     "input_columns": [
       "Time diff [s]",
       "Current [C-rate]",
