@@ -12,7 +12,6 @@ export XDG_CACHE_HOME="$HOME/.cache"
 export XDG_DATA_HOME="$HOME/.local/share"
 export UV_PYTHON_INSTALL_DIR="$XDG_DATA_HOME/uv/python"
 
-export DATA_ROOT="${DATA_ROOT:-/data}"
 export PROJECT_KEY="${PROJECT_KEY:-batgrad}"
 export UV_ENV_FILE="${UV_ENV_FILE:-.env}"
 PROJECT_ROOT="/workspace/ubuntu/$PROJECT_KEY"

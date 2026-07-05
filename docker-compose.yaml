@@ -27,10 +27,11 @@ services:
     stdin_open: true
     tty: true
     init: true
-    env_file:
-      - .env
     environment:
+      OP_SERVICE_ACCOUNT_TOKEN: ${OP_SERVICE_ACCOUNT_TOKEN:-}
+      PROJECT_KEY: ${PROJECT_KEY:-batgrad}
       SSH_AUTH_SOCK: /ssh-agent
+      UV_ENV_FILE: ${UV_ENV_FILE:-.env}
     volumes:
       - .:/workspace/ubuntu/${PROJECT_KEY:-batgrad}
       - dev-home:/home/ubuntu

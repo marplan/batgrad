@@ -19,11 +19,12 @@ cp .env.example .env
 Important values:
 
 - `HOST_DATA_ROOT` is mounted from the host into the container at `/data`.
-- `DATA_ROOT` defaults to `/data` inside every container.
+- `DATA_ROOT` is loaded by `uv run` from `.env`; it is not exported into shells by default.
 - `PROJECT_KEY` defaults to `batgrad` and controls `/workspace/ubuntu/$PROJECT_KEY`.
 - `HOST_UID` and `HOST_GID` map the local Compose container user to the host user.
 - `SSH_AUTH_SOCK_HOST` points Compose at the host SSH agent socket.
-- `UV_ENV_FILE=.env` lets `uv run` load the project env file.
+- `UV_ENV_FILE=.env` lets `uv run` load the project env file. Existing shell variables
+  take precedence, so do not export `DATA_ROOT` manually unless you want to override `.env`.
 
 Optional dotfiles use a separate env file:
 
