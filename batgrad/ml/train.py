@@ -457,7 +457,7 @@ def _save_validation_checkpoints(
             scheduler,
             scaler,
             run_dir,
-            f"best__{_metric_filename(monitor)}.pt",
+            f"best_{_metric_filename(monitor)}.pt",
             step=step,
             epoch_idx=epoch_idx,
             epoch_step=epoch_step,

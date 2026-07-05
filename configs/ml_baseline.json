@@ -82,7 +82,7 @@
     "output": { "parameterization": "shared" }
   },
   "train": {
-    "epochs": 8.0,
+    "epochs": 4.0,
     "log_every_steps": 10,
     "validate_per_epoch": 2,
     "loss": "categorical_ce",

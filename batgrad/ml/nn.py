@@ -434,45 +434,38 @@ class SequenceMixer(nn.Module):
                 h = h.sum(dim=2)
                 continue
             layer_key = f"layers.{layer_idx}"
-            y = _apply_sequence_layer(
-                layer, h, mask, states, next_states, layer_key, return_states=return_states
-            )
+            if spec.kind == "mamba" and return_states:
+                output, state = cast("MambaBlock", layer)(
+                    h,
+                    mask,
+                    state=None if states is None else states.get(layer_key),
+                    return_state=True,
+                )
+                next_states[layer_key] = state
+                y = output
+            else:
+                y = layer(h, mask)
             h = h + y if spec.uses_residual else y
         for layer_idx, (spec, layer) in enumerate(
             zip(self.config.head_layers, self.head_layers, strict=True)
         ):
             layer_key = f"head_layers.{layer_idx}"
-            y = _apply_sequence_layer(
-                layer, h, mask, states, next_states, layer_key, return_states=return_states
-            )
+            if spec.kind == "mamba" and return_states:
+                output, state = cast("MambaBlock", layer)(
+                    h,
+                    mask,
+                    state=None if states is None else states.get(layer_key),
+                    return_state=True,
+                )
+                next_states[layer_key] = state
+                y = output
+            else:
+                y = layer(h, mask)
             h = h + y if spec.uses_residual else y
         logits = self.output(self.final_norm(h)).view(*h.shape[:2], self.output_dim, self.num_bins)
         if return_states:
             return logits, next_states
         return logits
-
-
-def _apply_sequence_layer(
-    layer: nn.Module,
-    h: torch.Tensor,
-    mask: torch.Tensor | None,
-    states: dict[str, MambaCarryState] | None,
-    next_states: dict[str, MambaCarryState],
-    layer_key: str,
-    *,
-    return_states: bool,
-) -> torch.Tensor:
-    if isinstance(layer, MambaBlock) and return_states:
-        output, state = layer(
-            h,
-            mask,
-            state=None if states is None else states.get(layer_key),
-            return_state=True,
-        )
-        next_states[layer_key] = state
-        return output
-    return layer(h, mask)
-
 
 def categorical_target_distribution(
     target: torch.Tensor,
