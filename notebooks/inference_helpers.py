@@ -437,9 +437,9 @@ def _run_selected_batch_inference(
         inference_loader,
         batch_idx=0,
     )
-    inputs = batch.active.inputs.to(device=device)
-    targets = batch.active.targets.to(device=device)
-    mask = batch.active.mask.to(device=device)
+    inputs = batch.inputs.to(device=device)
+    targets = batch.targets.to(device=device)
+    mask = batch.mask.to(device=device)
     predictions = tuple(
         PredictionSeries(
             checkpoint_label=selected_checkpoint.alias,
@@ -469,7 +469,7 @@ def _run_selected_batch_inference(
         context_len=context_len,
         rollout_len=effective_rollout,
         group_labels=tuple(
-            _group_label(idx, key) for idx, key in enumerate(batch.active.state.group_keys)
+            _group_label(idx, key) for idx, key in enumerate(batch.state.group_keys)
         ),
         warning=warning,
     )

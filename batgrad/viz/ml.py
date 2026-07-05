@@ -860,8 +860,7 @@ def _metadata_frame(
     sample_index: int,
     submission: MlBatchPreviewSubmission,
 ) -> pl.DataFrame:
-    active = batch.active
-    state = active.state
+    state = batch.state
     sample_index = _clamp_sample_index(sample_index, len(state.window_offsets))
     consecutive_index = _clamp_consecutive_index(
         submission.consecutive_step,
@@ -899,17 +898,13 @@ def _metadata_frame(
             "field": "window_offset",
             "value": state.window_offsets[sample_index],
         },
-        {"scope": "tensor", "field": "inputs_shape", "value": tuple(active.inputs.shape)},
-        {"scope": "tensor", "field": "targets_shape", "value": tuple(active.targets.shape)},
-        {"scope": "tensor", "field": "mask_true", "value": int(active.mask.sum().item())},
+        {"scope": "tensor", "field": "inputs_shape", "value": tuple(batch.inputs.shape)},
+        {"scope": "tensor", "field": "targets_shape", "value": tuple(batch.targets.shape)},
+        {"scope": "tensor", "field": "mask_true", "value": int(batch.mask.sum().item())},
     ]
     rows.extend(
         {"scope": "batch.state", "field": field, "value": value}
         for field, value in asdict(batch.state).items()
-    )
-    rows.extend(
-        {"scope": "active.state", "field": field, "value": value}
-        for field, value in asdict(active.state).items()
     )
     return pl.DataFrame(
         {

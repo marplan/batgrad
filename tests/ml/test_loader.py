@@ -135,7 +135,7 @@ def test_dataset_steps_per_epoch_uses_planned_batches(tmp_path: Path) -> None:
         target_columns=(BaseColumns.volt,),
         scaling=(),
         config=config,
-        active_protocol=DatasetProtocolId.cycling,
+        protocols=(DatasetProtocolId.cycling,),
     )
 
     assert dataset.steps_per_epoch(0) == count_batch_plans(
@@ -208,11 +208,11 @@ def test_materialize_window_ref_reads_only_requested_window(tmp_path: Path) -> N
     assert store.slices == [
         ("data.parquet", ((7, 7),), (BaseColumns.time, BaseColumns.curr, BaseColumns.volt))
     ]
-    assert tuple(batch.active.inputs.shape) == (2, 3, 2)
-    assert tuple(batch.active.targets.shape) == (2, 3, 1)
-    assert batch.active.all_valid is True
-    assert batch.active.inputs[0, 0, 0].item() == 7.0
-    assert batch.active.targets[0, 0, 0].item() == 108.0
+    assert tuple(batch.inputs.shape) == (2, 3, 2)
+    assert tuple(batch.targets.shape) == (2, 3, 1)
+    assert batch.all_valid is True
+    assert batch.inputs[0, 0, 0].item() == 7.0
+    assert batch.targets[0, 0, 0].item() == 108.0
 
 
 def test_materialize_window_ref_marks_padded_batch_not_all_valid(tmp_path: Path) -> None:
@@ -256,8 +256,8 @@ def test_materialize_window_ref_marks_padded_batch_not_all_valid(tmp_path: Path)
         batch_idx=0,
     )
 
-    assert batch.active.all_valid is False
-    assert batch.active.mask.tolist() == [[True, False, False], [False, False, False]]
+    assert batch.all_valid is False
+    assert batch.mask.tolist() == [[True, False, False], [False, False, False]]
 
 
 def test_full_in_mem_loader_matches_windowed_loader(tmp_path: Path) -> None:
@@ -281,7 +281,7 @@ def test_full_in_mem_loader_matches_windowed_loader(tmp_path: Path) -> None:
         "input_columns": (BaseColumns.time, BaseColumns.curr),
         "target_columns": (BaseColumns.volt,),
         "scaling": (),
-        "active_protocol": DatasetProtocolId.cycling,
+        "protocols": (DatasetProtocolId.cycling,),
     }
     windowed = next(iter(MlDataIterable(config=LoaderConfig(default_window=window), **common)))
     full_in_mem = next(
@@ -293,9 +293,9 @@ def test_full_in_mem_loader_matches_windowed_loader(tmp_path: Path) -> None:
         )
     )
 
-    assert full_in_mem.active.inputs.equal(windowed.active.inputs)
-    assert full_in_mem.active.targets.equal(windowed.active.targets)
-    assert full_in_mem.active.mask.equal(windowed.active.mask)
+    assert full_in_mem.inputs.equal(windowed.inputs)
+    assert full_in_mem.targets.equal(windowed.targets)
+    assert full_in_mem.mask.equal(windowed.mask)
     assert store.slices
 
 
@@ -336,14 +336,14 @@ def test_dataloader_for_split_uses_full_index(tmp_path: Path) -> None:
             strategy="sequential",
             default_window=WindowConfig(batch_size=1, seq_len=3),
         ),
-        "active_protocol": DatasetProtocolId.cycling,
+        "protocols": (DatasetProtocolId.cycling,),
     }
 
     train_loader = torch.utils.data.DataLoader(MlDataIterable(**common), batch_size=None)
     val_loader = dataloader_for_split(train_loader, BaseColumns.split.values.val)
     val_batch = next(iter(val_loader))
 
-    assert val_batch.active.state.manifest_row_ids == (1,)
+    assert val_batch.state.manifest_row_ids == (1,)
 
 
 def test_loader_validates_only_active_split_protocol_columns(tmp_path: Path) -> None:
@@ -385,12 +385,12 @@ def test_loader_validates_only_active_split_protocol_columns(tmp_path: Path) -> 
                     strategy="sequential",
                     default_window=WindowConfig(batch_size=1, seq_len=3),
                 ),
-                active_protocol=DatasetProtocolId.cycling,
+                protocols=(DatasetProtocolId.cycling,),
             )
         )
     )
 
-    assert tuple(batch.active.inputs.shape) == (1, 3, 1)
+    assert tuple(batch.inputs.shape) == (1, 3, 1)
 
 
 def test_create_dataloader_coerces_protocol_names(tmp_path: Path) -> None:
@@ -424,7 +424,7 @@ def test_create_dataloader_coerces_protocol_names(tmp_path: Path) -> None:
         ),
     )
 
-    assert next(iter(loader)).active_protocol == DatasetProtocolId.hppc
+    assert next(iter(loader)).state.protocols == (DatasetProtocolId.hppc,)
 
 
 def test_loader_rejects_missing_group_key_column(tmp_path: Path) -> None:
@@ -439,7 +439,7 @@ def test_loader_rejects_missing_group_key_column(tmp_path: Path) -> None:
             target_columns=(BaseColumns.volt,),
             scaling=(),
             config=LoaderConfig(),
-            active_protocol=DatasetProtocolId.cycling,
+            protocols=(DatasetProtocolId.cycling,),
         )
 
 
@@ -467,12 +467,12 @@ def test_loader_validates_scaling_from_manifest_stats(tmp_path: Path) -> None:
                     strategy="sequential",
                     default_window=WindowConfig(batch_size=1, seq_len=3),
                 ),
-                active_protocol=DatasetProtocolId.cycling,
+                protocols=(DatasetProtocolId.cycling,),
             )
         )
     )
 
-    assert tuple(batch.active.inputs.shape) == (1, 3, 1)
+    assert tuple(batch.inputs.shape) == (1, 3, 1)
     assert store.slices[0][1] == ((0, 4),)
 
 
@@ -496,7 +496,7 @@ def test_loader_rejects_scaling_outside_manifest_stats(tmp_path: Path) -> None:
             target_columns=(BaseColumns.volt,),
             scaling=(ScalingRule(BaseColumns.time, 0.0, 10.0),),
             config=LoaderConfig(),
-            active_protocol=DatasetProtocolId.cycling,
+            protocols=(DatasetProtocolId.cycling,),
         )
 
 
@@ -512,7 +512,7 @@ def test_loader_requires_manifest_stats_for_scaled_columns(tmp_path: Path) -> No
             target_columns=(BaseColumns.volt,),
             scaling=(ScalingRule(BaseColumns.time, 0.0, 20.0),),
             config=LoaderConfig(),
-            active_protocol=DatasetProtocolId.cycling,
+            protocols=(DatasetProtocolId.cycling,),
         )
 
 

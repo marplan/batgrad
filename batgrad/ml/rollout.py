@@ -117,9 +117,9 @@ def run_rollouts(  # noqa: C901, PLR0915
                 window_config,
                 batch_idx=0,
             )
-            inputs = batch.active.inputs.to(device=device)
-            targets = batch.active.targets.to(device=device)
-            rollout_mask = batch.active.mask.to(device=device)
+            inputs = batch.inputs.to(device=device)
+            targets = batch.targets.to(device=device)
+            rollout_mask = batch.mask.to(device=device)
             if config.validation.rollout_extension.enabled:
                 inputs = append_rollout_extension(config, inputs)
                 targets = torch.cat(

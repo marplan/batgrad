@@ -12,8 +12,6 @@ from batgrad.ml.data.batch import (
     Batch,
     BatchSegmentRef,
     BatchState,
-    ProtocolBatch,
-    ProtocolBatchState,
 )
 from batgrad.ml.data.config import PADDING_VALUE, LoaderConfig, ScalingRule, WindowConfig
 from batgrad.ml.data.planning import BatchPlan, StreamPlan, WindowRef, row_segments
@@ -82,8 +80,6 @@ def materialize_batch_plan(
 ) -> Batch:
     if not plan.refs:
         raise ValueError("BatchPlan must contain at least one WindowRef")
-    if len({ref.protocol for ref in plan.refs}) != 1:
-        raise NotImplementedError("Mixed-protocol batch plans are not implemented yet")
     if config.strategy == "sequential" and len(plan.refs) == 1:
         return _materialize_window_ref_from_store_or_cache(
             store,
@@ -246,8 +242,6 @@ def _materialize_batch_plan_from_cache(
     batch_idx: int,
     cache: StreamTensorCache,
 ) -> Batch:
-    window_config = config.window_for(plan.refs[0].protocol)
-    sample_rows = window_config.seq_len + 1
     # PERF: full_in_mem shuffled batches are still roughly 3x slower than
     # sequential batches in many-stream benchmarks because they assemble many
     # independent stream windows instead of reshaping one contiguous slice. A
@@ -259,8 +253,8 @@ def _materialize_batch_plan_from_cache(
             sample_ref,
             input_columns,
             target_columns,
-            window_config.seq_len,
-            sample_rows,
+            config.window_for(sample_ref.protocol).seq_len,
+            config.window_for(sample_ref.protocol).seq_len + 1,
             cache,
         )
         for sample_ref in plan.refs
@@ -343,35 +337,25 @@ def _batch_from_protocol_tensors(
     stateful_step_idx: int | None = None,
     stateful_steps: int | None = None,
 ) -> Batch:
-    protocol_batch = ProtocolBatch(
-        protocol=ref.protocol,
+    return Batch(
         inputs=inputs,
         targets=targets,
         mask=mask,
         all_valid=bool(mask.all().item()),
-        state=ProtocolBatchState(
+        state=BatchState(
             split=ref.split,
             batch_idx=batch_idx,
-            protocol=ref.protocol,
+            protocols=tuple(sample_ref.protocol for sample_ref in refs),
             manifest_paths=tuple(sample_ref.manifest_path for sample_ref in refs),
             manifest_row_ids=tuple(sample_ref.manifest_row_id for sample_ref in refs),
             group_keys=tuple(sample_ref.group_key for sample_ref in refs),
             alignment_keys=tuple(sample_ref.alignment_key for sample_ref in refs),
             segments=segments,
             window_offsets=tuple(sample_ref.offset for sample_ref in refs),
-        ),
-    )
-    return Batch(
-        state=BatchState(
-            split=ref.split,
-            batch_idx=batch_idx,
-            active_protocol=ref.protocol,
-            protocol_order=(ref.protocol,),
             stateful_group_idx=stateful_group_idx,
             stateful_step_idx=stateful_step_idx,
             stateful_steps=stateful_steps,
         ),
-        protocols={ref.protocol: protocol_batch},
     )
 
 

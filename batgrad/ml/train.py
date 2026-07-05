@@ -164,13 +164,13 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
                 loss_metrics = backward_batch_loss_with_metrics(
                     config,
                     model,
-                    batch.active.inputs,
-                    batch.active.targets,
-                    batch.active.mask,
+                    batch.inputs,
+                    batch.targets,
+                    batch.mask,
                     device,
                     scaler,
                     collect_metrics=should_log,
-                    mask_all_valid=batch.active.all_valid,
+                    mask_all_valid=batch.all_valid,
                     initial_mamba_states=carried_mamba_states,
                     return_mamba_states=return_mamba_states,
                 )
@@ -316,8 +316,8 @@ def _logged_config(
 
 
 def _model_compute_token_count(config: ExperimentConfig, batch: Batch) -> int:
-    batch_size = int(batch.active.inputs.shape[0])
-    seq_len = int(batch.active.inputs.shape[1])
+    batch_size = int(batch.inputs.shape[0])
+    seq_len = int(batch.inputs.shape[1])
     suffix = config.train.masked_suffix
     if not suffix.enabled or suffix.roll_forward_steps <= 0:
         return batch_size * seq_len
@@ -596,12 +596,12 @@ def _validate(
             metrics = batch_loss_with_metrics(
                 val_loss_config,
                 model,
-                batch.active.inputs,
-                batch.active.targets,
-                batch.active.mask,
+                batch.inputs,
+                batch.targets,
+                batch.mask,
                 device,
                 include_rmse=True,
-                mask_all_valid=batch.active.all_valid,
+                mask_all_valid=batch.all_valid,
             )
             loss_sum += metrics.loss.detach()
             loss_count += 1
