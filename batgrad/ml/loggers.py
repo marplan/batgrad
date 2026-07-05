@@ -4,7 +4,10 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 from batgrad.logging import get_logger
 
@@ -50,7 +53,7 @@ class RunLogger(Protocol):
     def log_metrics(
         self,
         step: int,
-        metrics: dict[str, LogValue],
+        metrics: Mapping[str, LogValue],
         *,
         epoch: int | None = None,
         epoch_pct: int | None = None,
@@ -64,7 +67,7 @@ class StdoutRunLogger:
     def log_metrics(
         self,
         step: int,
-        metrics: dict[str, LogValue],
+        metrics: Mapping[str, LogValue],
         *,
         epoch: int | None = None,
         epoch_pct: int | None = None,
@@ -92,7 +95,7 @@ class NoOpRunLogger:
     def log_metrics(
         self,
         step: int,
-        metrics: dict[str, LogValue],
+        metrics: Mapping[str, LogValue],
         *,
         epoch: int | None = None,
         epoch_pct: int | None = None,
@@ -120,7 +123,7 @@ class JsonlRunLogger:
     def log_metrics(
         self,
         step: int,
-        metrics: dict[str, LogValue],
+        metrics: Mapping[str, LogValue],
         *,
         epoch: int | None = None,
         epoch_pct: int | None = None,
@@ -163,13 +166,13 @@ class WandbRunLogger:
     def log_metrics(
         self,
         step: int,
-        metrics: dict[str, LogValue],
+        metrics: Mapping[str, LogValue],
         *,
         epoch: int | None = None,
         epoch_pct: int | None = None,
     ) -> None:
         del epoch, epoch_pct
-        self.run.log(metrics, step=step)
+        self.run.log(dict(metrics), step=step)
 
     def log_payload(self, step: int, name: str, payload: object) -> None:
         self.run.log({name: payload}, step=step)
@@ -189,7 +192,7 @@ class CompositeRunLogger:
     def log_metrics(
         self,
         step: int,
-        metrics: dict[str, LogValue],
+        metrics: Mapping[str, LogValue],
         *,
         epoch: int | None = None,
         epoch_pct: int | None = None,
