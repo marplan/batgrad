@@ -76,7 +76,6 @@ class StreamPlan:
 
 @dataclass(frozen=True, slots=True)
 class BatchPlan:
-    active_protocol: DatasetProtocolId
     refs: tuple[WindowRef, ...]
     stateful_group_idx: int | None = None
     stateful_step_idx: int | None = None
@@ -103,36 +102,38 @@ def build_batch_plans(
 
 def count_batch_plans(
     index: MlDatasetIndex,
-    active_protocol: DatasetProtocolId | object,
+    active_protocol: DatasetProtocolId | object | None,
     config: LoaderConfig,
     epoch_idx: int = 0,
     stream_plans: tuple[StreamPlan, ...] | None = None,
 ) -> int:
-    protocol = coerce_protocol(active_protocol)
+    protocol_order = _protocol_order(index, active_protocol, config)
     if config.strategy == "sequential":
+        protocol = protocol_order[0]
         return _count_sequential_batch_plans(index, protocol, config)
     if config.strategy == "shuffled_protocol_groups":
         return _count_shuffled_protocol_group_batch_plans(
-            index, protocol, config, epoch_idx, stream_plans=stream_plans
+            index, protocol_order, config, epoch_idx, stream_plans=stream_plans
         )
     raise ValueError(f"Unknown batch strategy: {config.strategy!r}")
 
 
 def iter_batch_plans(
     index: MlDatasetIndex,
-    active_protocol: DatasetProtocolId | object,
+    active_protocol: DatasetProtocolId | object | None,
     config: LoaderConfig,
     epoch_idx: int = 0,
     stream_plans: tuple[StreamPlan, ...] | None = None,
 ) -> Iterator[BatchPlan]:
-    protocol = coerce_protocol(active_protocol)
+    protocol_order = _protocol_order(index, active_protocol, config)
     if config.strategy == "sequential":
+        protocol = protocol_order[0]
         for ref in iter_window_refs(index, protocol, config):
-            yield BatchPlan(active_protocol=protocol, refs=(ref,))
+            yield BatchPlan(refs=(ref,))
         return
     if config.strategy == "shuffled_protocol_groups":
         yield from _iter_shuffled_protocol_group_batch_plans(
-            index, protocol, config, epoch_idx, stream_plans=stream_plans
+            index, protocol_order, config, epoch_idx, stream_plans=stream_plans
         )
         return
     raise ValueError(f"Unknown batch strategy: {config.strategy!r}")
@@ -236,38 +237,57 @@ def protocol_index(index: MlDatasetIndex, protocol: DatasetProtocolId) -> MlData
     )
 
 
+def _protocol_order(
+    index: MlDatasetIndex,
+    active_protocol: DatasetProtocolId | object | None,
+    config: LoaderConfig,
+) -> tuple[DatasetProtocolId, ...]:
+    if config.protocol_order:
+        return config.protocol_order
+    if active_protocol is not None:
+        return (coerce_protocol(active_protocol),)
+    return (first_protocol(index),)
+
+
 def _iter_shuffled_protocol_group_batch_plans(
     index: MlDatasetIndex,
-    protocol: DatasetProtocolId,
+    protocol_order: tuple[DatasetProtocolId, ...],
     config: LoaderConfig,
     epoch_idx: int,
     *,
     stream_plans: tuple[StreamPlan, ...] | None = None,
 ) -> Iterator[BatchPlan]:
-    if protocol == DatasetProtocolId.eis:
+    """Yield shuffled stateful protocol-window batches.
+
+    For whole-stream mode (`stateful_n_windows=-1`), all streams in a batch are
+    shortened to the shortest stream length. With multi-protocol chains this can
+    drop long tails and, in the worst case, prevent later protocols from being
+    seen for longer streams in that batch. A later strategy should bucket by
+    length or preserve state per active lane instead of truncating the batch.
+    """
+    if any(protocol == DatasetProtocolId.eis for protocol in protocol_order):
         raise NotImplementedError(
             "shuffled_protocol_groups does not support EIS yet; "
             "use sequential debug or select cycling/HPPC/RPT"
         )
     refs_by_stream = _shuffled_protocol_refs_by_stream(
-        index,
-        protocol,
-        config,
-        epoch_idx,
-        stream_plans=stream_plans,
+        index, protocol_order, config, epoch_idx, stream_plans=stream_plans
     )
     stateful_segments = _stateful_segments(refs_by_stream, config.stateful_n_windows)
     _stable_shuffle(stateful_segments, seed=config.seed, epoch_idx=epoch_idx, salt="segments")
 
-    window = config.window_for(protocol)
+    window = config.window_for(protocol_order[0])
     for group_idx, batch_start in enumerate(range(0, len(stateful_segments), window.batch_size)):
         batch_segments = stateful_segments[batch_start : batch_start + window.batch_size]
         if len(batch_segments) != window.batch_size and config.drop_incomplete_batches:
             continue
+        # NOTE: Whole-stream stateful batches currently shorten every lane to the
+        # shortest stream in the batch. For chained protocols this can drop tails
+        # or even entire later protocols; a second strategy should handle this by
+        # length bucketing or per-lane state preservation.
         stateful_steps = min(len(segment) for segment in batch_segments)
         for step_idx in range(stateful_steps):
             yield BatchPlan(
-                active_protocol=protocol,
                 refs=tuple(segment[step_idx] for segment in batch_segments),
                 stateful_group_idx=group_idx,
                 stateful_step_idx=step_idx,
@@ -311,19 +331,19 @@ def _count_sequential_batch_plans(
 
 def _count_shuffled_protocol_group_batch_plans(
     index: MlDatasetIndex,
-    protocol: DatasetProtocolId,
+    protocol_order: tuple[DatasetProtocolId, ...],
     config: LoaderConfig,
     epoch_idx: int,
     *,
     stream_plans: tuple[StreamPlan, ...] | None = None,
 ) -> int:
-    if protocol == DatasetProtocolId.eis:
+    if any(protocol == DatasetProtocolId.eis for protocol in protocol_order):
         return 0
-    window = config.window_for(protocol)
-    plans = stream_plans or build_stream_plans(index, protocol, config)
-    ref_counts = tuple(
-        _count_shuffled_stream_refs(stream, window.seq_len, config, epoch_idx) for stream in plans
+    window = config.window_for(protocol_order[0])
+    refs_by_stream = _shuffled_protocol_refs_by_stream(
+        index, protocol_order, config, epoch_idx, stream_plans=stream_plans
     )
+    ref_counts = tuple(len(refs) for refs in refs_by_stream.values())
     ref_counts = tuple(count for count in ref_counts if count > 0)
     if config.stateful_n_windows == -1:
         return _count_whole_stream_stateful_batches(ref_counts, window.batch_size, config)
@@ -391,37 +411,48 @@ def _range_count(stop_exclusive: int, step: int) -> int:
 
 def _shuffled_protocol_refs_by_stream(
     index: MlDatasetIndex,
-    protocol: DatasetProtocolId,
+    protocol_order: tuple[DatasetProtocolId, ...],
     config: LoaderConfig,
     epoch_idx: int,
     *,
     stream_plans: tuple[StreamPlan, ...] | None = None,
 ) -> dict[tuple[object, ...], tuple[WindowRef, ...]]:
-    window = config.window_for(protocol)
-    refs_by_stream: dict[tuple[object, ...], tuple[WindowRef, ...]] = {}
-    plans = stream_plans or build_stream_plans(index, protocol, config)
-    for stream in plans:
-        row_count = stream.row_count
-        max_offset = row_count - window.seq_len
-        if max_offset <= 0:
-            continue
-        offsets = _whole_stream_offsets(row_count, window.seq_len)
-        if config.stateful_n_windows != -1:
-            phase = _resolve_stream_phase(
-                epoch_idx=epoch_idx,
-                seq_len=window.seq_len,
-                phase_start=stream.phase_start,
-                phase_stride=stream.phase_stride,
+    refs_by_stream: dict[tuple[object, ...], list[WindowRef]] = {}
+    for protocol in protocol_order:
+        window = config.window_for(protocol)
+        plans = (
+            tuple(stream for stream in stream_plans if stream.protocol == protocol)
+            if stream_plans is not None
+            else build_stream_plans(index, protocol, config)
+        )
+        for stream in plans:
+            row_count = stream.row_count
+            max_offset = row_count - window.seq_len
+            if max_offset <= 0:
+                continue
+            offsets = _whole_stream_offsets(row_count, window.seq_len)
+            if config.stateful_n_windows != -1:
+                phase = _resolve_stream_phase(
+                    epoch_idx=epoch_idx,
+                    seq_len=window.seq_len,
+                    phase_start=stream.phase_start,
+                    phase_stride=stream.phase_stride,
+                )
+                offsets = _build_phase_offsets(
+                    stream_len=row_count,
+                    step=window.seq_len,
+                    phase=phase,
+                )
+            refs = [_window_ref(stream, offset) for offset in offsets]
+            if not refs:
+                continue
+            stream_key = (
+                stream.alignment_key
+                if config.cross_protocol_state_carry == "chain"
+                else (*stream.alignment_key, protocol)
             )
-            offsets = _build_phase_offsets(
-                stream_len=row_count,
-                step=window.seq_len,
-                phase=phase,
-            )
-        stream_refs = tuple(_window_ref(stream, offset) for offset in offsets)
-        if stream_refs:
-            refs_by_stream[stream.stream_identity] = stream_refs
-    return refs_by_stream
+            refs_by_stream.setdefault(stream_key, []).extend(refs)
+    return {key: tuple(refs) for key, refs in refs_by_stream.items() if refs}
 
 
 def _window_ref(stream: StreamPlan, offset: int) -> WindowRef:

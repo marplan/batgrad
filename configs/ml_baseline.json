@@ -3,7 +3,7 @@
     "manifest_paths": {
       "type=synthetic/dataset=synthetic-pozzato-2022-m50t/source=normalized/manifest.parquet": "1f5c354"
     },
-    "protocols": ["cycling"],
+    "protocols": ["cycling", "HPPC", "RPT"],
     "input_columns": [
       "Time diff [s]",
       "Current [C-rate]",
@@ -28,6 +28,7 @@
     "seq_len": 1024,
     "strategy": "shuffled_protocol_groups",
     "stateful_n_windows": 1,
+    "cross_protocol_state_carry": "chain",
     "data_access": "full_in_mem",
     "num_workers": 0,
     "prefetch_to_device": false

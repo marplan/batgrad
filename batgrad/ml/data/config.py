@@ -7,6 +7,7 @@ from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId, MappingSpe
 
 PADDING_VALUE = -2.0
 type BatchStrategy = Literal["sequential", "shuffled_protocol_groups"]
+type CrossProtocolStateCarry = Literal["chain"]
 type MultiprocessingContext = Literal["fork", "spawn", "forkserver"]
 type DataAccessMode = Literal["windowed", "full_in_mem"]
 type ScalingTransform = Literal["linear", "log1p"]
@@ -207,6 +208,11 @@ def _validate_loader_strategy(config: LoaderConfig) -> None:
         )
     if config.data_access == "full_in_mem" and config.num_workers != 0:
         raise ValueError("data_access='full_in_mem' requires num_workers=0")
+    if config.cross_protocol_state_carry not in {None, "chain"}:
+        raise ValueError(
+            "cross_protocol_state_carry must be None or 'chain', "
+            f"got {config.cross_protocol_state_carry!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -245,8 +251,9 @@ class LoaderConfig:
     window_by_protocol: dict[DatasetProtocolId, WindowConfig] = field(default_factory=dict)
     seed: int = 69
     strategy: BatchStrategy = "shuffled_protocol_groups"
-    active_protocol: DatasetProtocolId | None = None
+    protocol_order: tuple[DatasetProtocolId, ...] = ()
     stateful_n_windows: int = 1
+    cross_protocol_state_carry: CrossProtocolStateCarry | None = None
     drop_incomplete_batches: bool = True
     drop_incomplete_distributed: bool = True
     data_access: DataAccessMode = "windowed"

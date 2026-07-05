@@ -51,22 +51,22 @@ class MlDataIterable(IterableDataset[Batch]):
         target_columns: tuple[str | MappingSpec, ...],
         scaling: tuple[ScalingRule, ...],
         config: LoaderConfig,
-        active_protocol: DatasetProtocolId | None = None,
+        protocols: tuple[object, ...] | None = None,
     ) -> None:
         self.store = store
         self.full_index = index
         self.index = index.filter_split(config.split)
         self.input_columns = tuple(input_columns)
         self.target_columns = tuple(target_columns)
+        self.protocol_order = _protocol_order(self.index, config, protocols)
         self.scaling = scaling
-        self.config = config
-        self.active_protocol = (
-            config.active_protocol or active_protocol or planning.first_protocol(self.index)
-        )
-        self.active_index = planning.protocol_index(self.index, self.active_protocol)
+        self.config = replace(config, protocol_order=self.protocol_order)
+        self.active_index = self.index
         planning.validate_key_columns(self.active_index, self.config)
-        self.stream_plans = planning.build_stream_plans(
-            self.active_index, self.active_protocol, self.config
+        self.stream_plans = tuple(
+            stream
+            for protocol in self.protocol_order
+            for stream in planning.build_stream_plans(self.active_index, protocol, self.config)
         )
         self.active_scaling = materialization.selected_scaling_rules(
             self.scaling,
@@ -87,7 +87,7 @@ class MlDataIterable(IterableDataset[Batch]):
         _log_data_access_plan(
             self.stream_plans,
             self.config,
-            self.active_protocol,
+            self.protocol_order,
             source_columns_,
         )
         if self.config.data_access == "full_in_mem":
@@ -105,9 +105,9 @@ class MlDataIterable(IterableDataset[Batch]):
         else:
             stream_tensor_cache = None
         if self.config.data_access == "full_in_mem" and not stream_tensor_cache:
-            raise ValueError("data_access='full_in_mem' could not load any active protocol streams")
+            raise ValueError("data_access='full_in_mem' could not load any selected protocol streams")
         if stream_tensor_cache is not None and not stream_tensor_cache.tensors:
-            raise ValueError("data_access='full_in_mem' could not load any active protocol streams")
+            raise ValueError("data_access='full_in_mem' could not load any selected protocol streams")
         self.stream_tensor_cache = stream_tensor_cache
         self._epoch_idx = 0
         if not self.input_columns:
@@ -123,7 +123,7 @@ class MlDataIterable(IterableDataset[Batch]):
     def steps_per_epoch(self, epoch_idx: int = 0) -> int:
         return planning.count_batch_plans(
             self.index,
-            self.active_protocol,
+            None,
             self.config,
             epoch_idx=epoch_idx,
             stream_plans=self.stream_plans,
@@ -139,7 +139,7 @@ class MlDataIterable(IterableDataset[Batch]):
             self.target_columns,
             self.active_scaling,
             self.config,
-            self.active_protocol,
+            self.protocol_order,
             self.stream_plans,
             self.schema_by_path,
             self.stream_tensor_cache,
@@ -208,6 +208,18 @@ class DevicePrefetchDataLoader:
         return self._base_loader.dataset
 
 
+def _protocol_order(
+    index: MlDatasetIndex,
+    config: LoaderConfig,
+    protocols: tuple[object, ...] | None,
+) -> tuple[DatasetProtocolId, ...]:
+    if config.protocol_order:
+        return config.protocol_order
+    if protocols:
+        return tuple(coerce_protocol(protocol) for protocol in protocols)
+    return (planning.first_protocol(index),)
+
+
 def create_dataloader(
     store: DatasetStoreReader,
     manifest_paths: ManifestPaths,
@@ -222,10 +234,7 @@ def create_dataloader(
 ) -> DataLoader[Batch] | DevicePrefetchDataLoader:
     resolved_config = LoaderConfig() if config is None else config
     if active_protocol is not None:
-        resolved_config = replace(
-            resolved_config,
-            active_protocol=coerce_protocol(active_protocol),
-        )
+        resolved_config = replace(resolved_config, protocol_order=(coerce_protocol(active_protocol),))
     index = build_index(
         store,
         manifest_paths,
@@ -240,7 +249,7 @@ def create_dataloader(
         target_columns=target_columns,
         scaling=scaling,
         config=resolved_config,
-        active_protocol=resolved_config.active_protocol,
+        protocols=protocols,
     )
     device = torch.device(resolved_config.device)
     use_cuda_prefetch = resolved_config.prefetch_to_device and device.type == "cuda"
@@ -319,7 +328,7 @@ def _iter_batches(
     target_columns: tuple[str, ...],
     scaling: tuple[ScalingRule, ...],
     config: LoaderConfig,
-    active_protocol: DatasetProtocolId,
+    protocol_order: tuple[DatasetProtocolId, ...],
     stream_plans: tuple[StreamPlan, ...] | None,
     schema_by_path: dict[str, set[str]] | None,
     stream_tensor_cache: StreamTensorCache | None,
@@ -328,7 +337,7 @@ def _iter_batches(
 ) -> Iterator[Batch]:
     plans = planning.iter_batch_plans(
         index,
-        active_protocol,
+        None,
         config,
         epoch_idx=epoch_idx,
         stream_plans=stream_plans,
@@ -352,19 +361,20 @@ def _iter_batches(
 def _log_data_access_plan(
     stream_plans: tuple[StreamPlan, ...],
     config: LoaderConfig,
-    active_protocol: DatasetProtocolId,
+    protocol_order: tuple[DatasetProtocolId, ...],
     source_columns: tuple[str, ...],
 ) -> None:
-    window = config.window_for(active_protocol)
+    window = config.window_for(protocol_order[0])
     total_rows = sum(stream.row_count for stream in stream_plans)
+    protocols = ",".join(str(protocol) for protocol in protocol_order)
     if config.data_access == "full_in_mem":
         payload_gb = total_rows * len(source_columns) * 4 / 1e9
         logger.info(
-            "ML loader data_access=full_in_mem split=%s protocol=%s streams=%d "
+            "ML loader data_access=full_in_mem split=%s protocols=%s streams=%d "
             "rows=%d columns=%d dtype=float32 estimated_tensor_payload_gb=%.2f. "
             "Full selected split/protocol/columns will be cached in CPU RAM.",
             config.split,
-            active_protocol,
+            protocols,
             len(stream_plans),
             total_rows,
             len(source_columns),
@@ -374,11 +384,11 @@ def _log_data_access_plan(
 
     batch_payload_gb = window.batch_size * window.seq_len * len(source_columns) * 4 / 1e9
     logger.info(
-        "ML loader data_access=windowed split=%s protocol=%s streams=%d columns=%d "
+        "ML loader data_access=windowed split=%s protocols=%s streams=%d columns=%d "
         "batch_size=%d seq_len=%d dtype=float32 estimated_batch_tensor_payload_gb=%.4f. "
         "Reads only needed windows from parquet; actual IO depends on row-group size.",
         config.split,
-        active_protocol,
+        protocols,
         len(stream_plans),
         len(source_columns),
         window.batch_size,
@@ -463,7 +473,7 @@ def dataloader_for_split(
             dataset.target_columns,
             dataset.scaling,
             config,
-            dataset.active_protocol,
+            dataset.protocol_order,
         ),
         config,
         use_cuda_prefetch=config.prefetch_to_device and torch.device(config.device).type == "cuda",

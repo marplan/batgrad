@@ -180,6 +180,7 @@ class LoaderTrainConfig:
     seq_len: int = 1024
     strategy: Literal["sequential", "shuffled_protocol_groups"] = "shuffled_protocol_groups"
     stateful_n_windows: int = 1
+    cross_protocol_state_carry: Literal["chain"] | None = None
     data_access: Literal["windowed", "full_in_mem"] = "windowed"
     num_workers: int = 0
     prefetch_to_device: bool = False
@@ -191,6 +192,8 @@ class LoaderTrainConfig:
             raise ValueError(f"Unsupported loader strategy: {self.strategy!r}")
         if self.stateful_n_windows == 0 or self.stateful_n_windows < -1:
             raise ValueError("loader.stateful_n_windows must be -1 or a positive integer")
+        if self.cross_protocol_state_carry not in {None, "chain"}:
+            raise ValueError("loader.cross_protocol_state_carry must be null or 'chain'")
         if self.data_access not in {"windowed", "full_in_mem"}:
             raise ValueError("loader.data_access must be 'windowed' or 'full_in_mem'")
         if self.num_workers < 0:
@@ -322,11 +325,6 @@ def _validate_protocol_strategy(config: ExperimentConfig) -> None:
         raise ValueError(
             "loader.strategy='shuffled_protocol_groups' does not support protocols "
             f"{unsupported}. Supported: {sorted(supported)}"
-        )
-    if len(config.data.protocols) != 1:
-        raise ValueError(
-            "loader.strategy='shuffled_protocol_groups' currently supports exactly one "
-            f"training protocol, got {list(config.data.protocols)}"
         )
 
 
