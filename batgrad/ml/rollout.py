@@ -69,7 +69,6 @@ def run_rollouts(  # noqa: C901, PLR0915
     logger: RunLogger,
     step: int,
 ) -> dict[str, float]:
-    protocol = DatasetProtocolId(config.data.protocols[0])
     val_index = dataset.full_index.filter_split(BaseColumns.split.values.val)
     context_len = config.loader.seq_len
     stored_rollout_len = config.validation.rollout_steps
@@ -82,7 +81,7 @@ def run_rollouts(  # noqa: C901, PLR0915
         loader_config(config, BaseColumns.split.values.val),
         default_window=WindowConfig(batch_size=1, seq_len=context_len + stored_rollout_len),
     )
-    stream_plans = build_stream_plans(val_index, protocol, window_config)
+    stream_plans_by_protocol = {}
     scaling = scaling_rules(config)
     rollout_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
     rollout_loss_count = torch.zeros((), dtype=torch.float32, device=device)
@@ -96,6 +95,12 @@ def run_rollouts(  # noqa: C901, PLR0915
     for group in config.validation.split.groups:
         if not group.rollout_start_offsets:
             continue
+        protocol = rollout_protocol(config, group.match)
+        if protocol not in stream_plans_by_protocol:
+            stream_plans_by_protocol[protocol] = build_stream_plans(
+                val_index, protocol, window_config
+            )
+        stream_plans = stream_plans_by_protocol[protocol]
         matches = [
             stream
             for stream in stream_plans
@@ -503,6 +508,20 @@ def stream_matches(
 ) -> bool:
     key_map = dict(zip(group_by, group_key, strict=True))
     return all(key_map.get(key) == value for key, value in match.items())
+
+
+def rollout_protocol(config: ExperimentConfig, match: dict[str, object]) -> DatasetProtocolId:
+    value = match.get("protocol")
+    if value is None:
+        raise ValueError(f"rollout selector must include protocol: {match}")
+    protocol = DatasetProtocolId(value)
+    enabled = {DatasetProtocolId(item) for item in config.data.protocols}
+    if protocol not in enabled:
+        raise ValueError(
+            f"rollout selector protocol {str(protocol)!r} is not in data.protocols: "
+            f"{tuple(str(item) for item in enabled)}"
+        )
+    return protocol
 
 
 def rollout_next_input_bins(

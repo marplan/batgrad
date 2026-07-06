@@ -114,6 +114,7 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
         else NoOpRunLogger()
     )
     logger.info("Run logger ready")
+    checkpoint_dir = _checkpoint_dir(run_dir, run_logger)
     scaler = torch.amp.GradScaler("cuda", enabled=config.run.use_amp and device.type == "cuda")
     step = 0
     epoch_idx = 0
@@ -244,7 +245,7 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
                         optimizer,
                         scheduler,
                         scaler,
-                        run_dir,
+                        checkpoint_dir,
                         step,
                         epoch_idx,
                         epoch_step,
@@ -261,7 +262,7 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
                 optimizer,
                 scheduler,
                 scaler,
-                run_dir,
+                checkpoint_dir,
                 "final.pt",
                 step=step,
                 epoch_idx=last_epoch_idx,
@@ -417,14 +418,14 @@ def _save_validation_checkpoints(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LambdaLR,
     scaler: torch.amp.GradScaler,
-    run_dir: Path | None,
+    checkpoint_dir: Path | None,
     step: int,
     epoch_idx: int,
     epoch_step: int,
     metrics: dict[str, float],
     best_checkpoints: dict[str, float],
 ) -> None:
-    if run_dir is None:
+    if checkpoint_dir is None:
         return
     if config.checkpoint.save_latest:
         _save_checkpoint(
@@ -433,7 +434,7 @@ def _save_validation_checkpoints(
             optimizer,
             scheduler,
             scaler,
-            run_dir,
+            checkpoint_dir,
             "latest.pt",
             step=step,
             epoch_idx=epoch_idx,
@@ -456,7 +457,7 @@ def _save_validation_checkpoints(
             optimizer,
             scheduler,
             scaler,
-            run_dir,
+            checkpoint_dir,
             f"best_{_metric_filename(monitor)}.pt",
             step=step,
             epoch_idx=epoch_idx,
@@ -470,17 +471,16 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LambdaLR,
     scaler: torch.amp.GradScaler,
-    run_dir: Path | None,
+    checkpoint_dir: Path | None,
     filename: str,
     *,
     step: int,
     epoch_idx: int,
     epoch_step: int,
 ) -> None:
-    if run_dir is None:
+    if checkpoint_dir is None:
         return
-    checkpoint_dir = run_dir / "checkpoints"
-    checkpoint_dir.mkdir(exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model": unwrap_model(model).state_dict(),
@@ -497,6 +497,18 @@ def _save_checkpoint(
         },
         checkpoint_dir / filename,
     )
+
+
+def _checkpoint_dir(run_dir: Path | None, run_logger: RunLogger) -> Path | None:
+    if run_dir is None:
+        return None
+    name = run_logger.run_id() or run_dir.name
+    return run_dir / "checkpoints" / _path_component(name)
+
+
+def _path_component(name: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9._-]+", "_", name).strip("._-")
+    return normalized or "run"
 
 
 def _metric_filename(metric_name: str) -> str:

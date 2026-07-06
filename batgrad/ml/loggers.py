@@ -60,6 +60,7 @@ class RunLogger(Protocol):
     ) -> None: ...
     def log_payload(self, step: int, name: str, payload: object) -> None: ...
     def run_name(self) -> str | None: ...
+    def run_id(self) -> str | None: ...
     def finish(self) -> None: ...
 
 
@@ -87,6 +88,9 @@ class StdoutRunLogger:
     def run_name(self) -> str | None:
         return None
 
+    def run_id(self) -> str | None:
+        return None
+
     def finish(self) -> None:
         return
 
@@ -106,6 +110,9 @@ class NoOpRunLogger:
         del step, name, payload
 
     def run_name(self) -> str | None:
+        return None
+
+    def run_id(self) -> str | None:
         return None
 
     def finish(self) -> None:
@@ -140,6 +147,9 @@ class JsonlRunLogger:
 
     def run_name(self) -> str | None:
         return self._run_name
+
+    def run_id(self) -> str | None:
+        return None
 
     def finish(self) -> None:
         self.metrics_file.close()
@@ -181,6 +191,10 @@ class WandbRunLogger:
         name = getattr(self.run, "name", None)
         return str(name) if name else None
 
+    def run_id(self) -> str | None:
+        run_id = getattr(self.run, "id", None)
+        return str(run_id) if run_id else None
+
     def finish(self) -> None:
         self.run.finish()
 
@@ -209,6 +223,13 @@ class CompositeRunLogger:
             name = logger.run_name()
             if name:
                 return name
+        return None
+
+    def run_id(self) -> str | None:
+        for logger in reversed(self.loggers):
+            run_id = logger.run_id()
+            if run_id:
+                return run_id
         return None
 
     def finish(self) -> None:
