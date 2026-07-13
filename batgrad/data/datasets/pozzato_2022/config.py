@@ -46,6 +46,8 @@ NORMALIZED_TIMESERIES = NormalizedTimeseriesColumns()
 NORMALIZED_EIS = NormalizedEisColumns()
 NOMINAL_CAPACITY_AH = 5.0
 AMBIENT_TEMPERATURE_DEGC = 20.0
+COOLING_ALPHA = 20.0
+
 
 INGEST_STAGE_SPEC = IngestStageSpec(
     metadata=INGEST_STAGE_METADATA,
@@ -105,7 +107,10 @@ def time_normalize_protocol(
     return NormalizeProtocolSpec(
         protocol=protocol,
         columns=tuple(NORMALIZED_TIMESERIES),
-        constant_columns={BaseColumns.amb_temp: AMBIENT_TEMPERATURE_DEGC},
+        constant_columns={
+            BaseColumns.amb_temp: AMBIENT_TEMPERATURE_DEGC,
+            BaseColumns.a_heat: COOLING_ALPHA,
+        },
         transforms=(
             CRateTransformSpec(
                 source_col=BaseColumns.curr,
@@ -147,7 +152,10 @@ NORMALIZE_STAGE_SPEC = NormalizeStageSpec(
         NormalizeProtocolSpec(
             protocol=BatteryProtocols.eis,
             columns=tuple(NORMALIZED_EIS),
-            constant_columns={BaseColumns.amb_temp: AMBIENT_TEMPERATURE_DEGC},
+            constant_columns={
+                BaseColumns.amb_temp: AMBIENT_TEMPERATURE_DEGC,
+                BaseColumns.a_heat: COOLING_ALPHA,
+            },
             checks=(
                 ImpedanceComponentsCheckSpec(),
                 MissingCheckSpec(),
