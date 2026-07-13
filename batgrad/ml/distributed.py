@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from batgrad.ml.metrics import LossMetrics
+
 
 @dataclass(frozen=True, slots=True)
 class DistributedContext:
@@ -80,11 +82,42 @@ def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
-    all_reduce_sum(tensor)
-    if is_distributed_initialized():
-        tensor /= dist.get_world_size()
-    return tensor
+def globally_normalized_backward_scale(local_count: torch.Tensor) -> torch.Tensor:
+    total_count = all_reduce_sum(local_count.detach().clone())
+    if bool((total_count <= 0).item()):
+        return torch.zeros((), dtype=local_count.dtype, device=local_count.device)
+    world_size = dist.get_world_size() if is_distributed_initialized() else 1
+    return local_count.new_tensor(float(world_size)) / total_count
+
+
+def all_reduce_loss_metrics(metrics: LossMetrics) -> LossMetrics:
+    feature_loss_sum = _required_reduced(metrics.feature_loss_sum, "feature_loss_sum")
+    feature_loss_count = _required_reduced(metrics.feature_loss_count, "feature_loss_count")
+    squared_sum = _optional_reduced(metrics.feature_squared_error_sum)
+    squared_count = _optional_reduced(metrics.feature_squared_error_count)
+    count = feature_loss_count.sum()
+    loss = (
+        feature_loss_sum.sum() / count
+        if bool((count > 0).item())
+        else torch.zeros((), dtype=feature_loss_sum.dtype, device=feature_loss_sum.device)
+    )
+    return LossMetrics(
+        loss=loss,
+        feature_loss_sum=feature_loss_sum,
+        feature_loss_count=feature_loss_count,
+        feature_squared_error_sum=squared_sum,
+        feature_squared_error_count=squared_count,
+    )
+
+
+def _required_reduced(value: torch.Tensor | None, name: str) -> torch.Tensor:
+    if value is None:
+        raise ValueError(f"loss metrics are missing {name}")
+    return all_reduce_sum(value.detach().clone())
+
+
+def _optional_reduced(value: torch.Tensor | None) -> torch.Tensor | None:
+    return None if value is None else all_reduce_sum(value.detach().clone())
 
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:

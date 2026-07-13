@@ -10,6 +10,8 @@ from torch.nn import functional
 if TYPE_CHECKING:
     from mamba_ssm.modules.mamba3 import Mamba3 as Mamba3Type
 
+    from batgrad.ml.config import ExperimentConfig
+
 SCALAR_INPUT_RANK = 3
 BINNED_INPUT_RANK = 4
 
@@ -467,6 +469,16 @@ class SequenceMixer(nn.Module):
             return logits, next_states
         return logits
 
+
+def build_model(config: ExperimentConfig, device: torch.device) -> SequenceMixer:
+    return SequenceMixer(
+        config.model,
+        input_dim=len(config.data.input_columns),
+        output_dim=len(config.data.target_columns),
+        device=device,
+    ).to(device)
+
+
 def categorical_target_distribution(
     target: torch.Tensor,
     num_bins: int,
@@ -511,102 +523,6 @@ def encode_categorical_values(
         raise ValueError(f"categorical inputs must be shaped (B,T,C), got {tuple(values.shape)}")
     return categorical_target_distribution(values, num_bins, sigma, value_ranges).to(
         dtype=values.dtype
-    )
-
-
-def categorical_ce_loss(
-    logits: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor | None,
-    sigma: float,
-    target_ranges: torch.Tensor,
-) -> torch.Tensor:
-    loss_sum, count = categorical_ce_loss_components(logits, target, mask, sigma, target_ranges)
-    if bool((count <= 0).item()):
-        return torch.zeros((), dtype=loss_sum.dtype, device=loss_sum.device)
-    return loss_sum / count
-
-
-def categorical_ce_loss_components(
-    logits: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor | None,
-    sigma: float,
-    target_ranges: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    loss_sum_by_feature, count_by_feature = categorical_ce_loss_per_feature_components(
-        logits, target, mask, sigma, target_ranges
-    )
-    return loss_sum_by_feature.sum(), count_by_feature.sum()
-
-
-def categorical_ce_loss_per_feature_components(
-    logits: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor | None,
-    sigma: float,
-    target_ranges: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    target = target.to(device=logits.device)
-    valid = _target_valid_mask(mask, target, logits.device)
-    if valid is not None:
-        target = torch.where(valid, target, torch.zeros_like(target))
-    target_dist = categorical_target_distribution(
-        target, int(logits.shape[-1]), sigma, target_ranges
-    )
-    loss = -(target_dist * torch.log_softmax(logits.float(), dim=-1)).sum(dim=-1)
-    if valid is None:
-        count = torch.full(
-            (int(loss.shape[-1]),),
-            float(loss[..., 0].numel()),
-            dtype=loss.dtype,
-            device=loss.device,
-        )
-        return loss.sum(dim=tuple(range(loss.ndim - 1))), count
-    return (loss * valid).sum(dim=tuple(range(loss.ndim - 1))), valid.sum(
-        dim=tuple(range(valid.ndim - 1))
-    ).to(dtype=loss.dtype)
-
-
-def categorical_rmse_per_feature_components(
-    logits: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor | None,
-    target_ranges: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    target = target.to(device=logits.device)
-    valid = _target_valid_mask(mask, target, logits.device)
-    pred = decode_categorical_logits(logits, target_ranges).float()
-    if valid is not None:
-        target = torch.where(valid, target, pred.to(dtype=target.dtype))
-    squared = torch.square(pred - target.float())
-    if valid is None:
-        count = torch.full(
-            (int(squared.shape[-1]),),
-            float(squared[..., 0].numel()),
-            dtype=squared.dtype,
-            device=squared.device,
-        )
-        return squared.sum(dim=tuple(range(squared.ndim - 1))), count
-    return (squared * valid).sum(dim=tuple(range(squared.ndim - 1))), valid.sum(
-        dim=tuple(range(valid.ndim - 1))
-    ).to(dtype=squared.dtype)
-
-
-def _target_valid_mask(
-    mask: torch.Tensor | None, target: torch.Tensor, device: torch.device
-) -> torch.Tensor | None:
-    finite = torch.isfinite(target.to(device=device))
-    if mask is None:
-        return finite
-    valid = mask.to(dtype=torch.bool, device=device)
-    if valid.shape == target.shape[:-1]:
-        return valid.unsqueeze(-1).expand(target.shape) & finite
-    if valid.shape == target.shape:
-        return valid & finite
-    raise ValueError(
-        "target mask must have shape target.shape[:-1] or target.shape, "
-        f"got mask={tuple(valid.shape)} target={tuple(target.shape)}"
     )
 
 

@@ -91,7 +91,6 @@
       "enabled": true,
       "channels": ["Terminal voltage [V]", "Surface temperature [degC]"],
       "suffix_steps": 128,
-      "fill_value": 0.0,
       "loss_on_masked_only": true,
       "carry_mamba_state": true,
       "detach_between_windows": true,
