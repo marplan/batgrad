@@ -61,6 +61,9 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
+markers = [
+  "cpu_only: CPU-only behavior contract; must not exercise CUDA execution",
+]
 
 [tool.ty.src]
 exclude = [

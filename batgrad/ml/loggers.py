@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from batgrad.ml.config import LoggingConfig
 
 from batgrad.logging import get_logger
 
@@ -24,29 +25,6 @@ STDOUT_METRICS = {
     "val/rollout/loss_ce",
     "val/rollout/rmse",
 }
-
-
-@dataclass(frozen=True, slots=True)
-class WandbConfig:
-    project: str | None = None
-    entity: str | None = None
-    group: str | None = None
-    name: str | None = None
-    tags: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class LoggingConfig:
-    backend: Literal["stdout", "jsonl", "wandb"] = "jsonl"
-    mode: Literal["offline", "online"] = "offline"
-    mirror_stdout: bool = True
-    wandb: WandbConfig = field(default_factory=WandbConfig)
-
-    def __post_init__(self) -> None:
-        if self.backend not in {"stdout", "jsonl", "wandb"}:
-            raise ValueError(f"Unsupported logging backend: {self.backend!r}")
-        if self.mode not in {"offline", "online"}:
-            raise ValueError(f"Unsupported logging mode: {self.mode!r}")
 
 
 class RunLogger(Protocol):

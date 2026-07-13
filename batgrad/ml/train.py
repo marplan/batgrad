@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import shutil
 import time
 from datetime import UTC, datetime
@@ -13,53 +12,54 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 
 from batgrad.logging import get_logger
+from batgrad.ml.checkpoint import (
+    checkpoint_dir,
+    load_model_weights,
+    save_training_checkpoint,
+    save_validation_checkpoints,
+)
 from batgrad.ml.config import (
     ExperimentConfig,
     config_to_dict,
     load_experiment_config,
     resolve_store_root,
 )
-from batgrad.ml.data.loader import MlDataIterable, create_dataloader
+from batgrad.ml.data.loader import (
+    MlDataIterable,
+    create_dataloader_from_index,
+    create_index,
+)
 from batgrad.ml.distributed import (
     DistributedContext,
-    all_reduce_mean,
-    all_reduce_sum,
+    all_reduce_loss_metrics,
     barrier,
     cleanup_distributed,
     init_distributed,
     unwrap_model,
 )
-from batgrad.ml.loggers import NoOpRunLogger, build_logger
-from batgrad.ml.masked_suffix import (
-    backward_batch_loss_with_metrics,
-    batch_loss_with_metrics,
-    masked_suffix_windows,
-)
-from batgrad.ml.metrics import (
-    LossMetrics,
-    accumulate_loss_metrics,
-    aggregate_rmse,
-    feature_metric_payload,
-    feature_rmse_payload,
-    grad_norm_metrics,
-)
-from batgrad.ml.nn import SequenceMixer
-from batgrad.ml.rollout import run_rollouts
-from batgrad.ml.train_utils import (
+from batgrad.ml.experiment import (
+    amp_enabled,
     data_validation_config,
     scaling_rules,
     train_loader_config,
     val_loader_config,
-    validation_loss_config,
 )
+from batgrad.ml.loggers import NoOpRunLogger, build_logger
+from batgrad.ml.masked_suffix import masked_suffix_windows
+from batgrad.ml.metrics import grad_norm_metrics, loss_metric_payload
+from batgrad.ml.nn import build_model
+from batgrad.ml.objective import backward_batch_loss_with_metrics
+from batgrad.ml.validation import validate
 from batgrad.storage.local import LocalDataProcessingStore
+from batgrad.viz.ml import build_rollout_figure
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from batgrad.ml.data.batch import Batch
-    from batgrad.ml.loggers import RunLogger
+    from batgrad.ml.data.index import MlDatasetIndex
     from batgrad.ml.nn import MambaCarryState
+    from batgrad.ml.validation import ValidationResult
 
 logger = get_logger(__name__)
 
@@ -67,55 +67,69 @@ logger = get_logger(__name__)
 def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, PLR0915
     config = load_experiment_config(path)
     dist_ctx = init_distributed(config.run.device)
-    run_dir = _prepare_run_dir(config) if dist_ctx.is_main else None
-    barrier()
+    _validate_distributed_state_carry(config, dist_ctx)
+    run_dir = _setup_with_distributed_cleanup(
+        lambda: _prepare_run_dir(config) if dist_ctx.is_main else None
+    )
+    _setup_with_distributed_cleanup(barrier)
     torch.manual_seed(config.run.seed)
     device = dist_ctx.device
-    store = LocalDataProcessingStore(resolve_store_root(config.data.store_root))
+    store = _setup_with_distributed_cleanup(
+        lambda: LocalDataProcessingStore(resolve_store_root(config.data.store_root))
+    )
     logger.info("Creating data loaders")
-    train_loader, val_loader, train_dataset = _create_loaders(config, store)
+    train_loader, val_loader, train_dataset, index = _setup_with_distributed_cleanup(
+        lambda: _create_loaders(config, store)
+    )
     logger.info("Data loaders ready")
     max_steps = config.train.max_steps or _max_steps_for_epochs(
         train_dataset, config.train.epochs, dist_ctx
     )
     logger.info("Creating model on %s", device)
-    model: torch.nn.Module = SequenceMixer(
-        config.model,
-        input_dim=len(config.data.input_columns),
-        output_dim=len(config.data.target_columns),
-        device=device,
-    ).to(device)
+    model: torch.nn.Module = _setup_with_distributed_cleanup(lambda: build_model(config, device))
     logger.info("Model ready on %s", device)
-    _init_model_from_checkpoint(config, model, device)
+    _setup_with_distributed_cleanup(lambda: _init_model_from_checkpoint(config, model, device))
     if config.run.compile_model:
         logger.info("Wrapping model with torch.compile")
-        model = cast("torch.nn.Module", torch.compile(model))
+        model = _setup_with_distributed_cleanup(
+            lambda: cast("torch.nn.Module", torch.compile(model))
+        )
         logger.info("Model compile wrapper ready")
     if dist_ctx.enabled:
         logger.info("Wrapping model with DistributedDataParallel")
-        model = DistributedDataParallel(
-            model,
-            device_ids=[dist_ctx.local_rank],
-            output_device=dist_ctx.local_rank,
+        model = _setup_with_distributed_cleanup(
+            lambda: DistributedDataParallel(
+                model,
+                device_ids=[dist_ctx.local_rank],
+                output_device=dist_ctx.local_rank,
+            )
         )
         logger.info("DistributedDataParallel wrapper ready")
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.optim.lr,
-        betas=(config.optim.beta1, config.optim.beta2),
-        eps=config.optim.eps,
-        weight_decay=config.optim.weight_decay,
+    optimizer = _setup_with_distributed_cleanup(
+        lambda: torch.optim.AdamW(
+            model.parameters(),
+            lr=config.optim.lr,
+            betas=(config.optim.beta1, config.optim.beta2),
+            eps=config.optim.eps,
+            weight_decay=config.optim.weight_decay,
+        )
     )
-    scheduler = _build_scheduler(config, optimizer, max_steps)
+    scheduler = _setup_with_distributed_cleanup(
+        lambda: _build_scheduler(config, optimizer, max_steps)
+    )
     logger.info("Initializing run logger")
-    run_logger = (
-        build_logger(config.logging, run_dir, _logged_config(config, model, device))
-        if dist_ctx.is_main
-        else NoOpRunLogger()
+    run_logger = _setup_with_distributed_cleanup(
+        lambda: (
+            build_logger(config.logging, run_dir, _logged_config(config, model, device))
+            if dist_ctx.is_main
+            else NoOpRunLogger()
+        )
     )
     logger.info("Run logger ready")
-    checkpoint_dir = _checkpoint_dir(run_dir, run_logger)
-    scaler = torch.amp.GradScaler("cuda", enabled=config.run.use_amp and device.type == "cuda")
+    checkpoints = _setup_with_distributed_cleanup(
+        lambda: checkpoint_dir(run_dir, run_logger.run_id())
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled(config, device))
     step = 0
     epoch_idx = 0
     last_epoch_idx = 0
@@ -170,6 +184,7 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
                     batch.mask,
                     device,
                     scaler,
+                    suffix=config.train.masked_suffix,
                     collect_metrics=should_log,
                     mask_all_valid=batch.all_valid,
                     initial_mamba_states=carried_mamba_states,
@@ -179,7 +194,7 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
                 carried_stateful_group_idx = batch.state.stateful_group_idx
                 carried_stateful_step_idx = batch.state.stateful_step_idx
                 log_loss_metrics = (
-                    _reduced_loss_metrics(loss_metrics) if should_log else loss_metrics
+                    all_reduce_loss_metrics(loss_metrics) if should_log else loss_metrics
                 )
                 loss = log_loss_metrics.loss
                 scaler.unscale_(optimizer)
@@ -226,44 +241,58 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
                     )
                 if validate_every and step % validate_every == 0:
                     epoch, epoch_pct = _epoch_progress(epoch_idx, epoch_step, steps_per_epoch)
-                    val_metrics = _validate(
+                    validation_result = validate(
                         config,
                         model,
                         val_loader,
-                        train_dataset,
+                        index,
                         store,
                         device,
-                        run_logger,
-                        step,
-                        epoch,
-                        epoch_pct,
                         dist_ctx,
                     )
-                    _save_validation_checkpoints(
+                    validation_metrics = _validation_metric_payload(config, validation_result)
+                    if validation_metrics:
+                        run_logger.log_metrics(
+                            step,
+                            validation_metrics,
+                            epoch=epoch,
+                            epoch_pct=epoch_pct,
+                        )
+                    if validation_result.rollout_examples:
+                        run_logger.log_payload(
+                            step,
+                            "val/rollout/plot",
+                            build_rollout_figure(
+                                config,
+                                validation_result.rollout_examples,
+                                config.loader.seq_len,
+                                run_logger.run_name(),
+                            ),
+                        )
+                    save_validation_checkpoints(
                         config,
                         model,
                         optimizer,
                         scheduler,
                         scaler,
-                        checkpoint_dir,
-                        step,
-                        epoch_idx,
-                        epoch_step,
-                        val_metrics,
-                        best_checkpoints,
+                        checkpoints,
+                        step=step,
+                        epoch_idx=epoch_idx,
+                        epoch_step=epoch_step,
+                        metrics=validation_metrics,
+                        best=best_checkpoints,
                     )
                 if step >= max_steps:
                     break
             epoch_idx += 1
         if config.checkpoint.save_final:
-            _save_checkpoint(
+            save_training_checkpoint(
                 config,
                 model,
                 optimizer,
                 scheduler,
                 scaler,
-                checkpoint_dir,
-                "final.pt",
+                None if checkpoints is None else checkpoints / "final.pt",
                 step=step,
                 epoch_idx=last_epoch_idx,
                 epoch_step=last_epoch_step,
@@ -274,33 +303,88 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
     return run_dir
 
 
+def _validate_distributed_state_carry(
+    config: ExperimentConfig, dist_ctx: DistributedContext
+) -> None:
+    if (
+        dist_ctx.world_size <= 1
+        or not config.train.masked_suffix.enabled
+        or not config.train.masked_suffix.carry_mamba_state
+        or config.loader.stateful_n_windows == 1
+    ):
+        return
+    cleanup_distributed()
+    raise ValueError(
+        "DDP does not support cross-batch Mamba state carry. Set "
+        "loader.stateful_n_windows=1, disable train.masked_suffix.carry_mamba_state, "
+        "or run single-process training."
+    )
+
+
+def _validation_metric_payload(
+    config: ExperimentConfig,
+    result: ValidationResult,
+) -> dict[str, float]:
+    payload: dict[str, float] = {}
+    if result.teacher_forced_metrics is not None:
+        payload.update(
+            loss_metric_payload(
+                "val/tf/loss_ce",
+                "val/tf/rmse",
+                config.data.target_columns,
+                result.teacher_forced_metrics,
+            )
+        )
+    if result.rollout_metrics is not None:
+        payload.update(
+            loss_metric_payload(
+                "val/rollout/loss_ce",
+                "val/rollout/rmse",
+                config.data.target_columns,
+                result.rollout_metrics,
+            )
+        )
+    return payload
+
+
+def _setup_with_distributed_cleanup[T](operation: Callable[[], T]) -> T:
+    try:
+        return operation()
+    except BaseException:
+        cleanup_distributed()
+        raise
+
+
 def _create_loaders(
     config: ExperimentConfig,
     store: LocalDataProcessingStore,
-) -> tuple[Iterable[Batch], Iterable[Batch], MlDataIterable]:
-    train_loader = create_dataloader(
+) -> tuple[Iterable[Batch], Iterable[Batch], MlDataIterable, MlDatasetIndex]:
+    index = create_index(
         store=store,
         manifest_paths=config.data.manifest_paths,
-        input_columns=config.data.input_columns,
-        target_columns=config.data.target_columns,
         protocols=config.data.protocols,
         protocol_mode=config.data.protocol_mode,
         validation=data_validation_config(config),
+    )
+    train_loader = create_dataloader_from_index(
+        store=store,
+        index=index,
+        input_columns=config.data.input_columns,
+        target_columns=config.data.target_columns,
+        protocols=config.data.protocols,
         scaling=scaling_rules(config),
         config=train_loader_config(config),
     )
-    val_loader = create_dataloader(
+    val_loader = create_dataloader_from_index(
         store=store,
-        manifest_paths=config.data.manifest_paths,
+        index=index,
         input_columns=config.data.input_columns,
         target_columns=config.data.target_columns,
         protocols=config.data.protocols,
-        protocol_mode=config.data.protocol_mode,
-        validation=data_validation_config(config),
         scaling=scaling_rules(config),
         config=val_loader_config(config),
     )
-    return (train_loader, val_loader, _dataset(train_loader))
+    return (train_loader, val_loader, _dataset(train_loader), index)
 
 
 def _logged_config(
@@ -404,116 +488,7 @@ def _init_model_from_checkpoint(
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"run.init_from checkpoint does not exist: {checkpoint_path}")
     logger.info("Initializing model weights from checkpoint: %s", checkpoint_path)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
-        raise ValueError(
-            f"run.init_from checkpoint must contain a 'model' state dict: {checkpoint_path}"
-        )
-    model.load_state_dict(checkpoint["model"])
-
-
-def _save_validation_checkpoints(
-    config: ExperimentConfig,
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LambdaLR,
-    scaler: torch.amp.GradScaler,
-    checkpoint_dir: Path | None,
-    step: int,
-    epoch_idx: int,
-    epoch_step: int,
-    metrics: dict[str, float],
-    best_checkpoints: dict[str, float],
-) -> None:
-    if checkpoint_dir is None:
-        return
-    if config.checkpoint.save_latest:
-        _save_checkpoint(
-            config,
-            model,
-            optimizer,
-            scheduler,
-            scaler,
-            checkpoint_dir,
-            "latest.pt",
-            step=step,
-            epoch_idx=epoch_idx,
-            epoch_step=epoch_step,
-        )
-    if not config.checkpoint.save_best:
-        return
-    for monitor in config.checkpoint.monitors:
-        value = metrics.get(monitor)
-        if value is None:
-            logger.warning("Checkpoint monitor %s was not logged at step=%d", monitor, step)
-            continue
-        previous = best_checkpoints.get(monitor)
-        if previous is not None and value >= previous:
-            continue
-        best_checkpoints[monitor] = value
-        _save_checkpoint(
-            config,
-            model,
-            optimizer,
-            scheduler,
-            scaler,
-            checkpoint_dir,
-            f"best_{_metric_filename(monitor)}.pt",
-            step=step,
-            epoch_idx=epoch_idx,
-            epoch_step=epoch_step,
-        )
-
-
-def _save_checkpoint(
-    config: ExperimentConfig,
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LambdaLR,
-    scaler: torch.amp.GradScaler,
-    checkpoint_dir: Path | None,
-    filename: str,
-    *,
-    step: int,
-    epoch_idx: int,
-    epoch_step: int,
-) -> None:
-    if checkpoint_dir is None:
-        return
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": unwrap_model(model).state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "scaler": scaler.state_dict(),
-            "config": config_to_dict(config),
-            "step": step,
-            "train_cursor": {
-                "epoch_idx": epoch_idx,
-                "epoch_step": epoch_step,
-                "global_step": step,
-            },
-        },
-        checkpoint_dir / filename,
-    )
-
-
-def _checkpoint_dir(run_dir: Path | None, run_logger: RunLogger) -> Path | None:
-    if run_dir is None:
-        return None
-    name = run_logger.run_id() or run_dir.name
-    return run_dir / "checkpoints" / _path_component(name)
-
-
-def _path_component(name: str) -> str:
-    normalized = re.sub(r"[^a-zA-Z0-9._-]+", "_", name).strip("._-")
-    return normalized or "run"
-
-
-def _metric_filename(metric_name: str) -> str:
-    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", metric_name).strip("_").lower()
-    return normalized or "metric"
+    load_model_weights(model, checkpoint_path, device, config)
 
 
 def _cadence_steps(
@@ -552,119 +527,9 @@ def _local_steps_per_epoch(
     return global_steps // dist_ctx.world_size
 
 
-def _reduced_loss_metrics(metrics: LossMetrics) -> LossMetrics:
-    loss = all_reduce_mean(metrics.loss.detach().clone())
-    feature_loss_sum = _all_reduce_optional_sum(metrics.feature_loss_sum)
-    feature_loss_count = _all_reduce_optional_sum(metrics.feature_loss_count)
-    feature_squared_error_sum = _all_reduce_optional_sum(metrics.feature_squared_error_sum)
-    feature_squared_error_count = _all_reduce_optional_sum(metrics.feature_squared_error_count)
-    return LossMetrics(
-        loss=loss,
-        feature_loss_sum=feature_loss_sum,
-        feature_loss_count=feature_loss_count,
-        feature_squared_error_sum=feature_squared_error_sum,
-        feature_squared_error_count=feature_squared_error_count,
-    )
-
-
-def _all_reduce_optional_sum(tensor: torch.Tensor | None) -> torch.Tensor | None:
-    if tensor is None:
-        return None
-    return all_reduce_sum(tensor.detach().clone())
-
-
 def _epoch_progress(epoch_idx: int, epoch_step: int, steps_per_epoch: int) -> tuple[int, int]:
     pct = math.ceil(epoch_step / steps_per_epoch * 100)
     return epoch_idx + 1, min(100, max(1, pct))
-
-
-@torch.no_grad()
-def _validate(
-    config: ExperimentConfig,
-    model: torch.nn.Module,
-    val_loader: Iterable[Batch],
-    train_dataset: MlDataIterable,
-    store: LocalDataProcessingStore,
-    device: torch.device,
-    logger: RunLogger,
-    step: int,
-    epoch: int | None = None,
-    epoch_pct: int | None = None,
-    dist_ctx: DistributedContext | None = None,
-) -> dict[str, float]:
-    model.eval()
-    logged_metrics: dict[str, float] = {}
-    if config.validation.max_tf_batches > 0:
-        val_loss_config = validation_loss_config(config)
-        loss_sum = torch.zeros((), dtype=torch.float32, device=device)
-        loss_count = torch.zeros((), dtype=torch.float32, device=device)
-        feature_loss_sum = torch.zeros(
-            (len(config.data.target_columns),), dtype=torch.float32, device=device
-        )
-        feature_loss_count = torch.zeros_like(feature_loss_sum)
-        feature_squared_error_sum = torch.zeros_like(feature_loss_sum)
-        feature_squared_error_count = torch.zeros_like(feature_loss_sum)
-        for idx, batch in enumerate(val_loader):
-            metrics = batch_loss_with_metrics(
-                val_loss_config,
-                model,
-                batch.inputs,
-                batch.targets,
-                batch.mask,
-                device,
-                include_rmse=True,
-                mask_all_valid=batch.all_valid,
-            )
-            loss_sum += metrics.loss.detach()
-            loss_count += 1
-            accumulate_loss_metrics(
-                metrics,
-                feature_loss_sum,
-                feature_loss_count,
-                feature_squared_error_sum,
-                feature_squared_error_count,
-            )
-            if idx + 1 >= config.validation.max_tf_batches:
-                break
-        all_reduce_sum(loss_sum)
-        all_reduce_sum(loss_count)
-        all_reduce_sum(feature_loss_sum)
-        all_reduce_sum(feature_loss_count)
-        all_reduce_sum(feature_squared_error_sum)
-        all_reduce_sum(feature_squared_error_count)
-        if bool((loss_count > 0).item()):
-            metrics_payload = {"val/tf/loss_ce": float((loss_sum / loss_count).detach().cpu())}
-            rmse = aggregate_rmse(feature_squared_error_sum, feature_squared_error_count)
-            if rmse is not None:
-                metrics_payload["val/tf/rmse"] = rmse
-            metrics_payload.update(
-                feature_metric_payload(
-                    "val/tf/loss_ce",
-                    config.data.target_columns,
-                    feature_loss_sum,
-                    feature_loss_count,
-                )
-            )
-            metrics_payload.update(
-                feature_rmse_payload(
-                    "val/tf/rmse",
-                    config.data.target_columns,
-                    feature_squared_error_sum,
-                    feature_squared_error_count,
-                )
-            )
-            logger.log_metrics(
-                step,
-                metrics_payload,
-                epoch=epoch,
-                epoch_pct=epoch_pct,
-            )
-            logged_metrics.update(metrics_payload)
-    if config.validation.rollout_steps > 0 and (dist_ctx is None or dist_ctx.is_main):
-        logged_metrics.update(
-            run_rollouts(config, unwrap_model(model), train_dataset, store, device, logger, step)
-        )
-    return logged_metrics
 
 
 def _dataset(loader: object) -> MlDataIterable:
