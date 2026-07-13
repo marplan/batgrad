@@ -9,12 +9,14 @@ import torch
 from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId
 from batgrad.contracts.protocols import BatteryProtocols
 from batgrad.contracts.row_ids import MANIFEST_ROW_ID_COLUMN
-from batgrad.ml.data.config import LoaderConfig, ScalingRule, WindowConfig
-from batgrad.ml.data.index import sort_index_frame
-from batgrad.ml.data.materialization import materialize_batch_plan
-from batgrad.ml.data.planning import iter_batch_plans
+from batgrad.ml.data.preview import (
+    MlBatchPreviewData,
+    MlBatchPreviewSpec,
+    prepare_ml_batch_preview,
+)
 from batgrad.ml.data.scaling import inverse_scale_tensor, scale_data
-from batgrad.ml.train_utils import scaling_rules
+from batgrad.ml.experiment import scaling_rules
+from batgrad.ml.metrics import loss_metric_payload
 from batgrad.storage.segments import SegmentSource, collect_segment_window_frames
 from batgrad.viz.plotting import (
     COLORWAY,
@@ -35,26 +37,13 @@ if TYPE_CHECKING:
     from batgrad.contracts.segments import ParquetSegment
     from batgrad.ml.config import ExperimentConfig
     from batgrad.ml.data.batch import Batch
+    from batgrad.ml.data.config import ScalingRule
     from batgrad.ml.data.index import MlDatasetIndex
     from batgrad.ml.data.planning import WindowRef
+    from batgrad.ml.inference import InferencePrediction, InferenceResult
+    from batgrad.ml.validation import RolloutExample
     from batgrad.storage.store import DatasetStoreReader
     from batgrad.viz.widgets.plotly_trace_resampler import PlotlyTraceResampler
-
-
-@dataclass(frozen=True, slots=True)
-class MlBatchPreviewSubmission:
-    submit_id: int
-    input_columns: tuple[str, ...]
-    target_columns: tuple[str, ...]
-    batch_size: int
-    seq_len: int
-    batch_group_index: int
-    sample_index: int = 0
-    consecutive_step: int = 0
-    strategy: str = "shuffled_protocol_groups"
-    stateful_n_windows: int = 1
-    active_protocol: str = str(DatasetProtocolId.cycling)
-    scaling: tuple[ScalingRule, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,33 +56,11 @@ class MlBatchPreview:
     current_stream_key: tuple[object, ...]
     store: DatasetStoreReader
     index: MlDatasetIndex
-    submission: MlBatchPreviewSubmission
-
-
-@dataclass(frozen=True, slots=True)
-class _PreviewSelection:
-    store: DatasetStoreReader
-    index: MlDatasetIndex
-    submission: MlBatchPreviewSubmission
-    ref: WindowRef
-    batch: Batch
-    sample_index: int
-    batch_index: int
-    total_batches: int
+    spec: MlBatchPreviewSpec
 
 
 _TRACE_LABELS = ("stream", "input batch", "target batch")
 PLOT_SEQUENCE_RANK = 2
-
-
-@dataclass(frozen=True, slots=True)
-class RolloutPlotSeries:
-    inputs: torch.Tensor
-    context_prediction: torch.Tensor
-    prediction: torch.Tensor
-    target: torch.Tensor
-    match: dict[str, object]
-    anchor: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +75,7 @@ class _BatchPlotSpec:
 
 def build_rollout_figure(
     config: ExperimentConfig,
-    series: list[RolloutPlotSeries],
+    series: list[RolloutExample] | tuple[RolloutExample, ...],
     context_len: int,
     run_name: str | None,
 ) -> object:
@@ -144,14 +111,18 @@ def build_rollout_figure(
                 )
             total_steps = int(target_cpu.shape[0])
             pred_steps = int(prediction_cpu.shape[0])
-            x_values = _rollout_time_axis(config, input_cpu)
+            x_values = _rollout_target_time_axis(config, input_cpu)
             pred_full = torch.full(
                 (total_steps, int(prediction_cpu.shape[1])),
                 float("nan"),
                 dtype=prediction_cpu.dtype,
             )
             pred_full[:context_len, :] = context_prediction_cpu[:context_len, :]
-            pred_full[context_len : context_len + pred_steps, :] = prediction_cpu
+            # Target index k represents the source row after input index k. The
+            # first rollout prediction therefore aligns with the final context
+            # logit at target index context_len - 1.
+            rollout_start = item.target_start
+            pred_full[rollout_start : rollout_start + pred_steps, :] = prediction_cpu
             color = COLORWAY[series_idx % len(COLORWAY)]
             cell_id = item.match.get("cell id", "unknown-cell")
             cycle = item.match.get("cycle index", "unknown-cycle")
@@ -183,7 +154,7 @@ def build_rollout_figure(
                 row=channel_idx,
                 col=1,
             )
-            context_x = x_values[min(context_len, len(x_values) - 1)]
+            context_x = x_values[min(rollout_start, len(x_values) - 1)]
             y_values = torch.cat((target_cpu[:, value_idx], pred_full[:, value_idx]))
             finite = y_values[torch.isfinite(y_values)]
             if int(finite.numel()) > 0:
@@ -222,69 +193,199 @@ def build_rollout_figure(
     return figure
 
 
-def _rollout_time_axis(config: ExperimentConfig, inputs: torch.Tensor) -> list[float]:
+def _rollout_target_time_axis(config: ExperimentConfig, inputs: torch.Tensor) -> list[float]:
+    """Return timestamps aligned with next-row targets rather than input rows."""
     try:
         dt_idx = config.data.input_columns.index("Time diff [s]")
     except ValueError:
-        return [float(idx) for idx in range(int(inputs.shape[0]))]
+        return [float(idx + 1) for idx in range(int(inputs.shape[0]))]
+    if int(inputs.shape[0]) == 0:
+        return []
     dt = inputs[:, dt_idx].to(dtype=torch.float32).clamp_min(0.0)
     elapsed = torch.cumsum(dt, dim=0) - dt[0]
-    return [float(value) for value in elapsed.tolist()]
+    target_elapsed = torch.cat((elapsed[1:], (elapsed[-1:] + dt[-1:])))
+    return [float(value) for value in target_elapsed.tolist()]
+
+
+def build_inference_widget(result: InferenceResult, batch_index: int) -> PlotlyTraceResampler:
+    config = result.config
+    columns = tuple(dict.fromkeys((*config.data.input_columns, *config.data.target_columns)))
+    axis_col = _axis_column(_inference_protocol(result, batch_index))
+    scaling = scaling_rules(config)
+    inputs = inverse_scale_tensor(result.inputs, config.data.input_columns, scaling)
+    targets = inverse_scale_tensor(result.targets, config.data.target_columns, scaling)
+    predictions = tuple(
+        replace(
+            series,
+            predictions=inverse_scale_tensor(
+                series.predictions,
+                config.data.target_columns,
+                scaling,
+            ),
+        )
+        for series in result.predictions
+    )
+    label = inference_group_label(result.group_keys[batch_index])
+    fig, height = make_timeseries_figure(columns, axis_col, label)
+    widget = make_trace_resampler(fig, height, max_batch_rows=None)
+    frame = _inference_plot_frame(
+        config,
+        inputs,
+        targets,
+        predictions,
+        batch_index,
+        columns,
+        axis_col,
+    )
+    lf = frame.lazy()
+    trace_labels = (
+        "ground truth",
+        *(_inference_prediction_label(series) for series in predictions),
+    )
+    colors = colors_by_label(trace_labels)
+    shown_roles: set[str] = set()
+    for row_idx, column in enumerate(columns, start=1):
+        target_idx = _column_index(config.data.target_columns, column)
+        add_registered_xy_trace(
+            fig,
+            widget,
+            lf,
+            x_col=axis_col,
+            y_col=_inference_base_col(column),
+            row=row_idx,
+            col=1,
+            label="ground truth",
+            color=colors["ground truth"],
+            showlegend=consume_showlegend("ground truth", shown_roles),
+            hovertemplate=axis_hovertemplate("ground truth", axis_col, _inference_base_col(column)),
+            row_count=frame.height,
+        )
+        if target_idx is None:
+            continue
+        for series in predictions:
+            y_col = _inference_prediction_col(column, series)
+            series_label = _inference_prediction_label(series)
+            add_registered_xy_trace(
+                fig,
+                widget,
+                lf,
+                x_col=axis_col,
+                y_col=y_col,
+                row=row_idx,
+                col=1,
+                label=series_label,
+                color=colors[series_label],
+                showlegend=consume_showlegend(series_label, shown_roles),
+                hovertemplate=axis_hovertemplate(series_label, axis_col, y_col),
+                row_count=frame.height,
+            )
+    return widget
+
+
+def inference_metrics_frame(result: InferenceResult) -> pl.DataFrame:
+    rows = []
+    for series in result.predictions:
+        row: dict[str, object] = {
+            "checkpoint": series.checkpoint_alias,
+            "checkpoint_path": series.checkpoint_path,
+            "strategy": "classic" if series.suffix_steps == 0 else "masked_suffix",
+            "suffix_steps": series.suffix_steps,
+        }
+        if series.metrics is not None:
+            row.update(
+                loss_metric_payload(
+                    "loss_ce",
+                    "rmse",
+                    result.config.data.target_columns,
+                    series.metrics,
+                )
+            )
+        rows.append(row)
+    return pl.DataFrame(rows, infer_schema_length=None)
+
+
+def _inference_plot_frame(
+    config: ExperimentConfig,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    predictions: tuple[InferencePrediction, ...],
+    batch_index: int,
+    columns: tuple[str, ...],
+    axis_col: str,
+) -> pl.DataFrame:
+    x_values = _rollout_target_time_axis(config, inputs[batch_index])
+    data: dict[str, list[float | None]] = {axis_col: [float(value) for value in x_values]}
+    for column in columns:
+        target_idx = _column_index(config.data.target_columns, column)
+        input_idx = _column_index(config.data.input_columns, column)
+        if target_idx is not None:
+            base = targets[batch_index, :, target_idx].tolist()
+            for series in predictions:
+                prediction = [None] * len(x_values)
+                values = series.predictions[batch_index, :, target_idx].tolist()
+                prediction[series.target_start : series.target_start + len(values)] = values
+                data[_inference_prediction_col(column, series)] = prediction
+        elif input_idx is not None:
+            base = inputs[batch_index, :, input_idx].tolist()
+        else:
+            base = [None] * len(x_values)
+        data[_inference_base_col(column)] = [
+            None if value is None else float(value) for value in base
+        ]
+    return pl.DataFrame(data)
+
+
+def _column_index(columns: tuple[str, ...], column: str) -> int | None:
+    try:
+        return columns.index(column)
+    except ValueError:
+        return None
+
+
+def _inference_base_col(column: str) -> str:
+    return f"base::{column}"
+
+
+def _inference_prediction_col(column: str, series: InferencePrediction) -> str:
+    return f"prediction::{series.checkpoint_alias}::{series.suffix_steps}::{column}"
+
+
+def _inference_prediction_label(series: InferencePrediction) -> str:
+    strategy = "classic" if series.suffix_steps == 0 else f"suffix steps {series.suffix_steps}"
+    return f"prediction | {strategy} | {series.checkpoint_alias}"
+
+
+def inference_group_label(group_key: tuple[object, ...]) -> str:
+    if not group_key:
+        return "inference"
+    protocol = group_key[-1]
+    identifiers = tuple(str(item) for item in group_key[1:-1]) or tuple(
+        str(item) for item in group_key
+    )
+    return ":".join((*identifiers, str(protocol)))
+
+
+def _inference_protocol(result: InferenceResult, batch_index: int) -> DatasetProtocolId:
+    group_key = result.group_keys[batch_index]
+    return (
+        DatasetProtocolId(group_key[-1])
+        if group_key
+        else DatasetProtocolId(result.config.data.protocols[0])
+    )
 
 
 def build_ml_batch_preview(
     store: DatasetStoreReader,
     index: MlDatasetIndex,
-    submission: MlBatchPreviewSubmission,
+    spec: MlBatchPreviewSpec,
 ) -> MlBatchPreview:
-    return _render_ml_batch_preview(_prepare_preview_selection(store, index, submission))
+    return _render_ml_batch_preview(prepare_ml_batch_preview(store, index, spec))
 
 
-def _prepare_preview_selection(
-    store: DatasetStoreReader,
-    index: MlDatasetIndex,
-    submission: MlBatchPreviewSubmission,
-) -> _PreviewSelection:
-    config = _loader_config(submission)
-    sorted_index = _sorted_preview_index(index)
-    protocol = DatasetProtocolId(submission.active_protocol)
-    requested_batch_index = _preview_raw_plan_index(submission)
-    selected_plan = None
-    selected_index = 0
-    total_batches = 0
-    for plan_idx, plan in enumerate(iter_batch_plans(sorted_index, protocol, config)):
-        total_batches = plan_idx + 1
-        if plan_idx <= requested_batch_index:
-            selected_plan = plan
-            selected_index = plan_idx
-    if selected_plan is None:
-        raise ValueError("No batch windows are available for this preview selection")
-
-    selected_sample_index = min(max(0, int(submission.sample_index)), len(selected_plan.refs) - 1)
-    return _PreviewSelection(
-        store=store,
-        index=sorted_index,
-        submission=submission,
-        ref=selected_plan.refs[selected_sample_index],
-        batch=materialize_batch_plan(
-            store,
-            selected_plan,
-            submission.input_columns,
-            submission.target_columns,
-            submission.scaling,
-            config,
-            selected_index,
-        ),
-        sample_index=selected_sample_index,
-        batch_index=selected_index,
-        total_batches=total_batches,
-    )
-
-
-def _render_ml_batch_preview(data: _PreviewSelection) -> MlBatchPreview:
+def _render_ml_batch_preview(data: MlBatchPreviewData) -> MlBatchPreview:
     store = data.store
     index = data.index
-    submission = data.submission
+    submission = data.spec
     ref = data.ref
     batch = data.batch
     batch_index = data.batch_index
@@ -307,7 +408,7 @@ def _render_ml_batch_preview(data: _PreviewSelection) -> MlBatchPreview:
         store,
         ref.segments,
         ref.offset,
-        _preview_rows(submission) + 1,
+        submission.preview_rows + 1,
         (axis_col, *y_columns),
         submission.scaling,
     )
@@ -336,7 +437,7 @@ def _render_ml_batch_preview(data: _PreviewSelection) -> MlBatchPreview:
             widget,
             stream,
             0,
-            _preview_rows(submission),
+            submission.preview_rows,
             _timeseries_plot_specs(axis_col, y_columns, submission),
             colors,
             shown_roles,
@@ -352,7 +453,7 @@ def _render_ml_batch_preview(data: _PreviewSelection) -> MlBatchPreview:
         current_stream_key=_stream_key(ref),
         store=store,
         index=index,
-        submission=submission,
+        spec=submission,
     )
 
 
@@ -363,15 +464,14 @@ def update_ml_batch_preview(
     consecutive_step: int | None = None,
 ) -> MlBatchPreview:
     submission = replace(
-        preview.submission,
+        preview.spec,
         batch_group_index=int(batch_group_index),
-        sample_index=preview.submission.sample_index if sample_index is None else int(sample_index),
-        consecutive_step=preview.submission.consecutive_step
+        sample_index=preview.spec.sample_index if sample_index is None else int(sample_index),
+        consecutive_step=preview.spec.consecutive_step
         if consecutive_step is None
         else int(consecutive_step),
     )
-    config = _loader_config(submission)
-    selected = _prepare_preview_selection(preview.store, preview.index, submission)
+    selected = prepare_ml_batch_preview(preview.store, preview.index, submission)
     batch_index = selected.batch_index
     sample_index = selected.sample_index
     ref = selected.ref
@@ -391,11 +491,10 @@ def update_ml_batch_preview(
             selected.total_batches,
             sample_index,
             submission,
-            config,
         )
     axis_col = _axis_column(ref.protocol)
     y_columns = _plot_columns(axis_col, submission.input_columns, submission.target_columns)
-    rows = _preview_rows(submission)
+    rows = submission.preview_rows
     stream = _scaled_stream_window(
         preview.store,
         ref.segments,
@@ -427,92 +526,14 @@ def update_ml_batch_preview(
         current_stream_key=preview.current_stream_key,
         store=preview.store,
         index=preview.index,
-        submission=submission,
+        spec=submission,
     )
-
-
-def count_ml_batch_preview_groups(
-    index: MlDatasetIndex,
-    *,
-    strategy: str,
-    active_protocol: str,
-    batch_size: int,
-    seq_len: int,
-    stateful_n_windows: int,
-) -> int:
-    if index.frame.is_empty() or BaseColumns.proto not in index.frame.columns:
-        return 0
-    if ml_batch_preview_unavailable_message(
-        strategy=strategy,
-        active_protocol=active_protocol,
-    ):
-        return 0
-    submission = MlBatchPreviewSubmission(
-        submit_id=0,
-        input_columns=("__unused__",),
-        target_columns=("__unused__",),
-        batch_size=batch_size,
-        seq_len=seq_len,
-        batch_group_index=0,
-        strategy=strategy,
-        stateful_n_windows=stateful_n_windows,
-        active_protocol=active_protocol,
-    )
-    config = _loader_config(submission)
-    batch_count = _count_preview_batches(
-        _sorted_preview_index(index), DatasetProtocolId(submission.active_protocol), config
-    )
-    if batch_count == 0:
-        return 0
-    return (batch_count + stateful_n_windows - 1) // stateful_n_windows
-
-
-def ml_batch_preview_unavailable_message(*, strategy: str, active_protocol: str) -> str | None:
-    try:
-        protocol = DatasetProtocolId(active_protocol)
-    except ValueError:
-        return None
-    if protocol == DatasetProtocolId.eis and strategy != "sequential":
-        return (
-            "EIS batch preview is not supported with shuffled protocol groups yet. "
-            "Use Sequential debug or select cycling/HPPC/RPT."
-        )
-    return None
-
-
-def _count_preview_batches(
-    index: MlDatasetIndex,
-    active_protocol: DatasetProtocolId | object,
-    config: LoaderConfig,
-) -> int:
-    return sum(1 for _plan in iter_batch_plans(index, active_protocol, config))
-
-
-def _loader_config(submission: MlBatchPreviewSubmission) -> LoaderConfig:
-    return LoaderConfig(
-        strategy="sequential"
-        if submission.strategy == "sequential"
-        else "shuffled_protocol_groups",
-        active_protocol=DatasetProtocolId(submission.active_protocol),
-        stateful_n_windows=int(submission.stateful_n_windows),
-        default_window=WindowConfig(
-            batch_size=submission.batch_size,
-            seq_len=submission.seq_len,
-            drop_incomplete=False,
-        ),
-    )
-
-
-def _sorted_preview_index(
-    index: MlDatasetIndex,
-) -> MlDatasetIndex:
-    return type(index)(sort_index_frame(index.frame))
 
 
 def _build_eis_batch_preview(
     store: DatasetStoreReader,
     index: MlDatasetIndex,
-    submission: MlBatchPreviewSubmission,
+    submission: MlBatchPreviewSpec,
     ref: WindowRef,
     batch: Batch,
     batch_index: int,
@@ -522,7 +543,7 @@ def _build_eis_batch_preview(
     _validate_eis_preview_columns((*submission.input_columns, *submission.target_columns))
     stream_lf = _eis_stream_lazy_frame(store, ref.segments, submission.scaling)
     stream = _eis_stream_window_frame(
-        store, ref.segments, ref.offset, _preview_rows(submission) + 1, submission.scaling
+        store, ref.segments, ref.offset, submission.preview_rows + 1, submission.scaling
     )
     title = _ref_title(index, ref)
     fig, height = make_eis_figure(title)
@@ -550,7 +571,7 @@ def _build_eis_batch_preview(
             widget,
             stream,
             0,
-            _preview_rows(submission),
+            submission.preview_rows,
             _eis_plot_specs(submission),
             colors,
             shown_roles,
@@ -566,7 +587,7 @@ def _build_eis_batch_preview(
         current_stream_key=_stream_key(ref),
         store=store,
         index=index,
-        submission=submission,
+        spec=submission,
     )
 
 
@@ -577,10 +598,9 @@ def _update_eis_batch_preview(
     batch_index: int,
     total_batches: int,
     sample_index: int,
-    submission: MlBatchPreviewSubmission,
-    config: LoaderConfig,
+    submission: MlBatchPreviewSpec,
 ) -> MlBatchPreview:
-    rows = config.default_window.batch_size * config.default_window.seq_len
+    rows = submission.preview_rows
     stream = _eis_stream_window_frame(
         preview.store, ref.segments, ref.offset, rows + 1, submission.scaling
     )
@@ -588,7 +608,7 @@ def _update_eis_batch_preview(
         stream,
         0,
         rows,
-        _eis_plot_specs(preview.submission),
+        _eis_plot_specs(preview.spec),
     )
     preview.widget.update_registered_traces(
         tuple(
@@ -605,7 +625,7 @@ def _update_eis_batch_preview(
         current_stream_key=preview.current_stream_key,
         store=preview.store,
         index=preview.index,
-        submission=submission,
+        spec=submission,
     )
 
 
@@ -663,7 +683,7 @@ def _validate_eis_preview_columns(columns: tuple[str, ...]) -> None:
         )
 
 
-def _eis_plot_specs(submission: MlBatchPreviewSubmission) -> tuple[_BatchPlotSpec, ...]:
+def _eis_plot_specs(submission: MlBatchPreviewSpec) -> tuple[_BatchPlotSpec, ...]:
     input_columns = set(submission.input_columns)
     target_columns = set(submission.target_columns)
     return (
@@ -697,7 +717,7 @@ def _eis_plot_specs(submission: MlBatchPreviewSubmission) -> tuple[_BatchPlotSpe
 def _timeseries_plot_specs(
     axis_col: str,
     y_columns: tuple[str, ...],
-    submission: MlBatchPreviewSubmission,
+    submission: MlBatchPreviewSpec,
 ) -> tuple[_BatchPlotSpec, ...]:
     return tuple(
         _BatchPlotSpec(
@@ -766,12 +786,6 @@ def _iter_batch_overlay_frames(
         if spec.target:
             frames.append(("target batch", spec, _overlay_frame(selected, offset + 1, rows)))
     return frames
-
-
-def _preview_rows(submission: MlBatchPreviewSubmission) -> int:
-    if submission.strategy != "sequential":
-        return submission.seq_len
-    return submission.batch_size * submission.seq_len
 
 
 def _stream_window_frame(
@@ -858,7 +872,7 @@ def _metadata_frame(
     plan_index: int,
     total_batches: int,
     sample_index: int,
-    submission: MlBatchPreviewSubmission,
+    submission: MlBatchPreviewSpec,
 ) -> pl.DataFrame:
     state = batch.state
     sample_index = _clamp_sample_index(sample_index, len(state.window_offsets))
@@ -912,16 +926,6 @@ def _metadata_frame(
             "field": [str(row["field"]) for row in rows],
             "value": [str(row["value"]) for row in rows],
         }
-    )
-
-
-def _preview_raw_plan_index(submission: MlBatchPreviewSubmission) -> int:
-    consecutive_index = _clamp_consecutive_index(
-        submission.consecutive_step,
-        submission.stateful_n_windows,
-    )
-    return (
-        int(submission.batch_group_index) * int(submission.stateful_n_windows) + consecutive_index
     )
 
 
