@@ -105,9 +105,13 @@ class MlDataIterable(IterableDataset[Batch]):
         else:
             stream_tensor_cache = None
         if self.config.data_access == "full_in_mem" and not stream_tensor_cache:
-            raise ValueError("data_access='full_in_mem' could not load any selected protocol streams")
+            raise ValueError(
+                "data_access='full_in_mem' could not load any selected protocol streams"
+            )
         if stream_tensor_cache is not None and not stream_tensor_cache.tensors:
-            raise ValueError("data_access='full_in_mem' could not load any selected protocol streams")
+            raise ValueError(
+                "data_access='full_in_mem' could not load any selected protocol streams"
+            )
         self.stream_tensor_cache = stream_tensor_cache
         self._epoch_idx = 0
         if not self.input_columns:
@@ -123,7 +127,6 @@ class MlDataIterable(IterableDataset[Batch]):
     def steps_per_epoch(self, epoch_idx: int = 0) -> int:
         return planning.count_batch_plans(
             self.index,
-            None,
             self.config,
             epoch_idx=epoch_idx,
             stream_plans=self.stream_plans,
@@ -139,7 +142,6 @@ class MlDataIterable(IterableDataset[Batch]):
             self.target_columns,
             self.active_scaling,
             self.config,
-            self.protocol_order,
             self.stream_plans,
             self.schema_by_path,
             self.stream_tensor_cache,
@@ -227,14 +229,11 @@ def create_dataloader(
     target_columns: tuple[str | MappingSpec, ...],
     protocols: tuple[object, ...] | None = None,
     protocol_mode: ProtocolMode = "strict",
-    active_protocol: DatasetProtocolId | object | None = None,
     validation: ValidationConfig | None = None,
     scaling: tuple[ScalingRule, ...] = (),
     config: LoaderConfig | None = None,
 ) -> DataLoader[Batch] | DevicePrefetchDataLoader:
     resolved_config = LoaderConfig() if config is None else config
-    if active_protocol is not None:
-        resolved_config = replace(resolved_config, protocol_order=(coerce_protocol(active_protocol),))
     index = build_index(
         store,
         manifest_paths,
@@ -242,6 +241,27 @@ def create_dataloader(
         protocol_mode=protocol_mode,
         validation=validation,
     )
+    return create_dataloader_from_index(
+        store,
+        index,
+        input_columns,
+        target_columns,
+        protocols=protocols,
+        scaling=scaling,
+        config=resolved_config,
+    )
+
+
+def create_dataloader_from_index(
+    store: DatasetStoreReader,
+    index: MlDatasetIndex,
+    input_columns: tuple[str | MappingSpec, ...],
+    target_columns: tuple[str | MappingSpec, ...],
+    protocols: tuple[object, ...] | None = None,
+    scaling: tuple[ScalingRule, ...] = (),
+    config: LoaderConfig | None = None,
+) -> DataLoader[Batch] | DevicePrefetchDataLoader:
+    resolved_config = LoaderConfig() if config is None else config
     dataset = MlDataIterable(
         store=store,
         index=index,
@@ -328,7 +348,6 @@ def _iter_batches(
     target_columns: tuple[str, ...],
     scaling: tuple[ScalingRule, ...],
     config: LoaderConfig,
-    protocol_order: tuple[DatasetProtocolId, ...],
     stream_plans: tuple[StreamPlan, ...] | None,
     schema_by_path: dict[str, set[str]] | None,
     stream_tensor_cache: StreamTensorCache | None,
@@ -337,7 +356,6 @@ def _iter_batches(
 ) -> Iterator[Batch]:
     plans = planning.iter_batch_plans(
         index,
-        None,
         config,
         epoch_idx=epoch_idx,
         stream_plans=stream_plans,

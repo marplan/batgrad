@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
+from logging import getLogger
 from typing import TYPE_CHECKING
 
 import polars as pl
@@ -15,6 +16,9 @@ from batgrad.ml.data.index import MlDatasetIndex
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+
+logger = getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +88,6 @@ class BatchPlan:
 
 def build_batch_plans(
     index: MlDatasetIndex,
-    active_protocol: DatasetProtocolId | object,
     config: LoaderConfig,
     epoch_idx: int = 0,
     stream_plans: tuple[StreamPlan, ...] | None = None,
@@ -92,7 +95,6 @@ def build_batch_plans(
     return tuple(
         iter_batch_plans(
             index,
-            active_protocol,
             config,
             epoch_idx=epoch_idx,
             stream_plans=stream_plans,
@@ -102,12 +104,11 @@ def build_batch_plans(
 
 def count_batch_plans(
     index: MlDatasetIndex,
-    active_protocol: DatasetProtocolId | object | None,
     config: LoaderConfig,
     epoch_idx: int = 0,
     stream_plans: tuple[StreamPlan, ...] | None = None,
 ) -> int:
-    protocol_order = _protocol_order(index, active_protocol, config)
+    protocol_order = _protocol_order(index, config)
     if config.strategy == "sequential":
         protocol = protocol_order[0]
         return _count_sequential_batch_plans(index, protocol, config)
@@ -120,12 +121,11 @@ def count_batch_plans(
 
 def iter_batch_plans(
     index: MlDatasetIndex,
-    active_protocol: DatasetProtocolId | object | None,
     config: LoaderConfig,
     epoch_idx: int = 0,
     stream_plans: tuple[StreamPlan, ...] | None = None,
 ) -> Iterator[BatchPlan]:
-    protocol_order = _protocol_order(index, active_protocol, config)
+    protocol_order = _protocol_order(index, config)
     if config.strategy == "sequential":
         protocol = protocol_order[0]
         for ref in iter_window_refs(index, protocol, config):
@@ -239,13 +239,10 @@ def protocol_index(index: MlDatasetIndex, protocol: DatasetProtocolId) -> MlData
 
 def _protocol_order(
     index: MlDatasetIndex,
-    active_protocol: DatasetProtocolId | object | None,
     config: LoaderConfig,
 ) -> tuple[DatasetProtocolId, ...]:
     if config.protocol_order:
         return config.protocol_order
-    if active_protocol is not None:
-        return (coerce_protocol(active_protocol),)
     return (first_protocol(index),)
 
 
@@ -281,11 +278,19 @@ def _iter_shuffled_protocol_group_batch_plans(
         batch_segments = stateful_segments[batch_start : batch_start + window.batch_size]
         if len(batch_segments) != window.batch_size and config.drop_incomplete_batches:
             continue
-        # NOTE: Whole-stream stateful batches currently shorten every lane to the
-        # shortest stream in the batch. For chained protocols this can drop tails
-        # or even entire later protocols; a second strategy should handle this by
-        # length bucketing or per-lane state preservation.
         stateful_steps = min(len(segment) for segment in batch_segments)
+        if config.stateful_n_windows == -1:
+            lane_lengths = tuple(len(segment) for segment in batch_segments)
+            dropped_windows = sum(length - stateful_steps for length in lane_lengths)
+            if dropped_windows:
+                logger.warning(
+                    "Whole-stream stateful batch truncates longer lanes: group=%d "
+                    "lane_lengths=%s emitted_steps=%d dropped_windows=%d",
+                    group_idx,
+                    lane_lengths,
+                    stateful_steps,
+                    dropped_windows,
+                )
         for step_idx in range(stateful_steps):
             yield BatchPlan(
                 refs=tuple(segment[step_idx] for segment in batch_segments),
@@ -343,10 +348,12 @@ def _count_shuffled_protocol_group_batch_plans(
     refs_by_stream = _shuffled_protocol_refs_by_stream(
         index, protocol_order, config, epoch_idx, stream_plans=stream_plans
     )
+    if config.stateful_n_windows == -1:
+        stateful_segments = _stateful_segments(refs_by_stream, config.stateful_n_windows)
+        _stable_shuffle(stateful_segments, seed=config.seed, epoch_idx=epoch_idx, salt="segments")
+        return _count_whole_stream_stateful_batches(stateful_segments, window.batch_size, config)
     ref_counts = tuple(len(refs) for refs in refs_by_stream.values())
     ref_counts = tuple(count for count in ref_counts if count > 0)
-    if config.stateful_n_windows == -1:
-        return _count_whole_stream_stateful_batches(ref_counts, window.batch_size, config)
     segment_count = sum(count // config.stateful_n_windows for count in ref_counts)
     batch_count = _batch_count(
         segment_count, window.batch_size, drop_incomplete=config.drop_incomplete_batches
@@ -377,21 +384,18 @@ def _count_shuffled_stream_refs(
 
 
 def _count_whole_stream_stateful_batches(
-    segment_lengths: tuple[int, ...],
+    stateful_segments: list[tuple[WindowRef, ...]],
     batch_size: int,
     config: LoaderConfig,
 ) -> int:
-    # Whole-stream stateful batches yield the shortest stream length in each batch.
-    # The exact shuffled grouping is intentionally not materialized here; this path
-    # is for epoch sizing, while stateful_n_windows=1 remains exact for large runs.
-    usable = len(segment_lengths)
+    usable = len(stateful_segments)
     if config.drop_incomplete_batches:
         usable = (usable // batch_size) * batch_size
     total = 0
     for start in range(0, usable, batch_size):
-        batch = segment_lengths[start : start + batch_size]
+        batch = stateful_segments[start : start + batch_size]
         if len(batch) == batch_size or not config.drop_incomplete_batches:
-            total += min(batch)
+            total += min(len(segment) for segment in batch)
     return total
 
 
