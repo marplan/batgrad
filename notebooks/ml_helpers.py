@@ -1,22 +1,27 @@
+# ruff: noqa: INP001
+
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
 
 import marimo as mo
 import polars as pl
 
 from batgrad.contracts.mapping import BaseColumns
+from batgrad.contracts.row_ids import ML_INDEX_ROW_ID_COLUMN
 from batgrad.ml.data.config import ScalingRule, ValidationConfig
 from batgrad.ml.data.index import MlDatasetIndex, available_manifest_paths
 from batgrad.ml.data.loader import create_index
 from batgrad.ml.data.materialization import resolve_index_schema_by_protocol
+from batgrad.ml.data.preview import (
+    MlBatchPreviewSpec,
+    count_ml_batch_preview_groups,
+    ml_batch_preview_unavailable_message,
+)
 from batgrad.notebook_helpers import selected_row_ids_from_table, wrap_anywidget_blocks
 from batgrad.viz.ml import (
     MlBatchPreview,
-    MlBatchPreviewSubmission,
     build_ml_batch_preview,
-    count_ml_batch_preview_groups,
-    ml_batch_preview_unavailable_message,
     update_ml_batch_preview,
 )
 
@@ -28,6 +33,12 @@ PREVIEW_SCALING: tuple[ScalingRule, ...] = (
     ScalingRule(BaseColumns.a_heat, 1.0, 50.0),
     ScalingRule(BaseColumns.dt, 0.0, 10_000.0, transform="log1p"),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class BatchPreviewSubmission:
+    submit_id: int
+    spec: MlBatchPreviewSpec
 
 
 def discover_normalized_manifest_status(store: object) -> tuple[tuple[str, ...], str | None]:
@@ -81,8 +92,6 @@ def selected_index_rows(index_frame: pl.DataFrame, index_table: object | None) -
     selected_row_ids = selected_row_ids_from_table(index_table.value)
     if not selected_row_ids:
         return pl.DataFrame()
-    from batgrad.contracts.row_ids import ML_INDEX_ROW_ID_COLUMN
-
     return index_frame.filter(pl.col(ML_INDEX_ROW_ID_COLUMN).is_in(selected_row_ids))
 
 
@@ -145,23 +154,30 @@ def make_batch_preview_submission(
     stateful_n_windows: int,
     active_protocol: str,
     enable_scaling: bool,
-) -> MlBatchPreviewSubmission | None:
-    if batch_warning is not None or selected_index_frame.is_empty() or not input_columns or not target_columns:
+) -> BatchPreviewSubmission | None:
+    if (
+        batch_warning is not None
+        or selected_index_frame.is_empty()
+        or not input_columns
+        or not target_columns
+    ):
         return None
     scaling = selected_preview_scaling((*input_columns, *target_columns)) if enable_scaling else ()
-    return MlBatchPreviewSubmission(
+    return BatchPreviewSubmission(
         submit_id=submit_id,
-        input_columns=input_columns,
-        target_columns=target_columns,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        batch_group_index=min(max(0, batch_group_index), max_preview_group),
-        sample_index=min(max(0, sample_index), max_sample_index),
-        consecutive_step=min(max(0, consecutive_step), max_consecutive_index),
-        strategy=strategy,
-        stateful_n_windows=stateful_n_windows,
-        active_protocol=active_protocol,
-        scaling=scaling,
+        spec=MlBatchPreviewSpec(
+            input_columns=input_columns,
+            target_columns=target_columns,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            batch_group_index=min(max(0, batch_group_index), max_preview_group),
+            sample_index=min(max(0, sample_index), max_sample_index),
+            consecutive_step=min(max(0, consecutive_step), max_consecutive_index),
+            strategy=strategy,
+            stateful_n_windows=stateful_n_windows,
+            active_protocol=active_protocol,
+            scaling=scaling,
+        ),
     )
 
 
@@ -178,7 +194,7 @@ def build_batch_preview(
     *,
     store: object,
     selected_index_frame: pl.DataFrame,
-    submission: MlBatchPreviewSubmission | None,
+    submission: BatchPreviewSubmission | None,
 ) -> tuple[str | None, MlBatchPreview | None, object | None]:
     if store is None or not selected_index_frame.height or submission is None:
         return None, None, None
@@ -186,7 +202,7 @@ def build_batch_preview(
         preview = build_ml_batch_preview(
             store,
             MlDatasetIndex(selected_index_frame),
-            submission,
+            submission.spec,
         )
     except (
         FileNotFoundError,
@@ -218,9 +234,9 @@ def update_batch_preview(
     if preview is None:
         return None, None
     if (
-        batch_group_index == preview.submission.batch_group_index
-        and sample_index == preview.submission.sample_index
-        and consecutive_step == preview.submission.consecutive_step
+        batch_group_index == preview.spec.batch_group_index
+        and sample_index == preview.spec.sample_index
+        and consecutive_step == preview.spec.consecutive_step
     ):
         return preview, None
     updated = update_ml_batch_preview(
@@ -229,7 +245,11 @@ def update_batch_preview(
         sample_index,
         consecutive_step,
     )
-    view = wrap_anywidget_blocks((updated.widget,))[0] if updated.widget is not preview.widget else None
+    view = (
+        wrap_anywidget_blocks((updated.widget,))[0]
+        if updated.widget is not preview.widget
+        else None
+    )
     return updated, view
 
 

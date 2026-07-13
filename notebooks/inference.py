@@ -17,17 +17,18 @@ with app.setup:
         load_manifest_preview,
         validation_group_options,
     )
+    from batgrad.ml.inference import available_devices
     from batgrad.notebook_helpers import (
         make_selectable_table,
         manifest_commit_lines,
         open_local_store_status,
         parse_manifest_commits,
     )
+    from batgrad.viz.ml import inference_group_label
     from notebooks.inference_helpers import (
-        available_devices,
         build_batch_inference,
         checkpoint_frame,
-        discover_checkpoints,
+        checkpoint_options,
         inference_view as render_inference_view,
         make_checkpoint_table,
         make_inference_request,
@@ -153,9 +154,7 @@ def _(
 @app.cell
 def _(index_error, index_frame):
     index_table = (
-        make_selectable_table(index_frame)
-        if index_error is None and index_frame.height
-        else None
+        make_selectable_table(index_frame) if index_error is None and index_frame.height else None
     )
     return (index_table,)
 
@@ -168,7 +167,7 @@ def _(index_frame, index_table):
 
 @app.cell
 def _():
-    checkpoints = discover_checkpoints()
+    checkpoints = checkpoint_options()
     checkpoint_frame_ = checkpoint_frame(checkpoints)
     checkpoint_table = make_checkpoint_table(checkpoint_frame_)
     _devices = available_devices()
@@ -237,18 +236,17 @@ def _(
         except (TypeError, ValueError) as exc:
             set_inference_submission_error(str(exc))
             return next_value
-        if submission is not None:
-            try:
-                request = make_inference_request(
-                    store=store,
-                    selected_index_frame=selected_index_frame,
-                    submission=submission,
-                )
-            except (TypeError, ValueError) as exc:
-                set_inference_submission_error(str(exc))
-                return next_value
-            set_inference_submission_error(None)
-            set_inference_request(request)
+        try:
+            request = make_inference_request(
+                store=store,
+                selected_index_frame=selected_index_frame,
+                submission=submission,
+            )
+        except (TypeError, ValueError) as exc:
+            set_inference_submission_error(str(exc))
+            return next_value
+        set_inference_submission_error(None)
+        set_inference_request(request)
         return next_value
 
     run_inference = mo.ui.button(value=0, on_click=commit_inference, label="Run inference")
@@ -267,7 +265,10 @@ def _(get_inference_request, set_inference_result):
 def _(get_inference_result, inference_result):
     result = inference_result or get_inference_result()
     row_options = (
-        [f"{idx}: {label}" for idx, label in enumerate(result.group_labels)]
+        [
+            f"{idx}: {inference_group_label(group_key)}"
+            for idx, group_key in enumerate(result.group_keys)
+        ]
         if result is not None
         else ["No inference result"]
     )
