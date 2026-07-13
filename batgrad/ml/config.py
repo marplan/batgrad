@@ -8,10 +8,32 @@ from types import UnionType
 from typing import Literal, Union, cast, get_args, get_origin, get_type_hints
 
 from batgrad.contracts.mapping import DatasetProtocolId
-from batgrad.ml.loggers import LoggingConfig  # noqa: TC001 - needed by get_type_hints at runtime
 from batgrad.ml.nn import SequenceMixerConfig  # noqa: TC001 - needed by get_type_hints at runtime
 
 type ScalingTransform = Literal["linear", "log1p"]
+
+
+@dataclass(frozen=True, slots=True)
+class WandbConfig:
+    project: str | None = None
+    entity: str | None = None
+    group: str | None = None
+    name: str | None = None
+    tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class LoggingConfig:
+    backend: Literal["stdout", "jsonl", "wandb"] = "jsonl"
+    mode: Literal["offline", "online"] = "offline"
+    mirror_stdout: bool = True
+    wandb: WandbConfig = field(default_factory=WandbConfig)
+
+    def __post_init__(self) -> None:
+        if self.backend not in {"stdout", "jsonl", "wandb"}:
+            raise ValueError(f"Unsupported logging backend: {self.backend!r}")
+        if self.mode not in {"offline", "online"}:
+            raise ValueError(f"Unsupported logging mode: {self.mode!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +77,11 @@ class DataConfig:
             raise ValueError("data.manifest_paths must not be empty")
         if not self.protocols:
             raise ValueError("data.protocols must not be empty")
+        duplicate_protocols = sorted(
+            protocol for protocol in set(self.protocols) if self.protocols.count(protocol) > 1
+        )
+        if duplicate_protocols:
+            raise ValueError(f"data.protocols contains duplicates: {duplicate_protocols}")
         if self.protocol_mode not in {"strict", "available"}:
             raise ValueError("data.protocol_mode must be 'strict' or 'available'")
         if not self.input_columns or not self.target_columns:
@@ -119,6 +146,11 @@ class ValidationSplitConfig:
             raise ValueError("validation.split.fraction must be in [0, 1)")
         if not self.group_by:
             raise ValueError("validation.split.group_by must not be empty")
+        duplicate_group_by = sorted(
+            column for column in set(self.group_by) if self.group_by.count(column) > 1
+        )
+        if duplicate_group_by:
+            raise ValueError(f"validation.split.group_by contains duplicates: {duplicate_group_by}")
         if self.strategy == "provide" and not self.groups:
             raise ValueError("validation.split.strategy='provide' requires groups")
         if self.strategy == "sample" and self.groups:
@@ -208,7 +240,6 @@ class MaskedSuffixConfig:
     enabled: bool = True
     channels: tuple[str, ...] = ()
     suffix_steps: int = 128
-    fill_value: float = 0.0
     loss_on_masked_only: bool = True
     carry_mamba_state: bool = True
     detach_between_windows: bool = True
@@ -310,8 +341,11 @@ class ExperimentConfig:
         _validate_protocol_strategy(self)
         _validate_mamba_state(self)
         _validate_masked_suffix_channels(self)
+        _validate_masked_suffix_context(self)
+        _validate_rollout_selectors(self)
         _validate_rollout_extension(self)
         _validate_prefetch(self)
+        _validate_mamba_device(self)
         _validate_output_mode(self)
 
 
@@ -332,7 +366,15 @@ def _validate_protocol_strategy(config: ExperimentConfig) -> None:
 
 
 def _validate_mamba_state(config: ExperimentConfig) -> None:
-    if config.train.masked_suffix.carry_mamba_state and any(
+    validation_suffix = resolved_validation_masked_suffix(config)
+    validation_carries_state = validation_suffix.carry_mamba_state and (
+        (config.validation.max_tf_batches > 0 and validation_suffix.enabled)
+        or config.validation.rollout_steps > 0
+    )
+    carries_state = (
+        config.train.masked_suffix.enabled and config.train.masked_suffix.carry_mamba_state
+    ) or validation_carries_state
+    if carries_state and any(
         layer.kind == "mamba" and layer.mamba_config(config.model.mamba).is_mimo
         for layer in (*config.model.layers, *config.model.head_layers)
     ):
@@ -341,7 +383,7 @@ def _validate_mamba_state(config: ExperimentConfig) -> None:
 
 def _validate_masked_suffix_channels(config: ExperimentConfig) -> None:
     suffix = config.train.masked_suffix
-    if not suffix.enabled:
+    if not suffix.enabled and not resolved_validation_masked_suffix(config).enabled:
         return
     input_columns = set(config.data.input_columns)
     target_columns = set(config.data.target_columns)
@@ -356,6 +398,67 @@ def _validate_masked_suffix_channels(config: ExperimentConfig) -> None:
             f"Missing inputs={missing_inputs} targets={missing_targets} "
             f"feedback={missing_feedback}"
         )
+    missing_masked = sorted(feedback_columns - set(suffix.channels))
+    if missing_masked:
+        raise ValueError(
+            "train.masked_suffix.channels must equal data.feedback_columns when masked suffix "
+            f"is enabled. Missing masked feedback columns={missing_masked}"
+        )
+
+
+def _validate_masked_suffix_context(config: ExperimentConfig) -> None:
+    train_suffix = config.train.masked_suffix
+    if train_suffix.enabled and train_suffix.suffix_steps >= config.loader.seq_len:
+        raise ValueError(
+            "train.masked_suffix.suffix_steps must be smaller than loader.seq_len when enabled"
+        )
+    validation_suffix = resolved_validation_masked_suffix(config)
+    if validation_suffix.enabled and validation_suffix.suffix_steps >= config.loader.seq_len:
+        raise ValueError(
+            "effective validation.masked_suffix.suffix_steps must be smaller than loader.seq_len"
+        )
+
+
+def resolved_validation_masked_suffix(config: ExperimentConfig) -> MaskedSuffixConfig:
+    validation = config.validation.masked_suffix
+    training = config.train.masked_suffix
+    return MaskedSuffixConfig(
+        enabled=training.enabled if validation.enabled is None else validation.enabled,
+        channels=training.channels,
+        suffix_steps=validation.suffix_steps or training.suffix_steps,
+        loss_on_masked_only=training.loss_on_masked_only,
+        carry_mamba_state=(
+            training.carry_mamba_state
+            if validation.carry_mamba_state is None
+            else validation.carry_mamba_state
+        ),
+        detach_between_windows=training.detach_between_windows,
+        roll_forward_steps=0,
+    )
+
+
+def _validate_rollout_selectors(config: ExperimentConfig) -> None:
+    group_columns = set(config.validation.split.group_by)
+    enabled_protocols = set(config.data.protocols)
+    for group in config.validation.split.groups:
+        unknown_columns = sorted(set(group.match) - group_columns)
+        if unknown_columns:
+            raise ValueError(
+                "validation.split.groups[].match contains columns outside "
+                "validation.split.group_by: "
+                f"{unknown_columns}"
+            )
+        if not group.rollout_start_offsets:
+            continue
+        protocol = group.match.get("protocol")
+        if protocol is None:
+            raise ValueError(
+                "validation split groups with rollout_start_offsets must include protocol in match"
+            )
+        if str(protocol) not in enabled_protocols:
+            raise ValueError(
+                f"validation rollout selector protocol must be in data.protocols: {protocol!r}"
+            )
 
 
 def _validate_rollout_extension(config: ExperimentConfig) -> None:
@@ -380,6 +483,16 @@ def _validate_rollout_extension(config: ExperimentConfig) -> None:
 def _validate_prefetch(config: ExperimentConfig) -> None:
     if config.loader.prefetch_to_device and not config.run.device.startswith("cuda"):
         raise ValueError("loader.prefetch_to_device requires run.device='cuda'")
+    if config.loader.data_access == "full_in_mem" and config.loader.num_workers != 0:
+        raise ValueError("loader.data_access='full_in_mem' requires loader.num_workers=0")
+
+
+def _validate_mamba_device(config: ExperimentConfig) -> None:
+    has_mamba = any(
+        layer.kind == "mamba" for layer in (*config.model.layers, *config.model.head_layers)
+    )
+    if has_mamba and not config.run.device.startswith("cuda"):
+        raise ValueError("Mamba layers require run.device to be a CUDA device")
 
 
 def _validate_output_mode(config: ExperimentConfig) -> None:
@@ -398,6 +511,10 @@ def _checkpoint_enabled(config: CheckpointConfig) -> bool:
 def load_experiment_config(path: str | Path) -> ExperimentConfig:
     with Path(path).open("r", encoding="utf-8") as file:
         raw = json.load(file)
+    return parse_experiment_config(raw)
+
+
+def parse_experiment_config(raw: object) -> ExperimentConfig:
     if not isinstance(raw, dict):
         raise TypeError("experiment config JSON must be an object")
     return _coerce_dataclass(ExperimentConfig, raw, "config")

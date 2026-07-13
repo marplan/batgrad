@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -12,11 +12,29 @@ from batgrad.ml.data.config import (
     ValidationConfig as DataValidationConfig,
     WindowConfig,
 )
-from batgrad.ml.data.scaling import scale_data
-from batgrad.ml.nn import encode_categorical_values
+from batgrad.ml.nn import decode_categorical_logits, encode_categorical_values
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
     from batgrad.ml.config import ExperimentConfig
+
+
+@dataclass(frozen=True, slots=True)
+class FeedbackValue:
+    data: torch.Tensor
+    binned: bool
+
+
+def amp_enabled(config: ExperimentConfig, device: torch.device) -> bool:
+    return config.run.use_amp and device.type == "cuda"
+
+
+def model_autocast(config: ExperimentConfig, device: torch.device) -> AbstractContextManager[None]:
+    return torch.autocast(
+        device_type=device.type,
+        enabled=amp_enabled(config, device),
+    )
 
 
 def scaling_rules(config: ExperimentConfig) -> tuple[ScalingRule, ...]:
@@ -76,53 +94,28 @@ def encode_inputs(
     return torch.where(masked_input_mask.unsqueeze(-1), torch.zeros_like(encoded), encoded)
 
 
-def feedback_pairs(config: ExperimentConfig) -> tuple[tuple[int, int], ...]:
+def feedback_pairs(
+    config: ExperimentConfig,
+    channels: tuple[str, ...] | None = None,
+) -> tuple[tuple[int, int], ...]:
+    selected = config.data.feedback_columns if channels is None else channels
     return tuple(
         (config.data.target_columns.index(name), config.data.input_columns.index(name))
-        for name in config.data.feedback_columns
-        if name in config.data.target_columns and name in config.data.input_columns
+        for name in selected
     )
 
 
-def validation_masked_suffix_enabled(config: ExperimentConfig) -> bool:
-    enabled = config.validation.masked_suffix.enabled
-    return config.train.masked_suffix.enabled if enabled is None else enabled
-
-
-def validation_suffix_steps(config: ExperimentConfig) -> int:
-    return config.validation.masked_suffix.suffix_steps or config.train.masked_suffix.suffix_steps
-
-
-def validation_carry_mamba_state(config: ExperimentConfig) -> bool:
-    carry = config.validation.masked_suffix.carry_mamba_state
-    return config.train.masked_suffix.carry_mamba_state if carry is None else carry
-
-
-def validation_loss_config(config: ExperimentConfig) -> ExperimentConfig:
-    suffix = replace(
-        config.train.masked_suffix,
-        enabled=validation_masked_suffix_enabled(config),
-        suffix_steps=validation_suffix_steps(config),
-        carry_mamba_state=validation_carry_mamba_state(config),
-        roll_forward_steps=0,
-    )
-    return replace(config, train=replace(config.train, masked_suffix=suffix))
-
-
-def append_rollout_extension(config: ExperimentConfig, inputs: torch.Tensor) -> torch.Tensor:
-    extension = config.validation.rollout_extension
-    if not extension.enabled or extension.steps <= 0:
-        return inputs
-    suffix = inputs[:, -1:, :].clone().repeat(1, extension.steps, 1)
-    scaling = scaling_rules(config)
-    for column, physical_value in extension.input_values.items():
-        column_idx = config.data.input_columns.index(column)
-        value = torch.tensor([[[float(physical_value)]]], dtype=inputs.dtype, device=inputs.device)
-        rule = tuple(rule for rule in scaling if rule.name == column)
-        if not rule:
-            raise ValueError(f"Missing scaling rule for rollout extension column: {column}")
-        suffix[:, :, column_idx] = scale_data(value, rule).reshape(())
-    return torch.cat((inputs, suffix), dim=1)
+def feedback_value(
+    config: ExperimentConfig,
+    logits: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> FeedbackValue:
+    if config.model.feedback_mode == "probabilities":
+        probabilities = torch.softmax(logits.detach().float(), dim=-1).to(dtype=dtype)
+        return FeedbackValue(probabilities, binned=True)
+    decoded = decode_categorical_logits(logits, target_ranges(config, device)).detach()
+    return FeedbackValue(decoded, binned=False)
 
 
 def data_validation_config(config: ExperimentConfig) -> DataValidationConfig:
@@ -132,9 +125,16 @@ def data_validation_config(config: ExperimentConfig) -> DataValidationConfig:
         return DataValidationConfig.provide(provided, group_by=split.group_by)
     if split.strategy == "merge":
         return DataValidationConfig.merge(
-            provided, fraction=split.fraction, group_by=split.group_by
+            provided,
+            fraction=split.fraction,
+            seed=config.run.seed,
+            group_by=split.group_by,
         )
-    return DataValidationConfig.sample(fraction=split.fraction, group_by=split.group_by)
+    return DataValidationConfig.sample(
+        fraction=split.fraction,
+        seed=config.run.seed,
+        group_by=split.group_by,
+    )
 
 
 def loader_config(
@@ -164,4 +164,4 @@ def train_loader_config(config: ExperimentConfig) -> DataLoaderConfig:
 
 
 def val_loader_config(config: ExperimentConfig) -> DataLoaderConfig:
-    return loader_config(config, BaseColumns.split.values.val, expand_roll_forward=False)
+    return loader_config(config, BaseColumns.split.values.val)
