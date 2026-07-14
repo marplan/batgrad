@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -15,6 +16,16 @@ type ScalingTransform = Literal["linear", "log1p"]
 
 @dataclass(frozen=True, slots=True)
 class WandbConfig:
+    """Weights & Biases run metadata.
+
+    Attributes:
+        project: W&B project name. The W&B client default is used when omitted.
+        entity: Optional team or user account.
+        group: Optional run group.
+        name: Optional display name.
+        tags: Searchable run tags.
+    """
+
     project: str | None = None
     entity: str | None = None
     group: str | None = None
@@ -24,6 +35,15 @@ class WandbConfig:
 
 @dataclass(frozen=True, slots=True)
 class LoggingConfig:
+    """Metric logging configuration.
+
+    Attributes:
+        backend: Output backend. JSONL and W&B require a run output directory.
+        mode: W&B synchronization mode; ignored by other backends.
+        mirror_stdout: Whether file and W&B backends also emit concise console metrics.
+        wandb: W&B-specific metadata.
+    """
+
     backend: Literal["stdout", "jsonl", "wandb"] = "jsonl"
     mode: Literal["offline", "online"] = "offline"
     mirror_stdout: bool = True
@@ -38,6 +58,27 @@ class LoggingConfig:
 
 @dataclass(frozen=True, slots=True)
 class ScalingRuleConfig:
+    """Serializable scaling rule for one selected column.
+
+    Linear scaling maps `[input_min, input_max]` to
+    `[output_min, output_max]`. The `log1p` transform is applied before the
+    linear map and consequently requires non-negative input bounds.
+
+    Attributes:
+        column: Canonical selected column name.
+        input_min: Lower bound in physical units.
+        input_max: Upper bound in physical units.
+        output_min: Lower model-space bound.
+        output_max: Upper model-space bound.
+        clip: Whether forward scaling clips to the output bounds.
+        transform: Pre-scaling transform.
+
+    Note:
+        Manifest validation still rejects observed values outside the configured
+        input bounds when `clip` is enabled. Clipping protects runtime values;
+        it does not relax the dataset contract.
+    """
+
     column: str
     input_min: float
     input_max: float
@@ -49,6 +90,11 @@ class ScalingRuleConfig:
     def __post_init__(self) -> None:
         if not self.column.strip():
             raise ValueError("data.scaling[].column must not be empty")
+        if not all(
+            math.isfinite(value)
+            for value in (self.input_min, self.input_max, self.output_min, self.output_max)
+        ):
+            raise ValueError("data.scaling bounds must be finite")
         if self.input_min >= self.input_max:
             raise ValueError("data.scaling input_min must be < input_max")
         if self.output_min >= self.output_max:
@@ -61,6 +107,24 @@ class ScalingRuleConfig:
 
 @dataclass(frozen=True, slots=True)
 class DataConfig:
+    """Dataset selection and model column contract.
+
+    Attributes:
+        manifest_paths: Mapping from canonical normalized manifest paths to the
+            expected Git commit or commit prefix.
+        protocols: Protocol values included in the experiment.
+        input_columns: Ordered model input columns.
+        target_columns: Ordered model target columns.
+        protocol_mode: `"strict"` requires every selected dataset to contain
+            every protocol; `"available"` retains the requested protocols that
+            exist and warns about missing combinations.
+        store_root: Data-store root, or `None` to use `DATA_ROOT`.
+        feedback_columns: Columns that are both inputs and targets and may receive
+            model predictions during rollout.
+        scaling: Scaling contracts for selected columns. Every input and target
+            requires exactly one rule.
+    """
+
     manifest_paths: dict[str, str]
     protocols: tuple[str, ...]
     input_columns: tuple[str, ...]
@@ -97,6 +161,14 @@ class DataConfig:
 def _validate_data_columns(config: DataConfig) -> None:
     input_columns = set(config.input_columns)
     target_columns = set(config.target_columns)
+    for field_name, columns in (
+        ("input_columns", config.input_columns),
+        ("target_columns", config.target_columns),
+        ("feedback_columns", config.feedback_columns),
+    ):
+        duplicates = sorted(column for column in set(columns) if columns.count(column) > 1)
+        if duplicates:
+            raise ValueError(f"data.{field_name} contains duplicates: {duplicates}")
     scaling_columns = [rule.column for rule in config.scaling]
     duplicates = sorted(
         column for column in set(scaling_columns) if scaling_columns.count(column) > 1
@@ -108,9 +180,11 @@ def _validate_data_columns(config: DataConfig) -> None:
         raise ValueError(
             f"data.scaling contains columns not selected for training: {unknown_scaling}"
         )
-    missing_targets = sorted(target_columns - set(scaling_columns))
-    if missing_targets:
-        raise ValueError(f"Every target column needs a data.scaling rule: {missing_targets}")
+    missing_scaling = sorted((input_columns | target_columns) - set(scaling_columns))
+    if missing_scaling:
+        raise ValueError(
+            f"Every input and target column needs a data.scaling rule: {missing_scaling}"
+        )
     missing_feedback_inputs = sorted(set(config.feedback_columns) - input_columns)
     missing_feedback_targets = sorted(set(config.feedback_columns) - target_columns)
     if missing_feedback_inputs or missing_feedback_targets:
@@ -122,6 +196,14 @@ def _validate_data_columns(config: DataConfig) -> None:
 
 @dataclass(frozen=True, slots=True)
 class ValidationGroupConfig:
+    """Explicit held-out group and optional rollout anchors.
+
+    Attributes:
+        match: Values matched against the validation split's grouping columns.
+        rollout_start_offsets: Zero-based source-row offsets identifying the last
+            observed input row at which anchored rollouts begin.
+    """
+
     match: dict[str, object]
     rollout_start_offsets: tuple[int, ...] = ()
 
@@ -134,6 +216,21 @@ class ValidationGroupConfig:
 
 @dataclass(frozen=True, slots=True)
 class ValidationSplitConfig:
+    """Group-aware validation split policy.
+
+    `sample` deterministically hashes groups, `provide` uses only explicit
+    selectors, and `merge` combines both sets. Splitting groups rather than rows
+    reduces leakage between related measurements. Sampling selects
+    `int(group_count * fraction)` groups, so small datasets can produce no sampled
+    validation groups.
+
+    Attributes:
+        strategy: Group selection strategy.
+        fraction: Fraction selected by deterministic sampling.
+        group_by: Manifest columns defining one indivisible group.
+        groups: Explicit group selectors used by `provide` and `merge`.
+    """
+
     strategy: Literal["sample", "provide", "merge"] = "sample"
     fraction: float = 0.2
     group_by: tuple[str, ...] = ("dataset id", "cell id", "cycle index")
@@ -159,6 +256,18 @@ class ValidationSplitConfig:
 
 @dataclass(frozen=True, slots=True)
 class RolloutExtensionConfig:
+    """Unscored rollout continuation beyond observed rows.
+
+    Attributes:
+        enabled: Whether to append synthetic future control rows.
+        steps: Number of unobserved rows to generate.
+        input_values: Physical-unit values for known future input controls.
+
+    Note:
+        Extension rows have no targets and never contribute to validation metrics.
+        Inputs omitted from `input_values` repeat their final observed value.
+    """
+
     enabled: bool = False
     steps: int = 0
     input_values: dict[str, float] = field(default_factory=dict)
@@ -176,6 +285,17 @@ class RolloutExtensionConfig:
 
 @dataclass(frozen=True, slots=True)
 class ValidationMaskedSuffixConfig:
+    """Validation overrides for masked-suffix execution.
+
+    `None` values inherit their training counterparts. Validation always
+    disables training roll-forward, regardless of the training configuration.
+
+    Attributes:
+        enabled: Override masked-suffix validation.
+        suffix_steps: Override the number of predicted suffix rows per call.
+        carry_mamba_state: Override recurrent state carry during validation.
+    """
+
     enabled: bool | None = None
     suffix_steps: int | None = None
     carry_mamba_state: bool | None = None
@@ -187,6 +307,18 @@ class ValidationMaskedSuffixConfig:
 
 @dataclass(frozen=True, slots=True)
 class ValidationConfig:
+    """Held-out-window and anchored-rollout validation configuration.
+
+    Attributes:
+        split: Group-aware train/validation split.
+        max_tf_batches: Maximum held-out batches evaluated at each validation;
+            zero disables this pass.
+        rollout_steps: Number of observed future rows scored per anchor.
+        log_rollout_plots: Whether supported loggers receive trajectory plots.
+        masked_suffix: Validation-time masked-suffix overrides.
+        rollout_extension: Optional unscored continuation after observed rows.
+    """
+
     split: ValidationSplitConfig = field(default_factory=ValidationSplitConfig)
     max_tf_batches: int = 1
     rollout_steps: int = 0
@@ -211,6 +343,28 @@ class ValidationConfig:
 
 @dataclass(frozen=True, slots=True)
 class LoaderTrainConfig:
+    """Training-loader settings stored in an experiment configuration.
+
+    Attributes:
+        batch_size: Number of stream lanes per batch.
+        seq_len: Input context length before any roll-forward extension.
+        strategy: Sequential windows or shuffled protocol-group streams.
+        stateful_n_windows: Consecutive windows per stateful group, or `-1` for
+            whole-stream mode.
+        cross_protocol_state_carry: `"chain"` permits aligned protocol streams
+            to share recurrent state.
+        data_access: Windowed parquet reads or a full CPU tensor cache.
+        num_workers: PyTorch data-loader worker count.
+        prefetch_to_device: Whether to asynchronously prefetch to the CUDA device.
+
+    Note:
+        `full_in_mem` trades RAM for throughput and requires `num_workers=0`.
+        Whole-stream batches are limited by the shortest lane and can omit longer
+        lane tails. Finite stateful groups discard a final group shorter than
+        `stateful_n_windows`. Shuffled protocol groups support cycling, HPPC, and
+        RPT but not EIS.
+    """
+
     batch_size: int = 32
     seq_len: int = 1024
     strategy: Literal["sequential", "shuffled_protocol_groups"] = "shuffled_protocol_groups"
@@ -237,6 +391,24 @@ class LoaderTrainConfig:
 
 @dataclass(frozen=True, slots=True)
 class MaskedSuffixConfig:
+    """Autoregressive masked-suffix objective and rollout settings.
+
+    Attributes:
+        enabled: Whether feedback inputs in a suffix are predicted rather than
+            supplied.
+        channels: Feedback columns to mask and regenerate.
+        suffix_steps: Maximum destination rows generated per model call.
+        loss_on_masked_only: Score only feedback targets in the suffix when true.
+        carry_mamba_state: Carry recurrent Mamba state between aligned windows.
+        detach_between_windows: Truncate gradients between roll-forward windows.
+        roll_forward_steps: Additional training positions traversed with generated
+            feedback.
+
+    Note:
+        Generated feedback is detached before reuse. Enabled suffixes must be
+        shorter than the loader sequence length.
+    """
+
     enabled: bool = True
     channels: tuple[str, ...] = ()
     suffix_steps: int = 128
@@ -256,6 +428,20 @@ class MaskedSuffixConfig:
 
 @dataclass(frozen=True, slots=True)
 class TrainConfig:
+    """Optimization-loop controls.
+
+    Attributes:
+        epochs: Fractional or whole passes over planned training batches.
+        log_per_epoch: Derived logging frequency when `log_every_steps` is unset.
+        log_every_steps: Optional explicit logging interval.
+        validate_per_epoch: Derived validation frequency; zero disables validation.
+        validate_every_steps: Optional explicit validation interval.
+        loss: Training objective. Only `"categorical_ce"` is supported.
+        grad_clip_norm: Maximum global gradient norm after AMP unscaling.
+        max_steps: Optional hard step limit overriding the epoch-derived count.
+        masked_suffix: Autoregressive training objective.
+    """
+
     epochs: float = 1.0
     log_per_epoch: int = 10
     log_every_steps: int | None = None
@@ -283,6 +469,17 @@ class TrainConfig:
 
 @dataclass(frozen=True, slots=True)
 class OptimizerConfig:
+    """AdamW optimizer parameters.
+
+    Attributes:
+        kind: Optimizer implementation; currently only `"adamw"`.
+        lr: Peak learning rate.
+        weight_decay: Decoupled weight decay.
+        beta1: First-moment coefficient.
+        beta2: Second-moment coefficient.
+        eps: Numerical stability term.
+    """
+
     kind: Literal["adamw"] = "adamw"
     lr: float = 1e-4
     weight_decay: float = 0.01
@@ -293,6 +490,14 @@ class OptimizerConfig:
 
 @dataclass(frozen=True, slots=True)
 class SchedulerConfig:
+    """Learning-rate scheduler parameters.
+
+    Attributes:
+        kind: Cosine decay with linear warmup, or no scheduler.
+        warmup_ratio: Fraction of total steps spent warming up.
+        min_lr_ratio: Final cosine learning rate as a fraction of peak rate.
+    """
+
     kind: Literal["linear_warmup_cosine", "none"] = "linear_warmup_cosine"
     warmup_ratio: float = 0.05
     min_lr_ratio: float = 0.01
@@ -300,6 +505,23 @@ class SchedulerConfig:
 
 @dataclass(frozen=True, slots=True)
 class RunConfig:
+    """Runtime and output settings.
+
+    Attributes:
+        device: PyTorch device string.
+        seed: Random seed used by model initialization and data planning.
+        use_amp: Enable CUDA automatic mixed precision.
+        compile_model: Wrap the model with `torch.compile`.
+        init_from: Optional checkpoint used to initialize compatible model weights.
+        output_dir: Parent run directory, or `None` for output-free stdout runs.
+        name: Stable run directory name. Existing directories with this name are
+            replaced before training starts.
+
+    Warning:
+        `init_from` is weight initialization, not training resume: optimizer,
+        scheduler, scaler, and cursor state are not restored.
+    """
+
     device: str = "cuda"
     seed: int = 69
     use_amp: bool = True
@@ -311,6 +533,16 @@ class RunConfig:
 
 @dataclass(frozen=True, slots=True)
 class CheckpointConfig:
+    """Checkpoint persistence policy.
+
+    Attributes:
+        save_latest: Replace the latest-step checkpoint after validation events.
+        save_best: Keep the lowest value observed for each monitored metric at
+            validation events. Unknown or unavailable metrics only emit a warning.
+        save_final: Save model and training state after the last step.
+        monitors: Metric names minimized by best-checkpoint tracking.
+    """
+
     save_latest: bool = False
     save_best: bool = False
     save_final: bool = False
@@ -326,6 +558,30 @@ class CheckpointConfig:
 
 @dataclass(frozen=True, slots=True)
 class ExperimentConfig:
+    """Validated, frozen dataclass contract for one ML experiment.
+
+    Constructing this object validates relationships spanning data, loader,
+    model, objective, validation, device, output, and checkpoint settings. JSON
+    callers should normally use `load_experiment_config` or
+    `parse_experiment_config` so nested objects are coerced strictly.
+
+    Attributes:
+        data: Dataset revisions, protocols, columns, feedback, and scaling.
+        loader: Training-loader behavior.
+        model: Sequence-mixer architecture.
+        train: Optimization-loop and objective controls.
+        validation: Held-out and rollout validation.
+        optim: AdamW parameters.
+        scheduler: Learning-rate schedule.
+        run: Device and output behavior.
+        logging: Metric logging backend.
+        checkpoint: Checkpoint persistence policy.
+
+    Note:
+        Frozen dataclasses prevent field reassignment, but mapping-valued fields
+        remain ordinary dictionaries and should be treated as read-only.
+    """
+
     data: DataConfig
     loader: LoaderTrainConfig
     model: SequenceMixerConfig
@@ -420,6 +676,14 @@ def _validate_masked_suffix_context(config: ExperimentConfig) -> None:
 
 
 def resolved_validation_masked_suffix(config: ExperimentConfig) -> MaskedSuffixConfig:
+    """Resolve validation suffix overrides against training defaults.
+
+    Args:
+        config: Validated experiment configuration.
+
+    Returns:
+        A complete suffix configuration with `roll_forward_steps` forced to zero.
+    """
     validation = config.validation.masked_suffix
     training = config.train.masked_suffix
     return MaskedSuffixConfig(
@@ -509,18 +773,69 @@ def _checkpoint_enabled(config: CheckpointConfig) -> bool:
 
 
 def load_experiment_config(path: str | Path) -> ExperimentConfig:
+    """Load and validate an experiment JSON file.
+
+    Args:
+        path: UTF-8 JSON file containing the complete experiment configuration.
+
+    Returns:
+        The strictly typed and cross-field-validated configuration.
+
+    Raises:
+        OSError: If the file cannot be read.
+        json.JSONDecodeError: If the file is not valid JSON.
+        TypeError: If a value has the wrong JSON type.
+        ValueError: If fields are missing, unknown, or mutually incompatible.
+
+    Examples:
+        Load the CPU dry-run configuration and inspect its model context:
+
+        ```python
+        from batgrad.ml.config import load_experiment_config
+
+        config = load_experiment_config("configs/ml_dry_run_cpu.json")
+        print(config.run.device, config.loader.seq_len)
+        ```
+    """
     with Path(path).open("r", encoding="utf-8") as file:
         raw = json.load(file)
     return parse_experiment_config(raw)
 
 
 def parse_experiment_config(raw: object) -> ExperimentConfig:
+    """Strictly parse a decoded JSON-compatible experiment object.
+
+    Unknown fields are rejected rather than ignored, and nested lists and objects
+    are converted to their immutable dataclass representations.
+
+    Args:
+        raw: Decoded JSON-compatible root object.
+
+    Returns:
+        A validated experiment configuration.
+
+    Raises:
+        TypeError: If the root or a nested value has the wrong type.
+        ValueError: If required fields are absent or validation fails.
+    """
     if not isinstance(raw, dict):
         raise TypeError("experiment config JSON must be an object")
     return _coerce_dataclass(ExperimentConfig, raw, "config")
 
 
 def resolve_store_root(configured: str | None) -> str:
+    """Resolve the data-store root from configuration or `DATA_ROOT`.
+
+    Args:
+        configured: Explicit root. When `None`, the `DATA_ROOT` environment
+            variable is used.
+
+    Returns:
+        A non-empty data-store root.
+
+    Raises:
+        ValueError: If neither source provides a non-empty value.
+    """
     value = configured if configured is not None else os.getenv("DATA_ROOT")
     if value is None or not value.strip():
         raise ValueError("data.store_root is missing and DATA_ROOT is not set")

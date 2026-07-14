@@ -33,6 +33,20 @@ def scale_data(
     data: pl.DataFrame | pl.LazyFrame | torch.Tensor,
     rules: tuple[ScalingRule, ...],
 ) -> pl.DataFrame | pl.LazyFrame | torch.Tensor:
+    """Scale selected frame columns or all tensor channels into model space.
+
+    Args:
+        data: Polars frame or tensor to scale. Tensor channels occupy the last
+            dimension and must match `rules` one-to-one in tuple order.
+        rules: Column scaling rules.
+
+    Returns:
+        A new object of the same concrete data type. Frame columns without a rule
+        are unchanged.
+
+    Raises:
+        ValueError: If a tensor's channel count differs from the rule count.
+    """
     if isinstance(data, pl.DataFrame | pl.LazyFrame):
         columns = data.columns if isinstance(data, pl.DataFrame) else data.collect_schema().names()
         return data.with_columns(_scale_expr(rule) for rule in rules if rule.name in columns)
@@ -50,6 +64,20 @@ def inverse_scale_data(
     data: pl.DataFrame | torch.Tensor,
     rules: tuple[ScalingRule, ...],
 ) -> pl.DataFrame | torch.Tensor:
+    """Reverse scaling for selected frame columns or ordered tensor channels.
+
+    Clipping is intentionally not applied during inverse scaling.
+
+    Args:
+        data: Frame matched by rule name, or tensor matched by rule order.
+        rules: Scaling rules to reverse.
+
+    Returns:
+        A new frame or tensor in physical units.
+
+    Raises:
+        ValueError: If a tensor's channel count differs from the rule count.
+    """
     if isinstance(data, pl.DataFrame):
         return data.with_columns(
             _inverse_scale_expr(rule) for rule in rules if rule.name in data.columns
@@ -66,6 +94,17 @@ def inverse_scale_tensor(
     columns: tuple[str | MappingSpec, ...],
     scaling: tuple[ScalingRule, ...],
 ) -> torch.Tensor:
+    """Inverse-scale named tensor channels while leaving other channels unchanged.
+
+    Args:
+        data: Tensor whose last dimension corresponds to `columns`.
+        columns: Ordered tensor channel names.
+        scaling: Available rules, matched to channels by name.
+
+    Returns:
+        A cloned tensor in which channels with matching rules are in physical
+        units.
+    """
     rules_by_name = {rule.name: rule for rule in scaling}
     selected = tuple(rules_by_name.get(str(column)) for column in columns)
     result = data.clone()
@@ -83,6 +122,24 @@ def minmax_scaling(
     output_max: float = 1.0,
     clip: bool = False,
 ) -> tuple[ScalingRule, ...]:
+    """Construct linear scaling rules from ordered column bounds.
+
+    Args:
+        bounds: Mapping from columns to `(input_min, input_max)` physical bounds.
+        output_min: Shared lower model-space bound.
+        output_max: Shared upper model-space bound.
+        clip: Whether forward scaling clips to output bounds.
+
+    Returns:
+        Rules preserving the mapping's iteration order.
+
+    Examples:
+        Scale voltage and current to `[-1, 1]`:
+
+        ```python
+        rules = minmax_scaling({"voltage": (2.5, 4.2), "current": (-5.0, 5.0)})
+        ```
+    """
     return tuple(
         ScalingRule(
             column,

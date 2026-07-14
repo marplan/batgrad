@@ -160,7 +160,8 @@ def build_stream_tensor_cache(
                 source_columns_,
                 scaling,
                 schema_by_path_=schema_by_path_,
-            )
+            ),
+            null_value=float("nan"),
         )
         for stream in stream_plans
     }
@@ -413,7 +414,8 @@ def _select_cached_columns(
     columns: tuple[str, ...],
 ) -> torch.Tensor:
     if columns == cache.input_columns:
-        return tensor.index_select(1, cache.input_indices)
+        selected = tensor.index_select(1, cache.input_indices)
+        return torch.where(torch.isnan(selected), PADDING_VALUE, selected)
     if columns == cache.target_columns:
         return tensor.index_select(1, cache.target_indices)
     indices = torch.tensor([cache.column_indices[column] for column in columns], dtype=torch.long)
@@ -509,8 +511,14 @@ def _frame_window_tensors(
     target_columns: tuple[str, ...],
     seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    inputs = _frame_to_tensor(window.slice(0, seq_len).select(input_columns))
-    targets = _frame_to_tensor(window.slice(1, seq_len).select(target_columns))
+    inputs = _frame_to_tensor(
+        window.slice(0, seq_len).select(input_columns),
+        null_value=PADDING_VALUE,
+    )
+    targets = _frame_to_tensor(
+        window.slice(1, seq_len).select(target_columns),
+        null_value=float("nan"),
+    )
     return inputs, targets, _window_mask(real_rows, seq_len)
 
 
@@ -589,8 +597,8 @@ def _validate_segment_columns(
         )
 
 
-def _frame_to_tensor(frame: pl.DataFrame) -> torch.Tensor:
-    filled = frame.fill_null(PADDING_VALUE)
+def _frame_to_tensor(frame: pl.DataFrame, *, null_value: float = PADDING_VALUE) -> torch.Tensor:
+    filled = frame.fill_null(null_value)
     to_torch = getattr(filled, "to_torch", None)
     if callable(to_torch):
         try:

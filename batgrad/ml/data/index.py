@@ -26,9 +26,18 @@ type ProtocolMode = Literal["strict", "available"]
 
 @dataclass(frozen=True)
 class MlDatasetIndex:
+    """Canonical table of normalized streams available to ML loaders.
+
+    Attributes:
+        frame: Deterministically sorted Polars frame containing manifest identity,
+            protocol, row counts, normalized segment paths, split assignments, and
+            stable manifest/ML row identifiers.
+    """
+
     frame: pl.DataFrame
 
     def validate(self) -> None:
+        """Validate that required loader columns are present."""
         required = {
             BaseColumns.set_id,
             BaseColumns.proto,
@@ -43,6 +52,14 @@ class MlDatasetIndex:
             raise ValueError(f"ML dataset index is missing required columns: {missing}")
 
     def filter_split(self, split: str) -> MlDatasetIndex:
+        """Return an index containing only one split.
+
+        Args:
+            split: Split value to retain, normally `train` or `validation`.
+
+        Returns:
+            A new index backed by the filtered frame.
+        """
         return MlDatasetIndex(self.frame.filter(pl.col(BaseColumns.split) == split))
 
 
@@ -53,6 +70,28 @@ def build_index(
     protocol_mode: ProtocolMode = "strict",
     validation: ValidationConfig | None = None,
 ) -> MlDatasetIndex:
+    """Build a validated ML index from normalized manifests.
+
+    Args:
+        store: Reader for manifests and normalized tables.
+        manifest_paths: Canonical normalized manifest paths mapped to expected Git
+            commits or commit prefixes of at least seven characters.
+        protocols: Optional requested protocols.
+        protocol_mode: `"strict"` requires every dataset/protocol combination;
+            `"available"` warns and retains combinations that exist.
+        validation: Group-aware split policy. By default all rows are training.
+
+    Returns:
+        A validated, deterministically sorted index with split and row IDs.
+
+    Raises:
+        ValueError: If paths, revisions, schemas, protocols, or split selectors
+            violate the normalized-manifest contract.
+
+    Note:
+        Dirty manifests are accepted with a warning. Manifest paths must follow
+        `type=*/dataset=*/source=normalized/manifest.parquet`.
+    """
     if not manifest_paths:
         raise ValueError("manifest_paths must not be empty")
     for manifest_path in manifest_paths:
@@ -74,6 +113,15 @@ def build_index(
 
 
 def available_manifest_paths(store: DatasetStoreReader) -> tuple[str, ...]:
+    """List canonical normalized manifests available in a store.
+
+    Args:
+        store: Reader whose files should be searched.
+
+    Returns:
+        Sorted canonical paths matching
+        `type=*/dataset=*/source=normalized/manifest.parquet`.
+    """
     return tuple(
         path
         for path in store.list_files(pattern="type=*/dataset=*/source=normalized/manifest.parquet")

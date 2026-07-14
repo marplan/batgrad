@@ -233,6 +233,57 @@ def create_dataloader(
     scaling: tuple[ScalingRule, ...] = (),
     config: LoaderConfig | None = None,
 ) -> DataLoader[Batch] | DevicePrefetchDataLoader:
+    """Build an ML index and create a protocol-aware batch loader.
+
+    This is the normal programmatic data entry point. It validates normalized
+    manifests and revisions, assigns group-aware splits, plans windows, applies
+    scaling, and materializes one-row-ahead targets.
+
+    Args:
+        store: Reader for normalized manifests and parquet segments.
+        manifest_paths: Manifest paths mapped to expected Git commits or prefixes.
+        input_columns: Ordered model input columns.
+        target_columns: Ordered model target columns.
+        protocols: Optional protocols to retain.
+        protocol_mode: Missing-protocol behavior across selected datasets.
+        validation: Group-aware split policy.
+        scaling: Runtime scaling rules. Tensor channel order follows selected
+            columns, not rule declaration order.
+        config: Windowing, planning, IO, multiprocessing, and device options.
+
+    Returns:
+        A PyTorch loader yielding `Batch`, or a CUDA-prefetch wrapper when
+        `prefetch_to_device` is enabled.
+
+    Raises:
+        ValueError: If manifests, columns, scaling, loader strategy, or device
+            settings are incompatible.
+
+    Examples:
+        Create a deterministic CPU loader:
+
+        ```python
+        from batgrad.ml.data.config import LoaderConfig, WindowConfig
+        from batgrad.ml.data.loader import create_dataloader
+
+        loader = create_dataloader(
+            store,
+            {"type=public/dataset=example/source=normalized/manifest.parquet": "abc1234"},
+            input_columns=("voltage", "current"),
+            target_columns=("voltage",),
+            config=LoaderConfig(
+                strategy="sequential",
+                default_window=WindowConfig(batch_size=4, seq_len=128),
+            ),
+        )
+        batch = next(iter(loader))
+        ```
+
+    Note:
+        `windowed` access minimizes memory and performs parquet reads per batch.
+        `full_in_mem` can be substantially faster but caches selected streams as
+        CPU `float32` tensors and requires `num_workers=0`.
+    """
     resolved_config = LoaderConfig() if config is None else config
     index = build_index(
         store,
@@ -261,6 +312,12 @@ def create_dataloader_from_index(
     scaling: tuple[ScalingRule, ...] = (),
     config: LoaderConfig | None = None,
 ) -> DataLoader[Batch] | DevicePrefetchDataLoader:
+    """Create a loader from an already validated ML index.
+
+    Use this entry point to reuse one index across training, validation, previews,
+    or experiments with different window settings. Arguments and return behavior
+    otherwise match `create_dataloader`.
+    """
     resolved_config = LoaderConfig() if config is None else config
     dataset = MlDataIterable(
         store=store,
@@ -298,6 +355,18 @@ def create_index(
     protocol_mode: ProtocolMode = "strict",
     validation: ValidationConfig | None = None,
 ) -> MlDatasetIndex:
+    """Build the reusable index consumed by `create_dataloader_from_index`.
+
+    Args:
+        store: Reader for normalized manifests.
+        manifest_paths: Manifest paths mapped to expected Git revisions.
+        protocols: Optional protocols to retain.
+        protocol_mode: Strict or best-available protocol selection.
+        validation: Group-aware split policy.
+
+    Returns:
+        A validated ML dataset index.
+    """
     return build_index(
         store,
         manifest_paths,

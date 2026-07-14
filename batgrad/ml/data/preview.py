@@ -213,19 +213,5 @@ def shard_columns_for_protocols(
     return tuple(sorted(set.intersection(*column_sets))) if column_sets else ()
 
 
-def default_input_columns(shard_columns: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(
-        str(column)
-        for column in (BaseColumns.time, BaseColumns.curr, BaseColumns.volt)
-        if column in shard_columns
-    )
-
-
-def default_target_columns(shard_columns: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(
-        str(column) for column in (BaseColumns.curr, BaseColumns.volt) if column in shard_columns
-    )
-
-
 def active_protocol_options(schema_by_protocol: dict[object, tuple[str, ...]]) -> tuple[str, ...]:
     return tuple(str(protocol) for protocol in schema_by_protocol) or ("cycling",)

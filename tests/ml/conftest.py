@@ -373,7 +373,7 @@ def make_config(
         n_heads=2,
         num_bins=5,
         feedback_mode=feedback_mode,  # type: ignore[arg-type]
-        layers=(LayerConfig(kind="ffn"),),
+        layers=(LayerConfig(kind="reduce", mode="sum_pool"), LayerConfig(kind="ffn")),
         head_layers=(LayerConfig(kind="ffn"),),
     )
     return ExperimentConfig(

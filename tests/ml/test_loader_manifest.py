@@ -27,6 +27,7 @@ from tests.ml.conftest import (
     make_memory_manifest_store,
     manifest_footer_bytes,
     series_frame,
+    shard_path,
 )
 
 MANIFEST_PATH = "type=synthetic/dataset=tiny-ml/source=normalized/manifest.parquet"
@@ -66,6 +67,39 @@ def test_create_dataloader_from_synthetic_manifest_materializes_batches(
     flat_inputs = batch.inputs.reshape(-1, len(INPUT_COLUMNS))
     flat_targets = batch.targets.reshape(-1, len(TARGET_COLUMNS))
     assert torch.equal(flat_targets[:-1, 0], flat_inputs[1:, 2])
+
+
+@pytest.mark.parametrize("data_access", ["windowed", "full_in_mem"])
+def test_loader_preserves_null_targets_as_non_finite(
+    tiny_manifest_store: InMemoryMlStore,
+    data_access: str,
+) -> None:
+    shard = shard_path("cell-a", 1, DatasetProtocolId.cycling, dataset="tiny-ml")
+    tiny_manifest_store.tables[shard] = tiny_manifest_store.tables[shard].with_columns(
+        pl.when(pl.int_range(pl.len()) == 1)
+        .then(None)
+        .otherwise(pl.col("voltage"))
+        .alias("voltage")
+    )
+    loader = create_dataloader(
+        store=tiny_manifest_store,
+        manifest_paths={MANIFEST_PATH: GIT_COMMIT},
+        input_columns=INPUT_COLUMNS,
+        target_columns=TARGET_COLUMNS,
+        protocols=(DatasetProtocolId.cycling,),
+        validation=ValidationConfig.sample(fraction=0.0),
+        config=LoaderConfig(
+            strategy="sequential",
+            default_window=WindowConfig(batch_size=1, seq_len=10),
+            data_access=data_access,
+        ),
+    )
+
+    batch = next(iter(loader))
+
+    assert batch.inputs[0, 1, 2].item() == -2.0
+    assert torch.isnan(batch.targets[0, 0, 0])
+    assert batch.mask[0, 0].item() is True
 
 
 def test_manifest_loader_shuffled_protocol_groups_preserves_stateful_sequence(

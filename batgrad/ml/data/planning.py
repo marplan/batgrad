@@ -110,8 +110,9 @@ def count_batch_plans(
 ) -> int:
     protocol_order = _protocol_order(index, config)
     if config.strategy == "sequential":
-        protocol = protocol_order[0]
-        return _count_sequential_batch_plans(index, protocol, config)
+        return sum(
+            _count_sequential_batch_plans(index, protocol, config) for protocol in protocol_order
+        )
     if config.strategy == "shuffled_protocol_groups":
         return _count_shuffled_protocol_group_batch_plans(
             index, protocol_order, config, epoch_idx, stream_plans=stream_plans
@@ -127,9 +128,9 @@ def iter_batch_plans(
 ) -> Iterator[BatchPlan]:
     protocol_order = _protocol_order(index, config)
     if config.strategy == "sequential":
-        protocol = protocol_order[0]
-        for ref in iter_window_refs(index, protocol, config):
-            yield BatchPlan(refs=(ref,))
+        for protocol in protocol_order:
+            for ref in iter_window_refs(index, protocol, config):
+                yield BatchPlan(refs=(ref,))
         return
     if config.strategy == "shuffled_protocol_groups":
         yield from _iter_shuffled_protocol_group_batch_plans(

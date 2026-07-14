@@ -14,7 +14,7 @@ from batgrad.ml.config import (
     resolved_validation_masked_suffix,
 )
 from batgrad.ml.experiment import data_validation_config, train_loader_config, val_loader_config
-from batgrad.ml.nn import LayerConfig
+from batgrad.ml.nn import LayerConfig, SequenceMixerConfig
 from tests.ml.conftest import make_config
 
 
@@ -120,6 +120,47 @@ def test_config_rejects_duplicate_protocols_and_validation_group_columns() -> No
         parse_experiment_config(raw)
 
 
+def test_config_requires_scaling_for_every_input_and_target() -> None:
+    raw = config_to_dict(load_experiment_config(Path("configs/ml_baseline.json")))
+    assert isinstance(raw, dict)
+    data = raw["data"]
+    assert isinstance(data, dict)
+    scaling = data["scaling"]
+    assert isinstance(scaling, list)
+    data["scaling"] = [rule for rule in scaling if rule["column"] != "Time diff [s]"]
+
+    with pytest.raises(ValueError, match="Every input and target column"):
+        parse_experiment_config(raw)
+
+
+@pytest.mark.parametrize("field", ["input_columns", "target_columns", "feedback_columns"])
+def test_config_rejects_duplicate_model_columns(field: str) -> None:
+    raw = config_to_dict(load_experiment_config(Path("configs/ml_baseline.json")))
+    assert isinstance(raw, dict)
+    data = raw["data"]
+    assert isinstance(data, dict)
+    columns = data[field]
+    assert isinstance(columns, list)
+    data[field] = [*columns, columns[0]]
+
+    with pytest.raises(ValueError, match=rf"data\.{field} contains duplicates"):
+        parse_experiment_config(raw)
+
+
+def test_sequence_mixer_requires_one_leading_reduce_layer() -> None:
+    with pytest.raises(ValueError, match="exactly one reduce layer at index 0"):
+        SequenceMixerConfig(layers=(LayerConfig(kind="ffn"),))
+    with pytest.raises(ValueError, match="exactly one reduce layer at index 0"):
+        SequenceMixerConfig(
+            layers=(
+                LayerConfig(kind="reduce", mode="sum_pool"),
+                LayerConfig(kind="reduce", mode="sum_pool"),
+            )
+        )
+    with pytest.raises(ValueError, match="head_layers must not contain reduce"):
+        SequenceMixerConfig(head_layers=(LayerConfig(kind="reduce", mode="sum_pool"),))
+
+
 def test_config_rejects_mamba_on_non_cuda_device() -> None:
     raw = config_to_dict(load_experiment_config(Path("configs/ml_baseline.json")))
     assert isinstance(raw, dict)
@@ -188,7 +229,10 @@ def test_config_rejects_validation_mamba_carry_for_mimo_rollouts() -> None:
             model=replace(
                 config.model,
                 mamba=replace(config.model.mamba, is_mimo=True),
-                layers=(LayerConfig(kind="mamba"),),
+                layers=(
+                    LayerConfig(kind="reduce", mode="sum_pool"),
+                    LayerConfig(kind="mamba"),
+                ),
             ),
             train=replace(
                 config.train,
@@ -210,7 +254,10 @@ def test_config_rejects_validation_mamba_carry_for_teacher_forced_suffix() -> No
             model=replace(
                 config.model,
                 mamba=replace(config.model.mamba, is_mimo=True),
-                layers=(LayerConfig(kind="mamba"),),
+                layers=(
+                    LayerConfig(kind="reduce", mode="sum_pool"),
+                    LayerConfig(kind="mamba"),
+                ),
             ),
             train=replace(
                 config.train,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import polars as pl
 import pytest
+import torch
 
 from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId
 from batgrad.ml.data.config import LoaderConfig, ValidationConfig, WindowConfig
@@ -79,7 +80,7 @@ def test_manifest_index_rejects_noncanonical_paths_before_store_access() -> None
         create_index(InMemoryMlStore(), {"manifest.parquet": TINY_GIT_COMMIT})
 
 
-def test_loader_converts_null_values_to_padding_without_invalidating_real_rows() -> None:
+def test_loader_uses_input_padding_and_preserves_null_targets() -> None:
     store = make_memory_manifest_store(rows=12)
     shard = next(path for path in store.tables if path.endswith("protocol=cycling.parquet"))
     store.tables[shard] = store.tables[shard].with_columns(
@@ -106,4 +107,4 @@ def test_loader_converts_null_values_to_padding_without_invalidating_real_rows()
 
     assert batch.mask[0].all()
     assert batch.inputs[0, 2, 2].item() == -2.0
-    assert batch.targets[0, 1, 0].item() == -2.0
+    assert torch.isnan(batch.targets[0, 1, 0])

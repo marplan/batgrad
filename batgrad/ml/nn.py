@@ -21,6 +21,22 @@ type ResidualKind = Literal["standard", "none"]
 
 @dataclass(frozen=True, slots=True)
 class MambaConfig:
+    """Default Mamba-3 layer parameters.
+
+    Attributes:
+        d_state: State-space dimension.
+        expand: Inner expansion factor.
+        headdim: Per-head width.
+        ngroups: Number of state-space parameter groups.
+        is_mimo: Enable Mamba-3 MIMO mode.
+        mimo_rank: MIMO projection rank.
+        chunk_size: Kernel processing chunk size.
+
+    Note:
+        Mamba layers require Linux, CUDA, and the `ml` dependency group.
+        Cross-window state carry currently requires SISO mode (`is_mimo=False`).
+    """
+
     d_state: int = 128
     expand: int = 2
     headdim: int = 64
@@ -46,6 +62,12 @@ class MambaConfig:
 
 @dataclass(frozen=True, slots=True)
 class ResidualConfig:
+    """Residual connection policy for a configured layer.
+
+    Attributes:
+        kind: Standard additive residual or no residual.
+    """
+
     kind: ResidualKind = "standard"
 
     def __post_init__(self) -> None:
@@ -55,6 +77,27 @@ class ResidualConfig:
 
 @dataclass(frozen=True, slots=True)
 class LayerConfig:
+    """One feature-reduction or temporal-mixing layer.
+
+    Attributes:
+        kind: Attention, feed-forward, Mamba, or feature reduction.
+        residual: Residual override. Temporal layers default to enabled and
+            reduction defaults to disabled.
+        mode: Reduction implementation; currently only `"sum_pool"`.
+        d_state: Optional per-layer Mamba state dimension.
+        expand: Optional per-layer Mamba expansion factor.
+        headdim: Optional per-layer Mamba head width.
+        ngroups: Optional per-layer Mamba group count.
+        is_mimo: Optional per-layer Mamba MIMO mode.
+        mimo_rank: Optional per-layer Mamba projection rank.
+        chunk_size: Optional per-layer Mamba kernel chunk size.
+
+    Note:
+        The main layer sequence must contain exactly one reduction layer at index
+        zero. Head layers cannot reduce. This validated transition changes
+        `(B, T, C_in, D)` to `(B, T, D)` before temporal layers.
+    """
+
     kind: LayerKind
     residual: bool | ResidualConfig | None = None
     mode: Literal["sum_pool"] | None = None
@@ -89,6 +132,7 @@ class LayerConfig:
 
     @property
     def uses_residual(self) -> bool:
+        """Return the effective residual policy for this layer."""
         if isinstance(self.residual, ResidualConfig):
             return self.residual.kind == "standard"
         if self.residual is not None:
@@ -96,6 +140,14 @@ class LayerConfig:
         return self.kind != "reduce"
 
     def mamba_config(self, default: MambaConfig) -> MambaConfig:
+        """Merge per-layer Mamba overrides with model defaults.
+
+        Args:
+            default: Model-level Mamba parameters.
+
+        Returns:
+            A complete configuration for this layer.
+        """
         return MambaConfig(
             d_state=default.d_state if self.d_state is None else self.d_state,
             expand=default.expand if self.expand is None else self.expand,
@@ -109,6 +161,13 @@ class LayerConfig:
 
 @dataclass(frozen=True, slots=True)
 class OutputConfig:
+    """Categorical output-head configuration.
+
+    Attributes:
+        parameterization: Output parameter sharing mode. Only `"shared"` is
+            currently supported.
+    """
+
     parameterization: Literal["shared"] = "shared"
 
     def __post_init__(self) -> None:
@@ -118,6 +177,44 @@ class OutputConfig:
 
 @dataclass(frozen=True, slots=True)
 class SequenceMixerConfig:
+    """Feature encoding and sequence-mixer architecture.
+
+    Attributes:
+        d_model: Temporal token width.
+        n_heads: Attention head count; must divide `d_model`.
+        mlp_ratio: Feed-forward hidden-width multiplier.
+        dropout: Attention and feed-forward dropout probability.
+        norm: Normalization implementation; currently RMSNorm only.
+        causal_attention: Prevent attention to future sequence positions.
+        num_bins: Categorical bins used to encode each scalar.
+        input_sigma: Gaussian width for input encoding; zero linearly interpolates
+            between adjacent bins.
+        output_sigma: Gaussian width for target distributions.
+        feedback_mode: Reuse detached probabilities directly or decode and
+            re-encode scalar feedback.
+        mamba: Default Mamba parameters.
+        layers: Main feature-reduction and temporal path.
+        head_layers: Temporal layers after feature reduction.
+        output: Categorical output projection settings.
+
+    Examples:
+        Build a small causal attention model:
+
+        ```python
+        from batgrad.ml.nn import LayerConfig, SequenceMixerConfig
+
+        config = SequenceMixerConfig(
+            d_model=128,
+            n_heads=4,
+            layers=(
+                LayerConfig(kind="reduce", mode="sum_pool"),
+                LayerConfig(kind="attention"),
+                LayerConfig(kind="ffn"),
+            ),
+        )
+        ```
+    """
+
     d_model: int = 256
     n_heads: int = 8
     mlp_ratio: float = 4.0
@@ -154,6 +251,17 @@ class SequenceMixerConfig:
             raise ValueError("model.feedback_mode must be 'probabilities' or 'decoded_scalar'")
         if not self.layers:
             raise ValueError("model.layers must not be empty")
+        _validate_layer_topology(self)
+
+
+def _validate_layer_topology(config: SequenceMixerConfig) -> None:
+    reduce_indices = tuple(
+        index for index, layer in enumerate(config.layers) if layer.kind == "reduce"
+    )
+    if reduce_indices != (0,):
+        raise ValueError("model.layers must contain exactly one reduce layer at index 0")
+    if any(layer.kind == "reduce" for layer in config.head_layers):
+        raise ValueError("model.head_layers must not contain reduce layers")
 
 
 class FeedForward(nn.Module):
@@ -217,6 +325,12 @@ class SelfAttention(nn.Module):
 
 @dataclass(frozen=True, slots=True)
 class MambaCarryState:
+    """Opaque recurrent state for one SISO Mamba-3 layer.
+
+    State is lane- and window-position-specific; callers must never reuse it
+    across unrelated streams or misaligned window starts.
+    """
+
     angle_state: torch.Tensor
     ssm_state: torch.Tensor
     k_state: torch.Tensor
@@ -375,6 +489,19 @@ class MambaBlock(nn.Module):
 
 
 class SequenceMixer(nn.Module):
+    """Categorical multi-feature sequence model.
+
+    The module consumes pre-encoded inputs shaped `(B, T, C_in, K)` and emits
+    logits shaped `(B, T, C_out, K)`. Use `encode_categorical_values` for
+    scalar inputs or the experiment helpers used by training and rollout.
+
+    Args:
+        config: Model architecture.
+        input_dim: Number of ordered input features.
+        output_dim: Number of ordered targets.
+        device: Construction device. Mamba layers require CUDA.
+    """
+
     def __init__(
         self,
         config: SequenceMixerConfig,
@@ -414,6 +541,18 @@ class SequenceMixer(nn.Module):
         states: dict[str, MambaCarryState] | None = None,
         return_states: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, MambaCarryState]]:
+        """Calculate categorical logits and optional recurrent states.
+
+        Args:
+            x: Encoded inputs shaped `(B, T, C_in, K)`.
+            mask: Optional valid-row mask shaped `(B, T)`.
+            states: Recurrent states keyed by configured Mamba layer path.
+            return_states: Return final state for each stateful layer.
+
+        Returns:
+            Logits shaped `(B, T, C_out, K)`, optionally paired with recurrent
+            states aligned to the end of the supplied sequence.
+        """
         if x.ndim != BINNED_INPUT_RANK:
             raise ValueError(
                 f"SequenceMixer expects binned inputs shaped (B,T,C,K), got {tuple(x.shape)}"
@@ -471,6 +610,19 @@ class SequenceMixer(nn.Module):
 
 
 def build_model(config: ExperimentConfig, device: torch.device) -> SequenceMixer:
+    """Build an experiment's model on the requested device.
+
+    Args:
+        config: Validated experiment configuration defining architecture and
+            ordered input/target columns.
+        device: Destination device.
+
+    Returns:
+        An initialized sequence mixer on `device`.
+
+    Raises:
+        ValueError: If a Mamba model is requested on a non-CUDA device.
+    """
     return SequenceMixer(
         config.model,
         input_dim=len(config.data.input_columns),
@@ -485,6 +637,21 @@ def categorical_target_distribution(
     sigma: float,
     target_ranges: torch.Tensor,
 ) -> torch.Tensor:
+    """Encode scalar targets as distributions over bounded categorical bins.
+
+    With `sigma=0`, probability mass is linearly interpolated between adjacent
+    bins. Positive sigma produces a normalized Gaussian over bin centers. Values
+    outside their target ranges are clamped before encoding.
+
+    Args:
+        target: Values shaped `(..., C)`.
+        num_bins: Number of categorical bins.
+        sigma: Gaussian width in normalized `[0, 1]` coordinates.
+        target_ranges: Per-channel bounds shaped `(C, 2)`.
+
+    Returns:
+        Float32 distributions shaped `(..., C, K)`.
+    """
     if sigma < 0.0:
         raise ValueError("categorical sigma must be >= 0")
     if target_ranges.shape != (int(target.shape[-1]), 2):
@@ -519,6 +686,21 @@ def encode_categorical_values(
     sigma: float,
     value_ranges: torch.Tensor,
 ) -> torch.Tensor:
+    """Encode scalar model inputs as categorical distributions.
+
+    Args:
+        values: Scalar inputs shaped `(B, T, C)`.
+        num_bins: Number of categorical bins.
+        sigma: Gaussian width in normalized coordinates; zero uses adjacent-bin
+            interpolation.
+        value_ranges: Per-channel bounds shaped `(C, 2)`.
+
+    Returns:
+        Encoded values shaped `(B, T, C, K)` with the input dtype.
+
+    Raises:
+        ValueError: If input rank or range shape is invalid.
+    """
     if values.ndim != SCALAR_INPUT_RANK:
         raise ValueError(f"categorical inputs must be shaped (B,T,C), got {tuple(values.shape)}")
     return categorical_target_distribution(values, num_bins, sigma, value_ranges).to(
@@ -527,6 +709,17 @@ def encode_categorical_values(
 
 
 def decode_categorical_logits(logits: torch.Tensor, target_ranges: torch.Tensor) -> torch.Tensor:
+    """Decode logits through the expected bin location.
+
+    This returns the probability-weighted expectation, not the argmax bin.
+
+    Args:
+        logits: Categorical logits shaped `(..., C, K)`.
+        target_ranges: Per-channel output bounds shaped `(C, 2)`.
+
+    Returns:
+        Decoded values shaped `(..., C)` in output-scaled units.
+    """
     ranges = target_ranges.to(device=logits.device, dtype=torch.float32)
     if ranges.shape != (int(logits.shape[-2]), 2):
         raise ValueError(

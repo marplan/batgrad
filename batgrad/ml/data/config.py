@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -40,6 +41,29 @@ def coerce_protocol(protocol: object) -> DatasetProtocolId:
 
 @dataclass(frozen=True)
 class ValidationConfig:
+    """Group-aware split policy used while constructing an ML index.
+
+    Attributes:
+        strategy: `"sample"` hashes groups deterministically, `"provide"`
+            selects explicit groups, and `"merge"` combines both.
+        fraction: Fraction of groups assigned to validation by sampling.
+        seed: Hash seed used by sampling.
+        group_by: Manifest columns that define an indivisible group.
+        provided: Explicit partial or complete group selectors.
+
+    Examples:
+        Hold out one cell explicitly:
+
+        ```python
+        from batgrad.contracts.mapping import BaseColumns
+        from batgrad.ml.data.config import ValidationConfig
+
+        validation = ValidationConfig.provide(
+            ({BaseColumns.set_id: "pozzato-2022", BaseColumns.cell_id: "Cell1"},)
+        )
+        ```
+    """
+
     strategy: Literal["sample", "provide", "merge"] = "sample"
     fraction: float = 0.2
     seed: int = 69
@@ -74,6 +98,16 @@ class ValidationConfig:
             BaseColumns.cidx,
         ),
     ) -> ValidationConfig:
+        """Create a deterministic sampled-group split.
+
+        Args:
+            fraction: Fraction of groups assigned to validation.
+            seed: Hash seed.
+            group_by: Columns defining one group.
+
+        Returns:
+            A sampled-group validation policy.
+        """
         return cls(strategy="sample", fraction=fraction, seed=seed, group_by=group_by)
 
     @classmethod
@@ -86,6 +120,15 @@ class ValidationConfig:
             BaseColumns.cidx,
         ),
     ) -> ValidationConfig:
+        """Create a split containing only explicitly selected groups.
+
+        Args:
+            provided: Partial or complete group selectors.
+            group_by: Columns defining one group.
+
+        Returns:
+            An explicit-group validation policy.
+        """
         return cls(strategy="provide", fraction=0.0, group_by=group_by, provided=provided)
 
     @classmethod
@@ -100,6 +143,17 @@ class ValidationConfig:
             BaseColumns.cidx,
         ),
     ) -> ValidationConfig:
+        """Create a split combining explicit and sampled groups.
+
+        Args:
+            provided: Partial or complete group selectors.
+            fraction: Additional fraction selected by deterministic sampling.
+            seed: Hash seed.
+            group_by: Columns defining one group.
+
+        Returns:
+            A merged explicit-and-sampled validation policy.
+        """
         return cls(
             strategy="merge",
             fraction=fraction,
@@ -111,6 +165,22 @@ class ValidationConfig:
 
 @dataclass(frozen=True)
 class ScalingRule:
+    """Runtime scaling rule for one tensor or frame column.
+
+    Attributes:
+        column: Canonical column name or mapping specification.
+        input_min: Lower physical-unit bound.
+        input_max: Upper physical-unit bound.
+        output_min: Lower model-space bound.
+        output_max: Upper model-space bound.
+        clip: Clip forward-scaled values to output bounds.
+        transform: Linear scaling or `log1p` followed by linear scaling.
+
+    Note:
+        Tensor functions associate rules with channels by tuple order. Frame
+        functions associate rules by column name.
+    """
+
     column: str | MappingSpec
     input_min: float
     input_max: float
@@ -122,6 +192,11 @@ class ScalingRule:
     def __post_init__(self) -> None:
         if self.transform not in {"linear", "log1p"}:
             raise ValueError(f"Unknown scaling transform: {self.transform!r}")
+        if not all(
+            math.isfinite(value)
+            for value in (self.input_min, self.input_max, self.output_min, self.output_max)
+        ):
+            raise ValueError("scaling bounds must be finite")
         if self.input_min >= self.input_max:
             raise ValueError(
                 f"input_min must be < input_max, got {self.input_min} >= {self.input_max}"
@@ -147,14 +222,23 @@ class WindowConfig:
     series protocols such as cycling/HPPC and frequency-domain protocols such as
     EIS usually need different sequence lengths.
 
+    Attributes:
+        batch_size: Number of contiguous sequence lanes carved from each window.
+        seq_len: Number of input and shifted-target positions per lane.
+        drop_incomplete: Drop a final source window that cannot fill every lane.
+        step_rows: Source-row distance between windows. The default advances by
+            `batch_size * seq_len`.
+
     Examples:
         Configure cycling as long ordered time windows and EIS as one compact
-        frequency window::
+        frequency window:
 
-            windows = {
-                DatasetProtocolId.cycling: WindowConfig(batch_size=8, seq_len=1024),
-                DatasetProtocolId.eis: WindowConfig(batch_size=16, seq_len=48),
-            }
+        ```python
+        windows = {
+            DatasetProtocolId.cycling: WindowConfig(batch_size=8, seq_len=1024),
+            DatasetProtocolId.eis: WindowConfig(batch_size=16, seq_len=48),
+        }
+        ```
 
     """
 
@@ -173,10 +257,12 @@ class WindowConfig:
 
     @property
     def step(self) -> int:
+        """Source-row distance between consecutive windows."""
         return self.step_rows or self.batch_size * self.seq_len
 
     @property
     def window_rows(self) -> int:
+        """Source rows needed for inputs and one-row-ahead targets."""
         return self.batch_size * self.seq_len + 1
 
 
@@ -225,10 +311,12 @@ class LoaderConfig:
     `alignment_key` identifies the shared physical context used by future
     multi-protocol schedules.
 
-    Usually `group_key` includes protocol and `alignment_key` does not::
+    Usually `group_key` includes protocol and `alignment_key` does not:
 
-        group_key = (dataset id, cell id, cycle index, protocol)
-        alignment_key = (dataset id, cell id, cycle index)
+    ```text
+    group_key = (dataset id, cell id, cycle index, protocol)
+    alignment_key = (dataset id, cell id, cycle index)
+    ```
 
     With this setup cycling/HPPC/EIS remain separate streams but can later be
     bundled together for the same cell/cycle.
@@ -242,8 +330,40 @@ class LoaderConfig:
       requested columns into CPU `float32` tensors. RAM scales approximately as
       `rows * selected_columns * 4 bytes`, plus runtime and temporary conversion
       overhead. A synthetic normalized smoke with batch=64, seq=1024, three
-      inputs and one target measured roughly 0.1-0.2M tokens/s for `windowed` and
-      30M+ tokens/s for `full_in_mem` after the cache is built.
+       inputs and one target measured roughly 0.1-0.2M tokens/s for `windowed` and
+       30M+ tokens/s for `full_in_mem` after the cache is built.
+
+    Attributes:
+        split: Index split yielded by the loader.
+        default_window: Window shape used unless a protocol override exists.
+        window_by_protocol: Protocol-specific window overrides.
+        seed: Reproducible planning and epoch-phase seed.
+        strategy: Sequential windows or shuffled protocol-group streams.
+        protocol_order: Explicit protocol traversal order.
+        stateful_n_windows: Consecutive windows per stateful group, or `-1` for
+            whole-stream mode.
+        cross_protocol_state_carry: `"chain"` groups aligned protocol streams
+            for recurrent state carry.
+        drop_incomplete_batches: Drop plans with fewer than the requested lanes.
+        drop_incomplete_distributed: Equalize plan counts across distributed ranks.
+        data_access: Parquet-window or full-memory access.
+        group_key: Columns identifying a protocol-specific stream.
+        alignment_key: Columns identifying streams that may be aligned.
+        num_workers: PyTorch worker process count.
+        prefetch_factor: Batches prefetched by each worker.
+        persistent_workers: Retain workers between iterations.
+        pin_memory: Pin CPU tensors before device transfer.
+        multiprocessing_context: Worker start method.
+        device: Destination device used by optional prefetch.
+        prefetch_to_device: Asynchronously move batches to CUDA.
+        non_blocking: Use non-blocking tensor transfers where possible.
+
+    Note:
+        Whole-stream shuffled batches truncate all lanes to the shortest lane.
+        Finite stateful groups discard a final group shorter than
+        `stateful_n_windows`. Shuffled protocol groups do not support EIS;
+        sequential mode traverses requested protocols in order. `full_in_mem`
+        requires `num_workers=0`; device prefetch requires CUDA.
     """
 
     split: str = BaseColumns.split.values.train
@@ -280,4 +400,12 @@ class LoaderConfig:
         _validate_loader_strategy(self)
 
     def window_for(self, protocol: DatasetProtocolId) -> WindowConfig:
+        """Return window settings for a protocol.
+
+        Args:
+            protocol: Protocol whose override should be resolved.
+
+        Returns:
+            The protocol override, or `default_window` when no override exists.
+        """
         return self.window_by_protocol.get(protocol, self.default_window)

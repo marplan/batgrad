@@ -60,6 +60,26 @@ def test_shuffled_protocol_schedule_is_reproducible_for_seed_and_epoch() -> None
     assert schedule(69) != schedule(70)
 
 
+def test_sequential_schedule_traverses_every_requested_protocol() -> None:
+    index = make_index(rows=35, split_cell_b=False)
+    config = LoaderConfig(
+        strategy="sequential",
+        default_window=WindowConfig(batch_size=1, seq_len=10),
+        protocol_order=(DatasetProtocolId.cycling, DatasetProtocolId.hppc),
+    )
+
+    plans = build_batch_plans(index, config)
+
+    assert len(plans) == count_batch_plans(index, config)
+    assert {plan.refs[0].protocol for plan in plans} == {
+        DatasetProtocolId.cycling,
+        DatasetProtocolId.hppc,
+    }
+    protocol_sequence = tuple(plan.refs[0].protocol for plan in plans)
+    first_hppc = protocol_sequence.index(DatasetProtocolId.hppc)
+    assert all(protocol == DatasetProtocolId.cycling for protocol in protocol_sequence[:first_hppc])
+
+
 def test_cross_protocol_state_carry_chains_by_alignment_key() -> None:
     index = make_index(rows=35, split_cell_b=False)
     config = LoaderConfig(
