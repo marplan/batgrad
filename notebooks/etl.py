@@ -2,7 +2,7 @@
 
 import marimo
 
-__generated_with = "0.23.10"
+__generated_with = "0.23.13"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -22,7 +22,7 @@ with app.setup:
     )
     from batgrad.logging import configure_logger
     from batgrad.notebook_helpers import make_plot_inspection_result, open_local_store_status
-    from notebooks.etl_helpers import (
+    from notebooks._support.etl_helpers import (
         EtlPlotResult,
         default_stage_widget_columns,
         make_controls,

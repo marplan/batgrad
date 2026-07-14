@@ -1,5 +1,3 @@
-# ruff: noqa: INP001
-
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
@@ -13,8 +11,6 @@ from batgrad.ml.inference import (
     CheckpointSelection,
     InferenceResult,
     discover_checkpoints as discover_checkpoint_paths,
-    evaluate_checkpoints,
-    resolve_device,
 )
 from batgrad.notebook_helpers import wrap_anywidget_blocks
 from batgrad.viz.ml import build_inference_widget, inference_metrics_frame
@@ -53,7 +49,33 @@ def checkpoint_options(root: str | Path = ".") -> tuple[CheckpointInfo, ...]:
     )
 
 
+def checkpoint_discovery_status(
+    root: str | Path,
+) -> tuple[tuple[CheckpointInfo, ...], str | None]:
+    root_path = Path(root).expanduser()
+    if not root_path.exists():
+        return (), f"Checkpoint search root does not exist: {root_path}"
+    if not root_path.is_dir():
+        return (), f"Checkpoint search root is not a directory: {root_path}"
+    checkpoints = checkpoint_options(root_path)
+    if not checkpoints:
+        return (
+            (),
+            f"No checkpoints found under {root_path}. "
+            "Expected files matching **/checkpoints/**/*.pt.",
+        )
+    return checkpoints, None
+
+
 def checkpoint_frame(checkpoints: tuple[CheckpointInfo, ...]) -> pl.DataFrame:
+    if not checkpoints:
+        return pl.DataFrame(
+            schema={
+                "alias": pl.String,
+                "checkpoint": pl.String,
+                "checkpoint_path": pl.String,
+            }
+        )
     return pl.DataFrame(
         {
             "alias": [f"ckpt {idx}" for idx in range(1, len(checkpoints) + 1)],
@@ -91,6 +113,8 @@ def make_inference_submission(
     masked_suffix_steps: str,
     rollout_steps: int,
 ) -> InferenceSubmission:
+    if not checkpoints:
+        raise ValueError("Select at least one checkpoint before running inference")
     parsed_suffix_steps = parse_masked_suffix_steps(masked_suffix_steps)
     return InferenceSubmission(
         submit_id=submit_id,
@@ -125,33 +149,6 @@ def make_inference_request(
     if store is None:
         raise ValueError("Select a valid store root before running inference")
     return InferenceRequest(submission, selected_index_frame.clone(), store)
-
-
-def build_batch_inference(
-    request: InferenceRequest | None,
-) -> tuple[str | None, InferenceResult | None]:
-    if request is None:
-        return None, None
-    try:
-        submission = request.submission
-        result = evaluate_checkpoints(
-            request.store,
-            request.selected_index_frame,
-            submission.checkpoints,
-            device=resolve_device(submission.device),
-            suffix_steps=submission.masked_suffix_steps,
-            rollout_steps=submission.rollout_steps,
-        )
-    except (
-        FileNotFoundError,
-        OSError,
-        TypeError,
-        ValueError,
-        RuntimeError,
-        NotImplementedError,
-    ) as exc:
-        return str(exc), None
-    return None, result
 
 
 def render_batch_result(result: InferenceResult | None, batch_index: int) -> object | None:

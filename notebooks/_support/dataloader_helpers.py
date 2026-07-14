@@ -1,38 +1,34 @@
-# ruff: noqa: INP001
-
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import marimo as mo
-import polars as pl
 
 from batgrad.contracts.mapping import BaseColumns
-from batgrad.contracts.row_ids import ML_INDEX_ROW_ID_COLUMN
-from batgrad.ml.data.config import ScalingRule, ValidationConfig
-from batgrad.ml.data.index import MlDatasetIndex, available_manifest_paths
-from batgrad.ml.data.loader import create_index
+from batgrad.ml.data.index import MlDatasetIndex
 from batgrad.ml.data.materialization import resolve_index_schema_by_protocol
 from batgrad.ml.data.preview import (
     MlBatchPreviewSpec,
     count_ml_batch_preview_groups,
     ml_batch_preview_unavailable_message,
 )
-from batgrad.notebook_helpers import selected_row_ids_from_table, wrap_anywidget_blocks
+from batgrad.notebook_helpers import wrap_anywidget_blocks
 from batgrad.viz.ml import (
     MlBatchPreview,
     build_ml_batch_preview,
     update_ml_batch_preview,
 )
 
-PREVIEW_SCALING: tuple[ScalingRule, ...] = (
-    ScalingRule(BaseColumns.crate, -6.0, 6.0),
-    ScalingRule(BaseColumns.volt, 2.3, 4.6),
-    ScalingRule(BaseColumns.temp, 5.0, 65.0),
-    ScalingRule(BaseColumns.amb_temp, 0.0, 50.0),
-    ScalingRule(BaseColumns.a_heat, 1.0, 50.0),
-    ScalingRule(BaseColumns.dt, 0.0, 10_000.0, transform="log1p"),
-)
+if TYPE_CHECKING:
+    import polars as pl
+
+    from batgrad.ml.data.config import ScalingRule
+
+BATCH_STRATEGY_OPTIONS = {
+    "Shuffled protocol groups": "shuffled_protocol_groups",
+    "Sequential debug": "sequential",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,58 +37,38 @@ class BatchPreviewSubmission:
     spec: MlBatchPreviewSpec
 
 
-def discover_normalized_manifest_status(store: object) -> tuple[tuple[str, ...], str | None]:
-    if store is None:
-        return (), None
-    try:
-        manifests = available_manifest_paths(store)
-    except (FileNotFoundError, OSError, ValueError, TypeError) as exc:
-        return (), f"Could not search for normalized manifests: {exc}"
-    if not manifests:
-        return (
-            (),
-            "No normalized manifests found. Expected files matching "
-            "type=*/dataset=*/source=normalized/manifest.parquet.",
+@dataclass(frozen=True, slots=True)
+class BatchPreviewDisplay:
+    preview: MlBatchPreview
+    view: object
+
+
+def protocol_requires_resubmit(
+    submission: BatchPreviewSubmission | None,
+    active_protocol: str,
+) -> bool:
+    return submission is not None and submission.spec.active_protocol != active_protocol
+
+
+def default_input_columns(shard_columns: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        str(column)
+        for column in (
+            BaseColumns.dt,
+            BaseColumns.crate,
+            BaseColumns.volt,
+            BaseColumns.temp,
+            BaseColumns.amb_temp,
+            BaseColumns.a_heat,
         )
-    return manifests, None
+        if column in shard_columns
+    )
 
 
-def build_index_frame(
-    *,
-    store: object,
-    selected_manifest_commits: dict[str, str],
-    protocols: tuple[object, ...] | None,
-    protocol_mode: str,
-    validation_fraction: float,
-    validation_seed: int,
-    group_by: tuple[str, ...],
-) -> tuple[str | None, pl.DataFrame]:
-    if store is None or not selected_manifest_commits:
-        return None, pl.DataFrame()
-    try:
-        ml_index = create_index(
-            store=store,
-            manifest_paths=selected_manifest_commits,
-            protocols=protocols,
-            protocol_mode=protocol_mode,
-            validation=ValidationConfig.sample(
-                fraction=validation_fraction,
-                seed=validation_seed,
-                group_by=group_by,
-            ),
-        )
-    except (FileNotFoundError, ValueError, TypeError) as exc:
-        return str(exc), pl.DataFrame()
-    return None, ml_index.frame
-
-
-def selected_index_rows(index_frame: pl.DataFrame, index_table: object | None) -> pl.DataFrame:
-    if index_table is None or not index_frame.height:
-        return pl.DataFrame()
-    selected_row_ids = selected_row_ids_from_table(index_table.value)
-    if not selected_row_ids:
-        return pl.DataFrame()
-    return index_frame.filter(pl.col(ML_INDEX_ROW_ID_COLUMN).is_in(selected_row_ids))
+def default_target_columns(shard_columns: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        str(column) for column in (BaseColumns.volt, BaseColumns.temp) if column in shard_columns
+    )
 
 
 def selected_schema_by_protocol(
@@ -153,7 +129,7 @@ def make_batch_preview_submission(
     strategy: str,
     stateful_n_windows: int,
     active_protocol: str,
-    enable_scaling: bool,
+    scaling: tuple[ScalingRule, ...],
 ) -> BatchPreviewSubmission | None:
     if (
         batch_warning is not None
@@ -162,7 +138,6 @@ def make_batch_preview_submission(
         or not target_columns
     ):
         return None
-    scaling = selected_preview_scaling((*input_columns, *target_columns)) if enable_scaling else ()
     return BatchPreviewSubmission(
         submit_id=submit_id,
         spec=MlBatchPreviewSpec(
@@ -179,15 +154,6 @@ def make_batch_preview_submission(
             scaling=scaling,
         ),
     )
-
-
-def selected_preview_scaling(columns: tuple[str, ...]) -> tuple[ScalingRule, ...]:
-    selected = tuple(dict.fromkeys(columns))
-    rules = {rule.name: rule for rule in PREVIEW_SCALING}
-    missing = tuple(column for column in selected if column not in rules)
-    if missing:
-        raise ValueError(f"Missing preview scaling rules for selected ML columns: {missing}")
-    return tuple(rules[column] for column in selected)
 
 
 def build_batch_preview(
@@ -230,27 +196,52 @@ def update_batch_preview(
     batch_group_index: int,
     sample_index: int,
     consecutive_step: int,
-) -> tuple[MlBatchPreview | None, object | None]:
+) -> tuple[str | None, MlBatchPreview | None, object | None]:
     if preview is None:
-        return None, None
+        return None, None, None
     if (
         batch_group_index == preview.spec.batch_group_index
         and sample_index == preview.spec.sample_index
         and consecutive_step == preview.spec.consecutive_step
     ):
-        return preview, None
-    updated = update_ml_batch_preview(
-        preview,
-        batch_group_index,
-        sample_index,
-        consecutive_step,
-    )
+        return None, preview, None
+    try:
+        updated = update_ml_batch_preview(
+            preview,
+            batch_group_index,
+            sample_index,
+            consecutive_step,
+        )
+    except (
+        FileNotFoundError,
+        StopIteration,
+        ValueError,
+        TypeError,
+        RuntimeError,
+        NotImplementedError,
+    ) as exc:
+        return str(exc), None, None
     view = (
         wrap_anywidget_blocks((updated.widget,))[0]
         if updated.widget is not preview.widget
         else None
     )
-    return updated, view
+    return None, updated, view
+
+
+def updated_batch_preview_display(
+    *,
+    previous: BatchPreviewDisplay | None,
+    preview: MlBatchPreview | None,
+    view: object | None,
+) -> BatchPreviewDisplay | None:
+    if preview is None:
+        return previous
+    if view is not None:
+        return BatchPreviewDisplay(preview, view)
+    if previous is not None and previous.preview.widget is preview.widget:
+        return BatchPreviewDisplay(preview, previous.view)
+    return previous
 
 
 def batch_preview_view(
@@ -261,7 +252,6 @@ def batch_preview_view(
     batch_error: str | None,
     preview: MlBatchPreview | None,
     preview_view: object | None,
-    stored_preview_view: object | None,
 ) -> object:
     if batch_warning is not None:
         return mo.callout(batch_warning, kind="warn")
@@ -271,10 +261,10 @@ def batch_preview_view(
         return mo.callout(submission_error, kind="danger")
     if batch_error is not None:
         return mo.callout(batch_error, kind="danger")
-    if preview is not None and (preview_view is not None or stored_preview_view is not None):
+    if preview is not None and preview_view is not None:
         return mo.vstack(
             [
-                preview_view or stored_preview_view,
+                preview_view,
                 mo.md("### Batch metadata"),
                 mo.ui.table(preview.metadata),
             ]

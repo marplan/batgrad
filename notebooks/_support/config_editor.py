@@ -1,4 +1,4 @@
-# ruff: noqa: ANN001, ANN202, C901, E501, FBT003, I002, INP001, PLR0911, PLR0912, PLR0915, PLR1711, PLW2901, Q001, SIM212, TRY300, TRY301
+# ruff: noqa: ANN001, ANN202, C901, E501, FBT003, I002, PLR0911, PLR0915, PLR1711, PLW2901, Q001, SIM212, TRY301
 
 import marimo
 
@@ -7,26 +7,28 @@ app = marimo.App(width="medium")
 
 with app.setup:
     import json
+    import math
     from pathlib import Path
 
     import marimo as mo
 
-    from batgrad.ml.config import (
-        config_to_dict,
-        parse_experiment_config,
+    from notebooks._support.config_helpers import (
+        build_config,
+        load_config_file,
+        save_config_file,
+        scaling_drafts,
     )
 
 
 @app.cell
 def _():
-    config_paths = tuple(str(path) for path in sorted(Path("configs").glob("*.json")))
+    config_paths = tuple(str(path) for path in sorted(Path("configs").rglob("*.json")))
     default_load_path = "configs/ml_baseline.json"
-    load_path = mo.ui.text(
-        value=default_load_path
-        if default_load_path in config_paths or not config_paths
-        else config_paths[0],
-        label="Load config path",
-        full_width=True,
+    load_options = config_paths or (default_load_path,)
+    load_path = mo.ui.dropdown(
+        options=load_options,
+        value=default_load_path if default_load_path in load_options else load_options[0],
+        label="Load config",
     )
     save_path = mo.ui.text(
         value="configs/ml_generated.json",
@@ -56,29 +58,10 @@ def _():
 
 @app.cell
 def _(load_path):
-    def _load_config(path_value: str):
-        path = Path(path_value).expanduser()
-        try:
-            with path.open("r", encoding="utf-8") as file:
-                raw = json.load(file)
-            if not isinstance(raw, dict):
-                return {}, None, "Config root must be a JSON object"
-            try:
-                parse_experiment_config(raw)
-                schema_error = None
-            except (TypeError, ValueError) as exc:
-                schema_error = str(exc)
-            return raw, None, schema_error
-        except (
-            FileNotFoundError,
-            OSError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-        ) as exc:
-            return None, str(exc), None
-
-    loaded_config, load_error, loaded_schema_error = _load_config(str(load_path.value))
+    _loaded = load_config_file(str(load_path.value))
+    loaded_config = _loaded.raw
+    load_error = _loaded.load_error
+    loaded_schema_error = _loaded.schema_error
     return load_error, loaded_config, loaded_schema_error
 
 
@@ -201,6 +184,41 @@ def _():
             result[path] = commit
         return result, errors
 
+    def scaling_rule_values(entries: object):
+        if not isinstance(entries, list | tuple):
+            return [], ["data.scaling must contain one rule per selected column"]
+        result = []
+        errors = []
+        for index, entry in enumerate(entries):
+            column = str(entry["column"])
+            try:
+                input_min = float(entry["input_min"].value)
+                input_max = float(entry["input_max"].value)
+                output_min = float(entry["output_min"].value)
+                output_max = float(entry["output_max"].value)
+            except (TypeError, ValueError):
+                errors.append(
+                    f"data.scaling[{index}] {column!r}: bounds must be finite numbers"
+                )
+                continue
+            if not all(math.isfinite(value) for value in (input_min, input_max, output_min, output_max)):
+                errors.append(
+                    f"data.scaling[{index}] {column!r}: bounds must be finite numbers"
+                )
+                continue
+            result.append(
+                {
+                    "column": column,
+                    "input_min": input_min,
+                    "input_max": input_max,
+                    "output_min": output_min,
+                    "output_max": output_max,
+                    "clip": bool(entry["clip"].value),
+                    "transform": str(entry["transform"].value),
+                }
+            )
+        return result, errors
+
     def nullable_bool_value(value: object) -> str:
         if isinstance(value, str) and value in {"inherit/null", "true", "false"}:
             return str(value)
@@ -227,15 +245,14 @@ def _():
     return (
         dict_entry_values,
         float_dict_entry_values,
-        json_value,
         manifest_values,
         nonempty_values,
         nullable_bool_value,
-        parse_json_field,
         parse_nullable_bool,
         parse_nullable_int,
         parse_nullable_str,
         path_value,
+        scaling_rule_values,
         set_path,
     )
 
@@ -252,9 +269,8 @@ def _():
 
     def info_icon(tooltip: str):
         safe_tooltip = safe_html_attr(tooltip)
-        return mo.md(
-            f'''
-            <div
+        return mo.Html(
+            f'''<span
               data-tooltip="{safe_tooltip}"
               style="
                 color: rgb(70, 167, 88);
@@ -262,18 +278,19 @@ def _():
                 border: 1px solid rgb(70, 167, 88);
                 width: 16px;
                 height: 16px;
-                border-radius: 80%;
+                box-sizing: border-box;
+                border-radius: 50%;
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
+                line-height: 1;
                 font-weight: bold;
                 cursor: help;
-                margin-left: 0.25rem;
-                margin-right: 0.25rem;
+                margin-inline: 0.375rem;
+                flex: 0 0 auto;
                 text-decoration: none;
               "
-            >i</div>
-            '''
+            >i</span>'''
         )
 
     def with_help(widget: object, tooltip: str | None = None, *, align: str = "center"):
@@ -282,18 +299,18 @@ def _():
         return mo.hstack(
             [widget, info_icon(tooltip)],
             justify="start",
-            gap="1rem",
+            gap=0.5,
             align=align,
         )
 
     def dynamic_array(array_widget: object, count_widget: object, tooltip: str | None = None):
         if isinstance(array_widget, list | tuple):
-            array_widget = mo.vstack(list(array_widget), gap="0.15rem")
+            array_widget = mo.vstack(list(array_widget), gap=0.15)
         items = [array_widget]
         if tooltip is not None:
             items.append(info_icon(tooltip))
         items.append(count_widget.style({"width": "3rem"}))
-        return mo.hstack(items, justify="start", gap="1rem", align="start")
+        return mo.hstack(items, justify="start", gap=0.5, align="start")
 
     def tree_array_rows(
         row_widgets: tuple[object, ...], count_widget: object, tooltip: str | None = None
@@ -306,7 +323,7 @@ def _():
         first_row = mo.hstack(
             first_row_items,
             justify="start",
-            gap="1rem",
+            gap=0.5,
             align="center",
         )
         return [first_row, *rows[1:]]
@@ -376,12 +393,12 @@ def _():
             mo.hstack(
                 [key_widget, value_widget],
                 widths=[0.45, 0.55],
-                gap="0.5rem",
+                gap=0.5,
                 align="center",
             )
             for key_widget, value_widget in entry_widgets
         ]
-        return dynamic_array(mo.vstack(rows, gap="0.15rem"), count_widget, tooltip)
+        return dynamic_array(mo.vstack(rows, gap=0.15), count_widget, tooltip)
 
     def dynamic_entries(
         entry_widgets: tuple[object, ...],
@@ -391,7 +408,7 @@ def _():
         entry_tooltip: str | None = None,
     ):
         entries = [with_help(widget, entry_tooltip) for widget in entry_widgets]
-        entries_widget = mo.vstack(entries, gap="0.15rem")
+        entries_widget = mo.vstack(entries, gap=0.15)
         return dynamic_array(entries_widget, count_widget, tooltip)
 
     def dynamic_text_array(
@@ -476,12 +493,74 @@ def _():
             for idx in range(count)
         )
 
+    def scaling_rule_widgets(columns: object, values: object, on_change=None):
+        selected_columns = tuple(
+            dict.fromkeys(str(column).strip() for column in columns if str(column).strip())
+        )
+        configured = (
+            tuple(item for item in values if isinstance(item, dict))
+            if isinstance(values, list | tuple)
+            else ()
+        )
+        initial = list(scaling_drafts(selected_columns, configured))
+
+        def update_at(index: int, field: str):
+            def update(value: object):
+                if on_change is None:
+                    return
+                current = [dict(item) for item in initial]
+                current[index][field] = value
+                on_change(current)
+
+            return update
+
+        return tuple(
+            {
+                "column": rule["column"],
+                "input_min": mo.ui.text(
+                    value=str(rule["input_min"]),
+                    label="input min",
+                    on_change=update_at(index, "input_min"),
+                ),
+                "input_max": mo.ui.text(
+                    value=str(rule["input_max"]),
+                    label="input max",
+                    on_change=update_at(index, "input_max"),
+                ),
+                "output_min": mo.ui.text(
+                    value=str(rule["output_min"]),
+                    label="output min",
+                    on_change=update_at(index, "output_min"),
+                ),
+                "output_max": mo.ui.text(
+                    value=str(rule["output_max"]),
+                    label="output max",
+                    on_change=update_at(index, "output_max"),
+                ),
+                "transform": mo.ui.dropdown(
+                    options=("linear", "log1p"),
+                    value=str(rule["transform"])
+                    if str(rule["transform"]) in {"linear", "log1p"}
+                    else "linear",
+                    label="transform",
+                    on_change=update_at(index, "transform"),
+                ),
+                "clip": mo.ui.checkbox(
+                    value=bool(rule["clip"]),
+                    label="clip",
+                    on_change=update_at(index, "clip"),
+                ),
+            }
+            for index, rule in enumerate(initial)
+        )
+
     return (
         dict_entry_widgets,
         dynamic_dict_entries,
         dynamic_manifest_array,
         dynamic_text_array,
         info_icon,
+        scaling_rule_widgets,
         tree_array_rows,
         with_help,
     )
@@ -659,7 +738,6 @@ def _(
     dynamic_manifest_array,
     dynamic_text_array,
     get_form_drafts,
-    json_value,
     load_path,
     loaded_config,
     model_head_layer_count,
@@ -757,16 +835,6 @@ def _(
         int(data_feedback_column_count.value),
         label="feedback_columns",
         on_change=_remember("data.feedback_columns"),
-    )
-    data_scaling = mo.ui.text_area(
-        value=(
-            _source_value("data.scaling", "")
-            if isinstance(_source_value("data.scaling", []), str)
-            else json_value(_source_value("data.scaling", []))
-        ),
-        label="",
-        full_width=True,
-        on_change=_remember("data.scaling"),
     )
     loader_batch_size = mo.ui.number(
         value=int(_source_value("loader.batch_size", 32)),
@@ -1316,7 +1384,6 @@ def _(
         data_manifest_paths,
         data_protocol_mode,
         data_protocols,
-        data_scaling,
         data_store_root,
         data_target_columns,
         loader_batch_size,
@@ -1375,6 +1442,48 @@ def _(
         validation_split_groups,
         validation_split_strategy,
     )
+
+
+@app.cell
+def _(
+    data_input_columns,
+    data_target_columns,
+    get_form_drafts,
+    load_path,
+    loaded_config,
+    path_value,
+    scaling_rule_widgets,
+    set_form_drafts,
+):
+    _scaling_load_path = str(load_path.value)
+    _scaling_form_drafts = get_form_drafts()
+    _scaling_form_values = _scaling_form_drafts.get(_scaling_load_path, {})
+    _configured_scaling = (
+        _scaling_form_values["data.scaling"]
+        if "data.scaling" in _scaling_form_values
+        else path_value(loaded_config, "data.scaling", [])
+    )
+    _scaling_columns = tuple(
+        dict.fromkeys(
+            str(widget.value).strip()
+            for widget in (*data_input_columns, *data_target_columns)
+            if str(widget.value).strip()
+        )
+    )
+
+    def _remember_scaling(value):
+        drafts = dict(get_form_drafts())
+        current = dict(drafts.get(_scaling_load_path, {}))
+        current["data.scaling"] = value
+        drafts[_scaling_load_path] = current
+        set_form_drafts(drafts)
+
+    data_scaling = scaling_rule_widgets(
+        _scaling_columns,
+        _configured_scaling,
+        on_change=_remember_scaling,
+    )
+    return (data_scaling,)
 
 
 @app.cell
@@ -1695,7 +1804,6 @@ def _(
     optim_eps,
     optim_lr,
     optim_weight_decay,
-    parse_json_field,
     parse_nullable_bool,
     parse_nullable_int,
     parse_nullable_str,
@@ -1706,6 +1814,7 @@ def _(
     run_output_dir,
     run_seed,
     run_use_amp,
+    scaling_rule_values,
     scheduler_kind,
     scheduler_min_lr_ratio,
     scheduler_warmup_ratio,
@@ -1749,12 +1858,9 @@ def _(
         manifest,
     )
 
-    for path, widget in (("data.scaling", data_scaling),):
-        parsed, error = parse_json_field(path, str(widget.value))
-        if error is not None:
-            build_errors.append(error)
-        else:
-            set_path(generated_config, path, parsed)
+    scaling, scaling_errors = scaling_rule_values(data_scaling)
+    build_errors.extend(scaling_errors)
+    set_path(generated_config, "data.scaling", scaling)
 
     try:
         stateful_n_windows = int(loader_stateful_n_windows.value)
@@ -2110,18 +2216,12 @@ def _(
     except (TypeError, ValueError) as exc:
         build_errors.append(str(exc))
 
-    try:
-        if build_errors:
-            raise ValueError("; ".join(build_errors))
-        validated_config = parse_experiment_config(generated_config)
-        generated_config = config_to_dict(validated_config)
-        validation_error = None
-    except (TypeError, ValueError) as exc:
-        validation_error = str(exc)
-        if build_errors:
-            generated_config = {}
-    generated_json = json.dumps(generated_config, indent=2)
-    return generated_config, generated_json, validation_error
+    _built = build_config(generated_config, build_errors)
+    generated_config = _built.raw
+    experiment_config = _built.experiment
+    generated_json = _built.json
+    validation_error = _built.error
+    return experiment_config, generated_config, generated_json, validation_error
 
 
 @app.cell
@@ -2154,19 +2254,21 @@ def _(
                 )
             )
             return next_value
-        path = Path(str(save_path.value)).expanduser()
-        if path.exists() and not bool(overwrite_existing.value):
+        try:
+            path = save_config_file(
+                str(save_path.value),
+                generated_json,
+                overwrite=bool(overwrite_existing.value),
+            )
+        except FileExistsError as exc:
             set_action_status(
                 (
                     _current_load_path,
-                    f"Not saved: {path} exists. Check overwrite to replace it.",
+                    f"Not saved: {exc.args[0]} exists. Check overwrite to replace it.",
                     "warn",
                 )
             )
             return next_value
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(generated_json + "\n", encoding="utf-8")
         except OSError as exc:
             set_action_status((_current_load_path, f"Not saved: {exc}", "danger"))
             return next_value
@@ -2225,12 +2327,27 @@ def _(
         status_kind = "warn"
     else:
         status_message, status_kind = "Loaded config", "success"
+    scaling_fields = {
+        str(entry["column"]): {
+            "input_min": entry["input_min"],
+            "input_max": entry["input_max"],
+            "output_min": entry["output_min"],
+            "output_max": entry["output_max"],
+            "transform": entry["transform"],
+            "clip": entry["clip"],
+        }
+        for entry in data_scaling
+    }
+    if not scaling_fields:
+        scaling_fields = {
+            "status": mo.md("Select input or target columns to configure scaling.")
+        }
     mo.vstack(
         [
             mo.md("# Create ML Config"),
             mo.hstack([load_path, save_path], justify="start"),
             overwrite_existing,
-            mo.hstack([validate_button, save_button], justify="start", gap="0.75rem"),
+            mo.hstack([validate_button, save_button], justify="start", gap=0.75),
             mo.callout(status_message, kind=status_kind),
             mo.md("## data"),
             mo.tree(
@@ -2268,11 +2385,7 @@ def _(
                         data_feedback_column_count,
                         "Targets also present as inputs for autoregressive feedback.",
                     ),
-                    "scaling": with_help(
-                        data_scaling,
-                        "Raw JSON scaling rules. Fields: column, input_min, input_max, output_min, output_max, clip, transform. Transforms: linear or log1p. Every target column needs a rule.",
-                        align="start",
-                    ),
+                    "scaling": scaling_fields,
                 },
                 label="data",
             ),
@@ -2351,7 +2464,7 @@ def _(
                 "kind": mo.hstack(
                     [layer["kind"], count_widget.style({"width": "3rem"})],
                     justify="start",
-                    gap="1rem",
+                    gap=0.5,
                     align="center",
                 )
                 if idx == 0
@@ -2382,7 +2495,7 @@ def _(
                         count_widget.style({"width": "3rem"}),
                     ],
                     justify="start",
-                    gap="1rem",
+                    gap=0.5,
                     align="center",
                 )
             )
@@ -2499,7 +2612,7 @@ def _(
                     validation_split_group_count.style({"width": "3rem"}),
                 ],
                 justify="start",
-                gap="1rem",
+                gap=0.5,
                 align="start",
             )
             if idx == 0
@@ -2525,7 +2638,7 @@ def _(
                     validation_split_group_count.style({"width": "3rem"}),
                 ],
                 justify="start",
-                gap="1rem",
+                gap=0.5,
             ),
         )
     validation_split_fields = {

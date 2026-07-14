@@ -1,4 +1,4 @@
-# ruff: noqa: ANN401, INP001, TC001
+# ruff: noqa: ANN401, TC001
 
 from __future__ import annotations
 

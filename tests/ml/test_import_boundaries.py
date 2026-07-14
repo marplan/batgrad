@@ -3,6 +3,18 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+NOTEBOOK_ENTRYPOINTS = {
+    "config.py",
+    "dataloader.py",
+    "etl.py",
+    "inference.py",
+    "training.py",
+}
+
+
+def test_notebook_entrypoints_use_current_names() -> None:
+    assert {path.name for path in Path("notebooks").glob("*.py")} == NOTEBOOK_ENTRYPOINTS
+
 
 def test_ml_does_not_import_data_package_or_notebooks() -> None:
     for path in Path("batgrad/ml").rglob("*.py"):
@@ -63,7 +75,10 @@ def test_inference_notebook_does_not_implement_model_execution() -> None:
         "batgrad.ml.nn",
         "batgrad.ml.rollout",
     )
-    for path in ("notebooks/inference.py", "notebooks/inference_helpers.py"):
+    for path in (
+        "notebooks/inference.py",
+        "notebooks/_support/inference_helpers.py",
+    ):
         tree = ast.parse(Path(path).read_text(encoding="utf-8"), filename=path)
         assert not any(name.startswith(forbidden_imports) for name in _imports(tree))
         calls = {
@@ -87,14 +102,28 @@ def test_ml_notebooks_do_not_import_numerical_execution_modules() -> None:
         "batgrad.ml.validation",
     )
     for path in (
-        "notebooks/createconfig.py",
+        "notebooks/config.py",
+        "notebooks/_support/config_editor.py",
+        "notebooks/_support/config_helpers.py",
+        "notebooks/dataloader.py",
+        "notebooks/_support/dataloader_helpers.py",
         "notebooks/inference.py",
-        "notebooks/inference_helpers.py",
-        "notebooks/ml.py",
-        "notebooks/ml_helpers.py",
+        "notebooks/_support/inference_helpers.py",
+        "notebooks/_support/ml_data_helpers.py",
     ):
         tree = ast.parse(Path(path).read_text(encoding="utf-8"), filename=path)
         assert not any(name.startswith(forbidden_imports) for name in _imports(tree))
+
+
+def test_training_notebook_keeps_execution_in_support_module() -> None:
+    tree = ast.parse(Path("notebooks/training.py").read_text(encoding="utf-8"))
+    forbidden_imports = (
+        "batgrad.ml.loss",
+        "batgrad.ml.masked_suffix",
+        "batgrad.ml.objective",
+        "batgrad.ml.validation",
+    )
+    assert not any(name.startswith(forbidden_imports) for name in _imports(tree))
 
 
 def _imports(tree: ast.AST) -> tuple[str, ...]:

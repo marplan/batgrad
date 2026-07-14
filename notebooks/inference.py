@@ -2,22 +2,30 @@
 
 import marimo
 
-__generated_with = "0.23.11"
+__generated_with = "0.23.14"
 app = marimo.App(width="medium")
 
 with app.setup:
     import os
 
     import marimo as mo
+    import polars as pl
 
     from batgrad.logging import configure_logger
+    from batgrad.ml.data.config import ValidationConfig
+    from batgrad.ml.data.index import MlDatasetIndex
+    from batgrad.ml.data.loader import create_index
     from batgrad.ml.data.preview import (
         available_protocols,
         default_validation_group_by,
         load_manifest_preview,
         validation_group_options,
     )
-    from batgrad.ml.inference import available_devices
+    from batgrad.ml.inference import (
+        available_devices,
+        evaluate_checkpoints,
+        resolve_device,
+    )
     from batgrad.notebook_helpers import (
         make_selectable_table,
         manifest_commit_lines,
@@ -25,10 +33,9 @@ with app.setup:
         parse_manifest_commits,
     )
     from batgrad.viz.ml import inference_group_label
-    from notebooks.inference_helpers import (
-        build_batch_inference,
+    from notebooks._support.inference_helpers import (
+        checkpoint_discovery_status,
         checkpoint_frame,
-        checkpoint_options,
         inference_view as render_inference_view,
         make_checkpoint_table,
         make_inference_request,
@@ -36,8 +43,7 @@ with app.setup:
         render_batch_result,
         selected_checkpoints_from_table,
     )
-    from notebooks.ml_helpers import (
-        build_index_frame,
+    from notebooks._support.ml_data_helpers import (
         discover_normalized_manifest_status,
         selected_index_rows,
     )
@@ -139,16 +145,30 @@ def _(
     validation_fraction,
     validation_seed,
 ):
-    index_error, index_frame = build_index_frame(
-        store=store,
-        selected_manifest_commits=selected_manifest_commits,
-        protocols=tuple(protocol_select.value) or None,
-        protocol_mode=protocol_mode.value,
-        validation_fraction=float(validation_fraction.value),
-        validation_seed=int(validation_seed.value),
-        group_by=tuple(group_by.value),
-    )
-    return index_error, index_frame
+    if store is None or not selected_manifest_commits:
+        ml_index = None
+        index_error = None
+        index_frame = pl.DataFrame()
+    else:
+        try:
+            ml_index = create_index(
+                store=store,
+                manifest_paths=selected_manifest_commits,
+                protocols=tuple(protocol_select.value) or None,
+                protocol_mode=protocol_mode.value,
+                validation=ValidationConfig.sample(
+                    fraction=float(validation_fraction.value),
+                    seed=int(validation_seed.value),
+                    group_by=tuple(group_by.value),
+                ),
+            )
+            index_error = None
+            index_frame = ml_index.frame
+        except (FileNotFoundError, TypeError, ValueError) as exc:
+            ml_index = None
+            index_error = str(exc)
+            index_frame = pl.DataFrame()
+    return index_error, index_frame, ml_index
 
 
 @app.cell
@@ -162,28 +182,38 @@ def _(index_error, index_frame):
 @app.cell
 def _(index_frame, index_table):
     selected_index_frame = selected_index_rows(index_frame, index_table)
-    return (selected_index_frame,)
+    selected_index = (
+        MlDatasetIndex(selected_index_frame) if selected_index_frame.height else None
+    )
+    return selected_index, selected_index_frame
 
 
 @app.cell
 def _():
-    checkpoints = checkpoint_options()
+    checkpoint_root = mo.ui.text(value=".", label="Checkpoint search root")
+    return (checkpoint_root,)
+
+
+@app.cell
+def _(checkpoint_root):
+    checkpoints, checkpoint_error = checkpoint_discovery_status(checkpoint_root.value)
     checkpoint_frame_ = checkpoint_frame(checkpoints)
-    checkpoint_table = make_checkpoint_table(checkpoint_frame_)
+    checkpoint_table = make_checkpoint_table(checkpoint_frame_) if checkpoints else None
     _devices = available_devices()
     device_select = mo.ui.dropdown(
         options=_devices,
         value=_devices[1] if len(_devices) > 1 else _devices[0],
         label="Device",
     )
-    return checkpoint_frame_, checkpoint_table, device_select
+    return checkpoint_error, checkpoint_frame_, checkpoint_table, device_select
 
 
 @app.cell
 def _(checkpoint_frame_, checkpoint_table):
-    selected_checkpoints = selected_checkpoints_from_table(
-        checkpoint_table.value,
-        checkpoint_frame_,
+    selected_checkpoints = (
+        selected_checkpoints_from_table(checkpoint_table.value, checkpoint_frame_)
+        if checkpoint_table is not None
+        else ()
     )
     return (selected_checkpoints,)
 
@@ -249,16 +279,45 @@ def _(
         set_inference_request(request)
         return next_value
 
-    run_inference = mo.ui.button(value=0, on_click=commit_inference, label="Run inference")
+    run_inference = mo.ui.button(
+        value=0,
+        on_click=commit_inference,
+        label="Run inference",
+        disabled=not selected_checkpoints,
+    )
     return masked_suffix_steps, rollout_steps, run_inference
 
 
 @app.cell
 def _(get_inference_request, set_inference_result):
-    inference_error, inference_result = build_batch_inference(get_inference_request())
-    if inference_result is not None:
-        set_inference_result(inference_result)
-    return inference_error, inference_result
+    inference_request = get_inference_request()
+    device = None
+    inference_error = None
+    inference_result = None
+    inference_submission = None
+    if inference_request is not None:
+        try:
+            inference_submission = inference_request.submission
+            device = resolve_device(inference_submission.device)
+            inference_result = evaluate_checkpoints(
+                inference_request.store,
+                inference_request.selected_index_frame,
+                inference_submission.checkpoints,
+                device=device,
+                suffix_steps=inference_submission.masked_suffix_steps,
+                rollout_steps=inference_submission.rollout_steps,
+            )
+            set_inference_result(inference_result)
+        except (
+            FileNotFoundError,
+            OSError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            NotImplementedError,
+        ) as exc:
+            inference_error = str(exc)
+    return device, inference_error, inference_request, inference_result, inference_submission
 
 
 @app.cell
@@ -310,11 +369,13 @@ def _(
     manifest_select,
     protocol_mode,
     protocol_select,
+    selected_index,
     store_error,
     store_root,
     validation_fraction,
     validation_seed,
 ):
+    _ = selected_index
     messages = []
     if store_error is not None:
         messages.append(mo.callout(store_error, kind="danger"))
@@ -344,6 +405,8 @@ def _(
 @app.cell
 def _(
     batch_row_select,
+    checkpoint_error,
+    checkpoint_root,
     checkpoint_table,
     device_select,
     inference_view,
@@ -351,11 +414,16 @@ def _(
     rollout_steps,
     run_inference,
 ):
+    checkpoint_view = (
+        mo.callout(checkpoint_error, kind="warn")
+        if checkpoint_error is not None
+        else checkpoint_table
+    )
     mo.vstack(
         [
             mo.md("## Batch inference"),
-            mo.hstack([device_select], justify="start"),
-            checkpoint_table,
+            mo.hstack([checkpoint_root, device_select], justify="start"),
+            checkpoint_view,
             mo.hstack([masked_suffix_steps, rollout_steps], justify="start"),
             run_inference,
             batch_row_select,
