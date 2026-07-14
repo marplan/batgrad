@@ -71,6 +71,7 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         self._trace_axes: dict[int, tuple[str, str]] = {}
         self._initial_samples: dict[int, TraceSample] = {}
         self._initial_annotation_samples: dict[int, TraceSample] = {}
+        self._current_samples: dict[int, TraceSample] | None = None
         self._last_axes: dict[str, object] = {}
         self._last_request_id = 0
         self._closed = False
@@ -175,6 +176,7 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         samples = self._sample_traces(sorted(self._sources), axes={})
         annotation_samples = self._sample_annotations(sorted(self._annotation_sources), axes={})
         self._initial_samples = {sample.trace_idx: sample for sample in samples}
+        self._current_samples = dict(self._initial_samples)
         self._initial_annotation_samples = {
             sample.trace_idx: sample for sample in annotation_samples
         }
@@ -217,7 +219,14 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
             trace_indices.append(trace_idx)
 
         samples = self._sample_traces(trace_indices, axes=self._last_axes)
-        status = _status_text(samples)
+        if self._current_samples is None:
+            status_samples = samples
+        else:
+            for sample in samples:
+                if sample.trace_idx in self._current_samples:
+                    self._current_samples[sample.trace_idx] = sample
+            status_samples = list(self._current_samples.values())
+        status = _status_text(status_samples)
         self._status = status
         self._update = {
             "updates": [_sample_payload(sample) for sample in samples],
@@ -310,6 +319,7 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         self._last_axes = axes
         self._last_request_id = int(str(evt.get("_rid") or 0))
         samples = self._sample_traces(indices, axes=axes)
+        self._current_samples = {sample.trace_idx: sample for sample in samples}
         annotation_samples = self._sample_annotations(annotation_indices, axes=axes)
         status = _status_text(samples)
         self._status = status
@@ -360,6 +370,7 @@ class PlotlyTraceResampler(anywidget.AnyWidget):
         self._trace_axes.clear()
         self._initial_samples.clear()
         self._initial_annotation_samples.clear()
+        self._current_samples = None
         self._last_axes.clear()
         self._fig_json = {"data": [], "layout": {}}
         self._update = {"updates": [], "status": "Closed", "_rid": self._last_request_id}

@@ -4,8 +4,13 @@ from dataclasses import replace
 
 import torch
 
-from batgrad.ml.inference import InferenceResult
-from batgrad.viz.ml import _inference_protocol, _rollout_target_time_axis
+from batgrad.ml.inference import InferencePrediction, InferenceResult
+from batgrad.viz.ml import (
+    _inference_protocol,
+    _rollout_target_time_axis,
+    build_inference_widget,
+)
+from batgrad.viz.plotting import COLORWAY
 from tests.ml.conftest import make_config
 
 
@@ -41,3 +46,33 @@ def test_inference_protocol_comes_from_selected_batch_lane() -> None:
     )
 
     assert str(_inference_protocol(result, 0)) == "HPPC"
+
+
+def test_default_inference_colors_start_with_visible_roles() -> None:
+    config = make_config()
+    sequence_len = 3
+    prediction = InferencePrediction(
+        checkpoint_alias="checkpoint",
+        checkpoint_path="checkpoint.pt",
+        suffix_steps=0,
+        predictions=torch.zeros((1, sequence_len, len(config.data.target_columns))),
+        metrics=None,
+        target_start=0,
+    )
+    result = InferenceResult(
+        config=config,
+        inputs=torch.zeros((1, sequence_len, len(config.data.input_columns))),
+        targets=torch.zeros((1, sequence_len, len(config.data.target_columns))),
+        predictions=(prediction,),
+        context_len=sequence_len,
+        rollout_len=0,
+        group_keys=(("dataset", "cell", 1, "cycling"),),
+        warning=None,
+    )
+
+    widget = build_inference_widget(result, 0)
+
+    colors_by_name = {trace.name: trace.line.color for trace in widget._fig.data}
+    assert colors_by_name["ground truth"] == COLORWAY[0]
+    prediction_name = next(name for name in colors_by_name if name.startswith("prediction"))
+    assert colors_by_name[prediction_name] == COLORWAY[1]

@@ -122,6 +122,29 @@ def test_multi_trace_budget_is_split_per_visible_trace() -> None:
     assert len(widget._fig_json["data"][1]["x"]) <= 3
 
 
+def test_partial_raw_trace_update_preserves_downsampled_status() -> None:
+    stream = _frame()
+    overlay = stream.slice(0, 2)
+    widget = _two_trace_widget(max_points_per_trace=5, max_points_per_figure=6)
+    for idx, frame in enumerate((stream, overlay)):
+        widget.register_trace(
+            idx,
+            frame.lazy(),
+            BaseColumns.time,
+            BaseColumns.volt,
+            MinMaxLTTBResamplingSpec(BaseColumns.time, BaseColumns.volt, points=8),
+            row_count=frame.height,
+        )
+
+    widget.show()
+    assert widget._status.startswith("Downsampled:")
+
+    widget.update_registered_traces(((1, overlay.lazy(), overlay.height),))
+
+    assert widget._status.startswith("Downsampled:")
+    assert str(widget._update["status"]).startswith("Downsampled:")
+
+
 def test_new_trace_registered_after_show_receives_budget_on_update() -> None:
     frame = _frame()
     widget = _two_trace_widget(max_points_per_trace=5, max_points_per_figure=6)

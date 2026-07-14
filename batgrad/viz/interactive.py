@@ -50,6 +50,10 @@ if TYPE_CHECKING:
 _EIS_COLS = set(EIS_COLUMNS)
 
 
+def _consume_overlay_showlegend(parent_label: str, shown_labels: set[str]) -> bool:
+    return consume_showlegend(parent_label, shown_labels)
+
+
 def make_widgets(
     run: InteractiveStageRun,
     cols: list[MappingSpec] | tuple[MappingSpec, ...],
@@ -191,7 +195,7 @@ def make_timeseries_widget(
                     col=1,
                     label="ingested",
                     legendgroup=label,
-                    showlegend=consume_showlegend("ingested", shown_overlay_labels),
+                    showlegend=_consume_overlay_showlegend(label, shown_overlay_labels),
                     max_points_per_trace=max_points_per_trace,
                 )
     return widget if fig.data else None

@@ -59,7 +59,7 @@ class MlBatchPreview:
     spec: MlBatchPreviewSpec
 
 
-_TRACE_LABELS = ("stream", "input batch", "target batch")
+_TRACE_LABELS = ("input", "target", "prediction", "stream")
 PLOT_SEQUENCE_RANK = 2
 
 
@@ -207,10 +207,19 @@ def _rollout_target_time_axis(config: ExperimentConfig, inputs: torch.Tensor) ->
     return [float(value) for value in target_elapsed.tolist()]
 
 
-def build_inference_widget(result: InferenceResult, batch_index: int) -> PlotlyTraceResampler:
+def build_inference_widget(
+    result: InferenceResult,
+    batch_index: int,
+    *,
+    include_inputs: bool = False,
+    index_axis: bool = False,
+    standard_role_labels: bool = False,
+) -> PlotlyTraceResampler:
     config = result.config
     columns = tuple(dict.fromkeys((*config.data.input_columns, *config.data.target_columns)))
-    axis_col = _axis_column(_inference_protocol(result, batch_index))
+    axis_col = (
+        "sequence index" if index_axis else _axis_column(_inference_protocol(result, batch_index))
+    )
     scaling = scaling_rules(config)
     inputs = inverse_scale_tensor(result.inputs, config.data.input_columns, scaling)
     targets = inverse_scale_tensor(result.targets, config.data.target_columns, scaling)
@@ -236,35 +245,80 @@ def build_inference_widget(result: InferenceResult, batch_index: int) -> PlotlyT
         batch_index,
         columns,
         axis_col,
+        index_axis=index_axis,
     )
     lf = frame.lazy()
-    trace_labels = (
-        "ground truth",
-        *(_inference_prediction_label(series) for series in predictions),
+    prediction_labels = tuple(
+        "prediction"
+        if standard_role_labels and len(predictions) == 1
+        else _inference_prediction_label(series)
+        for series in predictions
+    )
+    trace_labels = tuple(
+        dict.fromkeys(
+            (
+                *(("input", "target") if include_inputs else ("ground truth",)),
+                *prediction_labels,
+            )
+        )
     )
     colors = colors_by_label(trace_labels)
     shown_roles: set[str] = set()
     for row_idx, column in enumerate(columns, start=1):
         target_idx = _column_index(config.data.target_columns, column)
-        add_registered_xy_trace(
-            fig,
-            widget,
-            lf,
-            x_col=axis_col,
-            y_col=_inference_base_col(column),
-            row=row_idx,
-            col=1,
-            label="ground truth",
-            color=colors["ground truth"],
-            showlegend=consume_showlegend("ground truth", shown_roles),
-            hovertemplate=axis_hovertemplate("ground truth", axis_col, _inference_base_col(column)),
-            row_count=frame.height,
-        )
+        input_idx = _column_index(config.data.input_columns, column)
+        if include_inputs:
+            if input_idx is not None:
+                add_registered_xy_trace(
+                    fig,
+                    widget,
+                    lf,
+                    x_col=axis_col,
+                    y_col=_inference_input_col(column),
+                    row=row_idx,
+                    col=1,
+                    label="input",
+                    color=colors["input"],
+                    showlegend=consume_showlegend("input", shown_roles),
+                    hovertemplate=axis_hovertemplate("input", axis_col, column),
+                    row_count=frame.height,
+                )
+            if target_idx is not None:
+                add_registered_xy_trace(
+                    fig,
+                    widget,
+                    lf,
+                    x_col=axis_col,
+                    y_col=_inference_target_col(column),
+                    row=row_idx,
+                    col=1,
+                    label="target",
+                    color=colors["target"],
+                    showlegend=consume_showlegend("target", shown_roles),
+                    hovertemplate=axis_hovertemplate("target", axis_col, column),
+                    row_count=frame.height,
+                )
+        else:
+            add_registered_xy_trace(
+                fig,
+                widget,
+                lf,
+                x_col=axis_col,
+                y_col=_inference_base_col(column),
+                row=row_idx,
+                col=1,
+                label="ground truth",
+                color=colors["ground truth"],
+                showlegend=consume_showlegend("ground truth", shown_roles),
+                hovertemplate=axis_hovertemplate(
+                    "ground truth", axis_col, _inference_base_col(column)
+                ),
+                row_count=frame.height,
+            )
         if target_idx is None:
             continue
-        for series in predictions:
+        for series, series_label in zip(predictions, prediction_labels, strict=True):
             y_col = _inference_prediction_col(column, series)
-            series_label = _inference_prediction_label(series)
             add_registered_xy_trace(
                 fig,
                 widget,
@@ -312,14 +366,27 @@ def _inference_plot_frame(
     batch_index: int,
     columns: tuple[str, ...],
     axis_col: str,
+    *,
+    index_axis: bool = False,
 ) -> pl.DataFrame:
-    x_values = _rollout_target_time_axis(config, inputs[batch_index])
+    x_values = (
+        [float(idx) for idx in range(int(inputs.shape[1]))]
+        if index_axis
+        else _rollout_target_time_axis(config, inputs[batch_index])
+    )
     data: dict[str, list[float | None]] = {axis_col: [float(value) for value in x_values]}
     for column in columns:
         target_idx = _column_index(config.data.target_columns, column)
         input_idx = _column_index(config.data.input_columns, column)
+        if input_idx is not None:
+            data[_inference_input_col(column)] = [
+                float(value) for value in inputs[batch_index, :, input_idx].tolist()
+            ]
         if target_idx is not None:
             base = targets[batch_index, :, target_idx].tolist()
+            data[_inference_target_col(column)] = [
+                None if value is None else float(value) for value in base
+            ]
             for series in predictions:
                 prediction = [None] * len(x_values)
                 values = series.predictions[batch_index, :, target_idx].tolist()
@@ -333,6 +400,14 @@ def _inference_plot_frame(
             None if value is None else float(value) for value in base
         ]
     return pl.DataFrame(data)
+
+
+def _inference_input_col(column: str) -> str:
+    return f"input::{column}"
+
+
+def _inference_target_col(column: str) -> str:
+    return f"target::{column}"
 
 
 def _column_index(columns: tuple[str, ...], column: str) -> int | None:
@@ -782,9 +857,9 @@ def _iter_batch_overlay_frames(
     for spec in specs:
         selected = stream.select(spec.x, spec.y)
         if spec.input:
-            frames.append(("input batch", spec, _overlay_frame(selected, offset, rows)))
+            frames.append(("input", spec, _overlay_frame(selected, offset, rows)))
         if spec.target:
-            frames.append(("target batch", spec, _overlay_frame(selected, offset + 1, rows)))
+            frames.append(("target", spec, _overlay_frame(selected, offset + 1, rows)))
     return frames
 
 
