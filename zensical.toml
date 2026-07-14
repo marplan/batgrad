@@ -1,6 +1,6 @@
 [project]
 site_name = "batgrad docs"
-site_description = "Data processing tools for battery degradation datasets."
+site_description = "Data processing and machine-learning tools for battery degradation datasets."
 site_author = "batgrad contributors"
 copyright = "Copyright &copy; 2026 The authors"
 
@@ -24,6 +24,13 @@ nav = [
       { "Ingested" = "api/data/ingested.md" },
       { "Normalized" = "api/data/normalized.md" },
       { "Transformations" = "api/data/transformations.md" },
+    ] },
+    { "ML" = [
+      { "Configuration" = "api/ml/configuration.md" },
+      { "Data Loading" = "api/ml/data-loading.md" },
+      { "Models" = "api/ml/models.md" },
+      { "Training" = "api/ml/training.md" },
+      { "Inference" = "api/ml/inference.md" },
     ] },
   ] },
 ]

@@ -10,9 +10,14 @@ a fixed model package. Use the [Quick Start](quick-start.md) for the operational
 workflow, and use the notebooks to inspect each stage interactively:
 
 - `notebooks/etl.py` explores ingestion, transformations, and normalization.
-- `notebooks/ml.py` explores manifests, splits, streams, and batches.
-- `notebooks/createconfig.py` builds and validates experiment configurations.
+- `notebooks/dataloader.py` exposes manifests, indexes, loaders, and batches.
+- `notebooks/config.py` builds and validates experiment configurations.
+- `notebooks/training.py` steps through real training batches and plots exact objective traces.
 - `notebooks/inference.py` loads checkpoints and runs model inference.
+
+These five files are the standalone notebook entrypoints. Open them in Marimo edit
+mode to add investigation cells; modules under `notebooks/_support/` are shared
+implementation details rather than additional entrypoints.
 
 ## Data flow
 
@@ -130,7 +135,8 @@ references for the detailed API.
 The ML layer consumes normalized manifests, not raw files. An experiment
 configuration defines the complete run contract: data revisions, protocols,
 columns, scaling, windows, model structure, optimization, validation, logging,
-and checkpoint behavior.
+and checkpoint behavior. The public developer entry points are collected in the
+[ML API reference](api/ml/configuration.md).
 
 ```text
 select normalized manifests
@@ -142,6 +148,26 @@ select normalized manifests
   -> validate held-out windows and anchored rollouts
   -> load a checkpoint for inference
 ```
+
+### Current implementation boundaries
+
+The ML layer is an experiment template rather than a production training
+platform. Its current supported boundary is intentionally narrow:
+
+- Every selected input and target has one explicit scaling rule in the saved
+  experiment configuration.
+- The built-in trainer uses categorical cross-entropy, AdamW, and either cosine
+  warmup or no scheduler.
+- Sequential loading traverses requested protocols in order. Shuffled protocol
+  groups support cycling, HPPC, and RPT, but not EIS.
+- Finite stateful groups can drop incomplete tails, and whole-stream batches
+  truncate longer lanes to the shortest lane.
+- Mamba requires Linux, CUDA, and the `ml` dependency group; cross-window state
+  carry requires SISO layers.
+- Checkpoints contain full training state, but `run.init_from` restores compatible
+  model weights only and is not a resume mechanism.
+- Comparative inference starts each selected stream at source-row offset zero and
+  does not currently support EIS.
 
 ### Configure the experiment
 
@@ -157,7 +183,9 @@ datasets to participate in the same run.
 The selected manifests are checked against requested protocols, columns, and
 scaling ranges before training. Splits are formed from manifest task metadata
 rather than random rows, keeping related streams together and reducing leakage
-between nearby measurements.
+between nearby measurements. Fractional validation sampling selects
+`int(group_count * fraction)` groups, so small datasets may need explicit groups
+to ensure that a validation split exists.
 
 ### Build temporal windows
 
@@ -181,6 +209,10 @@ Loader strategies determine how windows are ordered and shuffled. Stateful
 groups can retain consecutive windows from one stream when a model needs
 continuity beyond one context. Dataset, cell, cycle, and protocol metadata
 remain available for grouping and validation selection.
+
+Null input values use the `-2.0` sentinel. Null targets remain `NaN` and are
+excluded by the finite-target loss mask. The row mask separately identifies
+positions backed by real source rows rather than padded tail rows.
 
 ### Encode and mix features
 
@@ -444,7 +476,7 @@ at the first or final step of a group, on group changes, or whenever steps are
 not consecutive. Ordinary teacher-forced training does not carry state between
 loader batches.
 
-## Validation
+## ML validation
 
 Validation uses held-out groups selected from manifest metadata. It measures two
 different behaviors because window-level accuracy alone does not show whether a
@@ -545,9 +577,10 @@ remain an important diagnostic.
 
 An optional rollout extension can continue beyond observed data with configured
 control values. Extension targets are unavailable, so those predictions can be
-inspected but do not contribute to scored validation metrics.
+inspected but do not contribute to scored validation metrics. Inputs omitted from
+the extension's configured values repeat their final observed value.
 
-## Inference and state reuse
+## ML inference and state reuse
 
 The inference notebook delegates checkpoint loading, selected-stream
 materialization, and batched rollout execution to
@@ -590,4 +623,7 @@ unrelated samples.
 
 The manifests and experiment configuration form the stable handoff between data
 preparation, training, validation, and inference, while each part of the
-template remains replaceable as experiments evolve.
+template remains replaceable as experiments evolve. See the
+[data-loading API](api/ml/data-loading.md), [model API](api/ml/models.md),
+[training entry point](api/ml/training.md), and
+[inference API](api/ml/inference.md) for callable contracts and examples.

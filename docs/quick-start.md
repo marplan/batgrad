@@ -103,6 +103,56 @@ run.clean()
 `protocols` filters protocols, `group_values` filters task keys such as cell or
 cycle, and `scratch_store` receives temporary outputs.
 
+## Machine Learning
+
+The ML layer reads normalized manifests. Complete ingestion and normalization
+first, then choose a configuration whose manifest revision and selected columns
+match the normalized data.
+
+The bundled configurations provide useful starting points:
+
+- `configs/ml_dry_run_cpu.json` runs a short
+  attention/FFN smoke test on CPU without writing run artifacts.
+- `configs/ml_dry_run_gpu.json` runs a short Mamba smoke
+  test on CUDA without writing run artifacts.
+- `configs/ml_baseline.json` is the full CUDA/W&B baseline
+  and writes logs and checkpoints.
+
+Use `notebooks/config.py` to edit the full schema. Its scaling editor derives
+one explicit rule per selected input or target column. Known battery columns start
+with editable suggestions, but the saved JSON always contains the resolved numeric
+rules and should be reviewed against normalized manifest statistics.
+
+Set `data.store_root` in the selected configuration or ensure `DATA_ROOT` points
+to the data store, then run:
+
+```sh
+python scripts/train.py --config configs/ml_dry_run_cpu.json
+```
+
+For file-backed runs, `train_from_config` creates the configured
+`run.output_dir/run.name` directory. If `run.name` is omitted, it uses a local
+timestamp. A named directory that already exists is deleted before the run
+starts.
+
+```text
+<run-dir>/
+  config.json
+  logs/
+    metrics.jsonl
+    payloads.jsonl
+  checkpoints/
+    <run-id-or-name>/
+      latest.pt
+      best_<metric>.pt
+      final.pt
+```
+
+Only enabled logger and checkpoint outputs are created. See
+[ML Configuration](api/ml/configuration.md),
+[ML Data Loading](api/ml/data-loading.md), [ML Models](api/ml/models.md),
+[ML Training](api/ml/training.md), and [ML Inference](api/ml/inference.md).
+
 ## Details
 
 Use the API Reference for implementation details:
@@ -110,3 +160,4 @@ Use the API Reference for implementation details:
 - API Reference > Data
 - API Reference > Contracts
 - API Reference > Datastore
+- API Reference > ML
