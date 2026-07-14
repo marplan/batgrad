@@ -18,12 +18,13 @@ from batgrad.ml.objective import batch_loss_with_metrics
 from batgrad.ml.rollout import predict_context, rollout_batch
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from batgrad.ml.config import ExperimentConfig
     from batgrad.ml.data.batch import Batch
     from batgrad.ml.data.index import MlDatasetIndex
     from batgrad.ml.distributed import DistributedContext
+    from batgrad.ml.objective import ObjectiveTrace
     from batgrad.storage.store import DatasetStoreReader
 
 
@@ -54,6 +55,7 @@ def validate(
     store: DatasetStoreReader,
     device: torch.device,
     dist_ctx: DistributedContext | None = None,
+    trace_callback: Callable[[ObjectiveTrace], None] | None = None,
 ) -> ValidationResult:
     model.eval()
     teacher_forced_metrics = None
@@ -63,6 +65,7 @@ def validate(
             model,
             val_loader,
             device,
+            trace_callback=trace_callback,
         )
     rollout_metrics = None
     rollout_examples: tuple[RolloutExample, ...] = ()
@@ -84,6 +87,8 @@ def _validate_batches(
     model: torch.nn.Module,
     val_loader: Iterable[Batch],
     device: torch.device,
+    *,
+    trace_callback: Callable[[ObjectiveTrace], None] | None = None,
 ) -> LossMetrics | None:
     suffix = resolved_validation_masked_suffix(config)
     metrics: LossMetrics | None = None
@@ -100,6 +105,7 @@ def _validate_batches(
                 suffix=suffix,
                 include_rmse=True,
                 mask_all_valid=batch.all_valid,
+                trace_callback=trace_callback,
             ),
         )
         if idx + 1 >= config.validation.max_tf_batches:

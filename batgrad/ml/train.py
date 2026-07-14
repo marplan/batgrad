@@ -4,6 +4,7 @@ import json
 import math
 import shutil
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -46,7 +47,7 @@ from batgrad.ml.experiment import (
 )
 from batgrad.ml.loggers import NoOpRunLogger, build_logger
 from batgrad.ml.masked_suffix import masked_suffix_windows
-from batgrad.ml.metrics import grad_norm_metrics, loss_metric_payload
+from batgrad.ml.metrics import LossMetrics, grad_norm_metrics, loss_metric_payload
 from batgrad.ml.nn import build_model
 from batgrad.ml.objective import backward_batch_loss_with_metrics
 from batgrad.ml.validation import validate
@@ -59,12 +60,132 @@ if TYPE_CHECKING:
     from batgrad.ml.data.batch import Batch
     from batgrad.ml.data.index import MlDatasetIndex
     from batgrad.ml.nn import MambaCarryState
+    from batgrad.ml.objective import ObjectiveTrace
     from batgrad.ml.validation import ValidationResult
 
 logger = get_logger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class OptimizerStepResult:
+    metrics: LossMetrics
+    total_grad_norm: torch.Tensor
+    grad_metrics: dict[str, float]
+    mamba_states: dict[str, MambaCarryState] | None
+
+
+def build_optimizer(
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+) -> torch.optim.Optimizer:
+    """Build the optimizer configured for a training model."""
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=config.optim.lr,
+        betas=(config.optim.beta1, config.optim.beta2),
+        eps=config.optim.eps,
+        weight_decay=config.optim.weight_decay,
+    )
+
+
+def optimize_batch(
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+    batch: Batch,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.amp.GradScaler,
+    *,
+    collect_metrics: bool,
+    initial_mamba_states: dict[str, MambaCarryState] | None = None,
+    trace_callback: Callable[[ObjectiveTrace], None] | None = None,
+    metric_reducer: Callable[[LossMetrics], LossMetrics] | None = None,
+) -> OptimizerStepResult:
+    """Execute the optimizer update used by both full and interactive training."""
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    return_mamba_states = _should_return_mamba_states(config, batch)
+    loss_metrics = backward_batch_loss_with_metrics(
+        config,
+        model,
+        batch.inputs,
+        batch.targets,
+        batch.mask,
+        device,
+        scaler,
+        suffix=config.train.masked_suffix,
+        collect_metrics=collect_metrics,
+        mask_all_valid=batch.all_valid,
+        initial_mamba_states=initial_mamba_states,
+        return_mamba_states=return_mamba_states,
+        trace_callback=trace_callback,
+    )
+    reported_metrics = loss_metrics if metric_reducer is None else metric_reducer(loss_metrics)
+    scaler.unscale_(optimizer)
+    gradients = (
+        grad_norm_metrics(unwrap_model(model), config, reported_metrics) if collect_metrics else {}
+    )
+    total_grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), config.train.grad_clip_norm
+    )
+    scaler.step(optimizer)
+    scaler.update()
+    scheduler.step()
+    return OptimizerStepResult(
+        reported_metrics,
+        total_grad_norm,
+        gradients,
+        _detach_mamba_states(loss_metrics.mamba_states),
+    )
+
+
 def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, PLR0915
+    """Execute a complete training run from an experiment JSON file.
+
+    The entry point validates the configuration, builds one shared index and the
+    train/validation loaders, constructs the model and optimizer, trains to the
+    explicit or epoch-derived step limit, validates, logs, and saves configured
+    checkpoints. Distributed execution is activated by `torchrun` environment
+    variables and requires CUDA/NCCL.
+
+    Args:
+        path: Experiment JSON path.
+
+    Returns:
+        The created run directory, or `None` for output-free stdout runs.
+
+    Raises:
+        OSError: If configuration, data, output, or checkpoint files cannot be
+            accessed.
+        TypeError: If the JSON schema has incorrect value types.
+        ValueError: If configuration, manifests, runtime, or distributed settings
+            are invalid.
+
+    Examples:
+        Run the bundled CPU smoke experiment:
+
+        ```python
+        from batgrad.ml.train import train_from_config
+
+        run_dir = train_from_config("configs/ml_dry_run_cpu.json")
+        ```
+
+        The equivalent repository command is:
+
+        ```sh
+        python scripts/train.py --config configs/ml_dry_run_cpu.json
+        ```
+
+    Warning:
+        When `run.name` resolves to an existing directory under
+        `run.output_dir`, that directory is removed before training. The
+        `run.init_from` option initializes compatible model weights only; it
+        does not resume optimizer, scheduler, AMP scaler, or training cursor state.
+
+    Note:
+        AMP is CUDA-only. Cross-batch Mamba state carry is unavailable under DDP.
+    """
     config = load_experiment_config(path)
     dist_ctx = init_distributed(config.run.device)
     _validate_distributed_state_carry(config, dist_ctx)
@@ -105,15 +226,7 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
             )
         )
         logger.info("DistributedDataParallel wrapper ready")
-    optimizer = _setup_with_distributed_cleanup(
-        lambda: torch.optim.AdamW(
-            model.parameters(),
-            lr=config.optim.lr,
-            betas=(config.optim.beta1, config.optim.beta2),
-            eps=config.optim.eps,
-            weight_decay=config.optim.weight_decay,
-        )
-    )
+    optimizer = _setup_with_distributed_cleanup(lambda: build_optimizer(config, model))
     scheduler = _setup_with_distributed_cleanup(
         lambda: _build_scheduler(config, optimizer, max_steps)
     )
@@ -165,8 +278,6 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
                 next_step = step + 1
                 should_log = next_step % log_every == 0 or next_step == 1
                 log_token_count += _model_compute_token_count(config, batch)
-                model.train()
-                optimizer.zero_grad(set_to_none=True)
                 if first_train_step:
                     logger.info("Running first training step")
                 carried_mamba_states = _initial_mamba_states_for_batch(
@@ -175,43 +286,29 @@ def train_from_config(path: str | Path) -> Path | None:  # noqa: C901, PLR0912, 
                     carried_stateful_group_idx,
                     carried_stateful_step_idx,
                 )
-                return_mamba_states = _should_return_mamba_states(config, batch)
-                loss_metrics = backward_batch_loss_with_metrics(
+                step_result = optimize_batch(
                     config,
                     model,
-                    batch.inputs,
-                    batch.targets,
-                    batch.mask,
+                    batch,
                     device,
+                    optimizer,
+                    scheduler,
                     scaler,
-                    suffix=config.train.masked_suffix,
                     collect_metrics=should_log,
-                    mask_all_valid=batch.all_valid,
                     initial_mamba_states=carried_mamba_states,
-                    return_mamba_states=return_mamba_states,
+                    metric_reducer=all_reduce_loss_metrics if should_log else None,
                 )
-                carried_mamba_states = _detach_mamba_states(loss_metrics.mamba_states)
+                loss_metrics = step_result.metrics
+                carried_mamba_states = step_result.mamba_states
                 carried_stateful_group_idx = batch.state.stateful_group_idx
                 carried_stateful_step_idx = batch.state.stateful_step_idx
-                log_loss_metrics = (
-                    all_reduce_loss_metrics(loss_metrics) if should_log else loss_metrics
-                )
+                log_loss_metrics = loss_metrics
                 loss = log_loss_metrics.loss
-                scaler.unscale_(optimizer)
-                grad_metrics = (
-                    grad_norm_metrics(unwrap_model(model), config, log_loss_metrics)
-                    if should_log
-                    else {}
-                )
-                total_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), config.train.grad_clip_norm
-                )
+                grad_metrics = step_result.grad_metrics
+                total_grad_norm = step_result.total_grad_norm
                 clip_observed_count += 1
                 if float(total_grad_norm.detach().cpu()) > config.train.grad_clip_norm:
                     clip_trigger_count += 1
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
                 step = next_step
                 if first_train_step:
                     logger.info("First training step complete")

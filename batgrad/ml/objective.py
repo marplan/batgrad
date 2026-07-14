@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -17,10 +18,40 @@ from batgrad.ml.masked_suffix import (
     refresh_mamba_states_from_feedback,
 )
 from batgrad.ml.metrics import LossMetrics
+from batgrad.ml.nn import decode_categorical_logits
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from batgrad.ml.config import ExperimentConfig, MaskedSuffixConfig
+    from batgrad.ml.masked_suffix import MaskedWindowOutput
     from batgrad.ml.nn import MambaCarryState
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectiveWindowTrace:
+    """Exact detached outputs and loss mask for one objective model call."""
+
+    start: int
+    logits: torch.Tensor
+    predictions: torch.Tensor
+    loss_mask: torch.Tensor
+    prediction_slice: slice
+    target_slice: slice
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectiveTrace:
+    """Detached objective inputs plus a merged display trajectory and exact windows."""
+
+    inputs: torch.Tensor
+    targets: torch.Tensor
+    predictions: torch.Tensor
+    mask: torch.Tensor
+    mask_boundaries: tuple[int, ...]
+    context_len: int
+    roll_forward_steps: int
+    windows: tuple[ObjectiveWindowTrace, ...] = ()
 
 
 def batch_loss_with_metrics(
@@ -36,6 +67,7 @@ def batch_loss_with_metrics(
     mask_all_valid: bool | None = None,
     initial_mamba_states: dict[str, MambaCarryState] | None = None,
     return_mamba_states: bool = False,
+    trace_callback: Callable[[ObjectiveTrace], None] | None = None,
 ) -> LossMetrics:
     inputs = inputs.to(device=device)
     targets = targets.to(device=device)
@@ -50,6 +82,7 @@ def batch_loss_with_metrics(
             device,
             include_rmse=include_rmse,
             mask_all_valid=mask_all_valid,
+            trace_callback=trace_callback,
         )
     return masked_suffix_loss_with_metrics(
         config,
@@ -63,6 +96,7 @@ def batch_loss_with_metrics(
         mask_all_valid=mask_all_valid,
         initial_mamba_states=initial_mamba_states,
         return_mamba_states=return_mamba_states,
+        trace_callback=trace_callback,
     )
 
 
@@ -80,6 +114,7 @@ def backward_batch_loss_with_metrics(
     mask_all_valid: bool | None = None,
     initial_mamba_states: dict[str, MambaCarryState] | None = None,
     return_mamba_states: bool = False,
+    trace_callback: Callable[[ObjectiveTrace], None] | None = None,
 ) -> LossMetrics:
     inputs = inputs.to(device=device)
     targets = targets.to(device=device)
@@ -101,6 +136,7 @@ def backward_batch_loss_with_metrics(
             mask_all_valid=mask_all_valid,
             initial_mamba_states=initial_mamba_states,
             return_mamba_states=return_mamba_states,
+            trace_callback=trace_callback,
         )
     metrics = batch_loss_with_metrics(
         config,
@@ -113,6 +149,7 @@ def backward_batch_loss_with_metrics(
         mask_all_valid=mask_all_valid,
         initial_mamba_states=initial_mamba_states,
         return_mamba_states=return_mamba_states,
+        trace_callback=trace_callback,
     )
     scaler.scale(metrics.loss * local_count * backward_scale).backward()
     if collect_metrics:
@@ -130,6 +167,7 @@ def teacher_forced_loss_with_metrics(
     *,
     include_rmse: bool = False,
     mask_all_valid: bool | None = None,
+    trace_callback: Callable[[ObjectiveTrace], None] | None = None,
 ) -> LossMetrics:
     with model_autocast(config, device):
         logits = cast(
@@ -139,7 +177,7 @@ def teacher_forced_loss_with_metrics(
                 mask=attention_mask_or_none(mask, all_valid=mask_all_valid),
             ),
         )
-        return loss_metrics_from_logits(
+        metrics = loss_metrics_from_logits(
             logits,
             targets,
             mask,
@@ -147,6 +185,33 @@ def teacher_forced_loss_with_metrics(
             target_ranges=target_ranges(config, device),
             include_rmse=include_rmse,
         )
+        if trace_callback is not None:
+            with torch.no_grad():
+                predictions = decode_categorical_logits(
+                    logits.detach(), target_ranges(config, device)
+                )
+            trace_callback(
+                ObjectiveTrace(
+                    inputs.detach().cpu(),
+                    targets.detach().cpu(),
+                    predictions.cpu(),
+                    mask.detach().cpu(),
+                    (),
+                    int(inputs.shape[1]),
+                    0,
+                    (
+                        ObjectiveWindowTrace(
+                            0,
+                            logits.detach().cpu(),
+                            predictions.cpu(),
+                            mask.detach().cpu(),
+                            slice(0, int(logits.shape[1])),
+                            slice(0, int(logits.shape[1])),
+                        ),
+                    ),
+                )
+            )
+        return metrics
 
 
 def masked_suffix_loss_with_metrics(
@@ -165,6 +230,7 @@ def masked_suffix_loss_with_metrics(
     mask_all_valid: bool | None = None,
     initial_mamba_states: dict[str, MambaCarryState] | None = None,
     return_mamba_states: bool = False,
+    trace_callback: Callable[[ObjectiveTrace], None] | None = None,
 ) -> LossMetrics:
     context_len = int(inputs.shape[1]) - suffix.roll_forward_steps
     if context_len <= suffix.suffix_steps:
@@ -186,6 +252,13 @@ def masked_suffix_loss_with_metrics(
     final_window_start_states: dict[str, MambaCarryState] | None = None
     final_window_start = 0
     ranges = target_ranges(config, device)
+    trace_predictions = (
+        torch.full_like(targets, float("nan"), device=device)
+        if trace_callback is not None
+        else None
+    )
+    trace_boundaries: list[int] = []
+    trace_windows: list[ObjectiveWindowTrace] = []
     for start, current_suffix_steps, next_shift_steps in windows:
         final_window_start = start
         final_window_start_states = states
@@ -216,6 +289,18 @@ def masked_suffix_loss_with_metrics(
             len(config.data.target_columns),
             loss_on_masked_only=suffix.loss_on_masked_only,
         )
+        if trace_predictions is not None:
+            trace_windows.append(
+                _capture_masked_window_trace(
+                    trace_predictions,
+                    output,
+                    start,
+                    context_len,
+                    ranges,
+                    loss_mask,
+                )
+            )
+            trace_boundaries.append(start + context_len - current_suffix_steps)
         current = loss_metrics_from_logits(
             output.logits,
             window_targets,
@@ -254,7 +339,7 @@ def masked_suffix_loss_with_metrics(
             device,
             mask_all_valid=mask_all_valid,
         )
-    return LossMetrics(
+    metrics = LossMetrics(
         loss=total_loss * 0.0 if bool((total_count <= 0).item()) else total_loss / total_count,
         feature_loss_sum=feature_loss_sum if collect_metrics else None,
         feature_loss_count=feature_loss_count if collect_metrics else None,
@@ -265,6 +350,47 @@ def masked_suffix_loss_with_metrics(
         if collect_metrics and include_rmse
         else None,
         mamba_states=final_states,
+    )
+    if trace_callback is not None and trace_predictions is not None:
+        trace_callback(
+            ObjectiveTrace(
+                inputs.detach().cpu(),
+                targets.detach().cpu(),
+                trace_predictions.detach().cpu(),
+                mask.detach().cpu(),
+                tuple(trace_boundaries),
+                context_len,
+                suffix.roll_forward_steps,
+                tuple(trace_windows),
+            )
+        )
+    return metrics
+
+
+def _capture_masked_window_trace(
+    trace_predictions: torch.Tensor,
+    output: MaskedWindowOutput,
+    start: int,
+    context_len: int,
+    ranges: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> ObjectiveWindowTrace:
+    with torch.no_grad():
+        decoded = decode_categorical_logits(output.logits.detach(), ranges)
+    window_predictions = trace_predictions[:, start : start + context_len, :]
+    trace_predictions[:, start : start + context_len, :] = torch.where(
+        torch.isnan(window_predictions),
+        decoded,
+        window_predictions,
+    )
+    trace_predictions[:, output.target_slice, :] = decoded[:, output.prediction_slice, :]
+    return ObjectiveWindowTrace(
+        start,
+        output.logits.detach().cpu(),
+        decoded.detach().cpu(),
+        loss_mask.detach().cpu(),
+        output.prediction_slice,
+        output.target_slice,
     )
 
 

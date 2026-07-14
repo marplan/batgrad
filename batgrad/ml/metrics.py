@@ -12,6 +12,21 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class LossMetrics:
+    """Count-weighted categorical loss and decoded-error components.
+
+    Sums and counts are retained instead of batch means so callers can aggregate
+    batches, rollout chunks, and distributed ranks without mean-of-means bias.
+
+    Attributes:
+        loss: Scalar categorical cross-entropy over all valid selected values.
+        feature_loss_sum: Per-target cross-entropy sums.
+        feature_loss_count: Per-target valid-value counts.
+        feature_squared_error_sum: Per-target decoded squared-error sums in
+            output-scaled units.
+        feature_squared_error_count: Per-target decoded-error counts.
+        mamba_states: Optional recurrent states produced by objective execution.
+    """
+
     loss: torch.Tensor
     feature_loss_sum: torch.Tensor | None = None
     feature_loss_count: torch.Tensor | None = None
