@@ -68,12 +68,14 @@ markers = [
 [tool.ty.src]
 exclude = [
   "notebooks/*.py",
+  "notebooks/**/*.py",
   "tests/**/*.py",
 ]
 
 [tool.ruff]
 exclude = [
   "notebooks/*.py",
+  "notebooks/**/*.py",
 ]
 target-version = "py312"
 line-length = 100
