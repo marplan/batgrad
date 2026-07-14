@@ -9,10 +9,21 @@ import torch
 
 from batgrad.contracts.mapping import BaseColumns
 from batgrad.ml.config import config_to_dict
-from batgrad.ml.inference import CheckpointSelection, evaluate_checkpoints
+from batgrad.ml.inference import CheckpointSelection, discover_checkpoints, evaluate_checkpoints
 from batgrad.ml.nn import LayerConfig, build_model
 from batgrad.viz.ml import inference_metrics_frame
 from tests.ml.conftest import make_config, make_index, make_store
+
+
+def test_checkpoint_discovery_includes_training_output_layout(tmp_path: Path) -> None:
+    direct = tmp_path / "direct" / "checkpoints" / "latest.pt"
+    nested = tmp_path / "nested" / "checkpoints" / "run-id" / "final.pt"
+    ignored = tmp_path / "nested" / "model.pt"
+    for path in (direct, nested, ignored):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    assert discover_checkpoints(tmp_path) == (direct, nested)
 
 
 def test_inference_loads_checkpoint_and_runs_batched_rollout(tmp_path: Path) -> None:

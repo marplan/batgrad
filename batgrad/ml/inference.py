@@ -25,12 +25,30 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class CheckpointSelection:
+    """Named checkpoint included in a comparative inference request.
+
+    Attributes:
+        alias: Non-empty display label for plots and metrics.
+        path: Checkpoint path.
+    """
+
     alias: str
     path: str
 
 
 @dataclass(frozen=True, slots=True)
 class InferencePrediction:
+    """One checkpoint and suffix-setting prediction series.
+
+    Attributes:
+        checkpoint_alias: User-provided checkpoint label.
+        checkpoint_path: Loaded checkpoint path.
+        suffix_steps: Requested suffix width; zero denotes classic one-step rollout.
+        predictions: CPU tensor shaped `(B, rollout_len, C_out)`.
+        metrics: CPU count-weighted metrics for observed targets.
+        target_start: Target offset aligned with prediction step zero.
+    """
+
     checkpoint_alias: str
     checkpoint_path: str
     suffix_steps: int
@@ -41,6 +59,19 @@ class InferencePrediction:
 
 @dataclass(frozen=True, slots=True)
 class InferenceResult:
+    """Materialized context and comparative checkpoint predictions.
+
+    Attributes:
+        config: Shared compatible experiment configuration.
+        inputs: Materialized scaled inputs on the CPU.
+        targets: Materialized scaled next-row targets on the CPU.
+        predictions: Results for each checkpoint and requested suffix width.
+        context_len: Checkpoint sequence length.
+        rollout_len: Effective horizon after shortest-stream clipping.
+        group_keys: Stream keys aligned with the batch dimension.
+        warning: Human-readable clipping warning, if any.
+    """
+
     config: ExperimentConfig
     inputs: torch.Tensor
     targets: torch.Tensor
@@ -52,6 +83,11 @@ class InferenceResult:
 
 
 def available_devices() -> tuple[str, ...]:
+    """Return CPU and currently available indexed CUDA device strings.
+
+    Returns:
+        A tuple beginning with `"cpu"`, followed by available `"cuda:N"` devices.
+    """
     devices = ["cpu"]
     if torch.cuda.is_available():
         devices.extend(f"cuda:{idx}" for idx in range(torch.cuda.device_count()))
@@ -59,6 +95,17 @@ def available_devices() -> tuple[str, ...]:
 
 
 def resolve_device(value: str) -> torch.device:
+    """Validate and return a requested PyTorch execution device.
+
+    Args:
+        value: Device string such as `"cpu"` or `"cuda:0"`.
+
+    Returns:
+        The parsed PyTorch device.
+
+    Raises:
+        ValueError: If a requested CUDA device is unavailable.
+    """
     device = torch.device(value)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was selected but torch.cuda.is_available() is false")
@@ -72,7 +119,18 @@ def resolve_device(value: str) -> torch.device:
 
 
 def discover_checkpoints(root: str | Path = ".") -> tuple[Path, ...]:
-    return tuple(sorted(Path(root).glob("**/checkpoints/*.pt")))
+    """Discover training checkpoints below a root directory.
+
+    The search includes both direct `checkpoints/*.pt` files and the
+    `checkpoints/<run-id-or-name>/*.pt` layout produced by training.
+
+    Args:
+        root: Directory containing one or more run directories.
+
+    Returns:
+        Sorted checkpoint paths.
+    """
+    return tuple(sorted(Path(root).glob("**/checkpoints/**/*.pt")))
 
 
 @torch.no_grad()
@@ -85,6 +143,33 @@ def evaluate_checkpoints(  # noqa: C901
     suffix_steps: tuple[int, ...],
     rollout_steps: int,
 ) -> InferenceResult:
+    """Evaluate compatible checkpoints on selected normalized streams.
+
+    The selected index rows are materialized once, then every checkpoint is run
+    with every requested suffix width. Checkpoints must agree on model-relevant
+    columns, sequence length, and scaling.
+
+    Args:
+        store: Reader for normalized stream data.
+        selected_index_frame: One or more rows from an `MlDatasetIndex`.
+        selections: Named checkpoint paths.
+        device: Evaluation device.
+        suffix_steps: Suffix widths to compare; zero requests classic rollout.
+        rollout_steps: Requested prediction horizon.
+
+    Returns:
+        CPU context/targets and comparative predictions. The horizon is clipped to
+        the shortest selected stream and reported through `warning`.
+
+    Raises:
+        ValueError: If selections are empty, incompatible, unsupported by selected
+            protocols, or too short for the checkpoint context.
+
+    Note:
+        EIS inference is not currently supported. All selected rows must match a
+        protocol configured by every checkpoint. Materialization always starts at
+        source-row offset zero for each selected stream.
+    """
     if selected_index_frame.is_empty():
         raise ValueError("Select one or more ML index rows before running inference")
     if not selections:

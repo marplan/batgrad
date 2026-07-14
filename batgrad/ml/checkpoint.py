@@ -20,6 +20,14 @@ logger = get_logger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class LoadedCheckpoint:
+    """Model and experiment metadata restored for evaluation.
+
+    Attributes:
+        config: Validated configuration embedded in the checkpoint.
+        model: Reconstructed model in evaluation mode on the requested device.
+        step: Saved training step, if present and valid.
+    """
+
     config: ExperimentConfig
     model: torch.nn.Module
     step: int | None
@@ -45,10 +53,38 @@ def checkpoint_config(
 
 
 def read_checkpoint_config(path: str | Path) -> ExperimentConfig:
+    """Read and validate only the experiment configuration from a checkpoint.
+
+    Args:
+        path: PyTorch checkpoint path.
+
+    Returns:
+        The embedded experiment configuration.
+
+    Note:
+        PyTorch still deserializes the checkpoint payload; this helper merely
+        avoids constructing the model.
+    """
     return checkpoint_config(load_checkpoint_payload(path), path)
 
 
 def load_checkpoint(path: str | Path, device: torch.device) -> LoadedCheckpoint:
+    """Reconstruct a trained model for evaluation.
+
+    Args:
+        path: PyTorch checkpoint path.
+        device: Device used for deserialization and model construction.
+
+    Returns:
+        The validated configuration, evaluation-mode model, and optional step.
+
+    Raises:
+        TypeError: If required configuration or model payloads are absent.
+        RuntimeError: If model weights are incompatible with the configuration.
+
+    Warning:
+        Checkpoints use PyTorch object deserialization. Load only trusted files.
+    """
     payload = load_checkpoint_payload(path, device)
     state_dict = payload.get("model")
     if not isinstance(state_dict, dict):

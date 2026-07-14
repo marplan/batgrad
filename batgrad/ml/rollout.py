@@ -33,6 +33,16 @@ ROLLOUT_INPUT_RANK = 3
 
 @dataclass(frozen=True, slots=True)
 class RolloutResult:
+    """Predictions and optional metrics from one batched rollout.
+
+    Attributes:
+        prediction: Decoded output-scaled values shaped
+            `(B, executed_steps, C_out)`.
+        metrics: Count-weighted metrics when targets and a mask were supplied.
+        target_start: Target-sequence offset aligned with prediction step zero;
+            equal to `context_len - 1` under the next-row target contract.
+    """
+
     prediction: torch.Tensor
     metrics: LossMetrics | None
     target_start: int
@@ -51,6 +61,56 @@ def rollout_batch(
     targets: torch.Tensor | None = None,
     mask: torch.Tensor | None = None,
 ) -> RolloutResult:
+    """Run classic or masked-suffix autoregressive rollout for a batch.
+
+    Known future non-feedback controls must already be present in `inputs`.
+    Feedback columns are replaced recursively with detached model predictions.
+    Supplying both `targets` and `mask` enables scored evaluation; omitting
+    both performs deployment-style prediction with identical execution semantics.
+
+    Args:
+        config: Experiment defining columns, scaling, encoding, and feedback.
+        model: Compatible model in evaluation mode.
+        inputs: Scaled scalar inputs shaped `(B, T, C_in)` containing context
+            and enough future control rows for the requested horizon.
+        context_len: Number of initially observed input rows.
+        rollout_steps: Maximum future rows to predict.
+        suffix: Disabled for one-step rollout or enabled for chunked suffix calls.
+        device: Model execution device.
+        targets: Optional scaled next-row targets shaped `(B, T, C_out)`.
+        mask: Optional valid-target mask supplied together with `targets`.
+
+    Returns:
+        Decoded output-scaled predictions, optional metrics, and target alignment.
+
+    Raises:
+        ValueError: If shapes, context, horizon, suffix width, or optional scoring
+            inputs are invalid.
+
+    Examples:
+        Run deployment-style one-step feedback without metrics:
+
+        ```python
+        from batgrad.ml.config import MaskedSuffixConfig
+        from batgrad.ml.rollout import rollout_batch
+
+        result = rollout_batch(
+            config,
+            model,
+            inputs,
+            context_len=512,
+            rollout_steps=64,
+            suffix=MaskedSuffixConfig(enabled=False),
+            device=device,
+        )
+        assert result.prediction.shape[1] == 64
+        ```
+
+    Note:
+        Attention recomputes over each visible context. Mamba state is advanced by
+        exactly the rows leaving the next window and must not be shared across
+        unrelated streams.
+    """
     if inputs.ndim != ROLLOUT_INPUT_RANK:
         raise ValueError(f"rollout inputs must be shaped (B,T,C), got {tuple(inputs.shape)}")
     if context_len <= 0 or context_len > int(inputs.shape[1]):
