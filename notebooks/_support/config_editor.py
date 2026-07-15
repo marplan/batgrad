@@ -983,6 +983,12 @@ def _(
                     label="",
                     on_change=remember_layer(idx, "residual"),
                 ),
+                "bias": mo.ui.dropdown(
+                    options=("inherit/null", "true", "false"),
+                    value=nullable_bool_value(layer_value(idx, "bias", None)),
+                    label="",
+                    on_change=remember_layer(idx, "bias"),
+                ),
                 "d_state": mo.ui.text(
                     value=nullable_text(layer_value(idx, "d_state", None)),
                     label="",
@@ -1054,6 +1060,11 @@ def _(
         step=0.01,
         label="",
         on_change=model_change("dropout"),
+    )
+    model_bias = mo.ui.checkbox(
+        value=bool(model_value("bias", False)),
+        label="",
+        on_change=model_change("bias"),
     )
     model_norm = mo.ui.dropdown(
         options=("rmsnorm",),
@@ -1394,6 +1405,7 @@ def _(
         loader_seq_len,
         loader_stateful_n_windows,
         loader_strategy,
+        model_bias,
         model_causal_attention,
         model_d_model,
         model_dropout,
@@ -1778,6 +1790,7 @@ def _(
     logging_mode,
     logging_wandb,
     manifest_values,
+    model_bias,
     model_causal_attention,
     model_d_model,
     model_dropout,
@@ -1939,6 +1952,10 @@ def _(
                 layer["residual"] = {"kind": residual.removeprefix("object:")}
             if kind == "reduce":
                 layer["mode"] = "sum_pool"
+            if kind in {"attention", "ffn"}:
+                bias = parse_nullable_bool(layer_widgets["bias"].value)
+                if bias is not None:
+                    layer["bias"] = bias
             if kind == "mamba":
                 for key in ("d_state", "expand", "headdim", "ngroups", "mimo_rank", "chunk_size"):
                     try:
@@ -1962,6 +1979,7 @@ def _(
                 "n_heads": int(model_n_heads.value),
                 "mlp_ratio": float(model_mlp_ratio.value),
                 "dropout": float(model_dropout.value),
+                "bias": bool(model_bias.value),
                 "norm": str(model_norm.value),
                 "causal_attention": bool(model_causal_attention.value),
                 "num_bins": int(model_num_bins.value),
@@ -2431,6 +2449,7 @@ def _(
 @app.cell
 def _(
     get_layer_kind_change,
+    model_bias,
     model_causal_attention,
     model_d_model,
     model_dropout,
@@ -2474,6 +2493,8 @@ def _(
             kind = str(layer["kind"].value)
             if kind == "reduce":
                 view["mode"] = mo.md("`sum_pool`")
+            elif kind in {"attention", "ffn"}:
+                view["bias"] = layer["bias"]
             elif kind == "mamba":
                 view.update(
                     {
@@ -2508,6 +2529,10 @@ def _(
         ),
         "mlp_ratio": with_help(model_mlp_ratio, "Feed-forward hidden multiplier."),
         "dropout": with_help(model_dropout, "Dropout probability in [0, 1)."),
+        "bias": with_help(
+            model_bias,
+            "Default bias for feature, attention, FFN, and output linear projections.",
+        ),
         "norm": with_help(model_norm, "Normalization kind. Currently rmsnorm only."),
         "causal_attention": with_help(model_causal_attention, "Use causal attention masks."),
         "num_bins": with_help(model_num_bins, "Number of bins for binned target parameterization."),

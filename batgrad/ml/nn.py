@@ -83,6 +83,8 @@ class LayerConfig:
         kind: Attention, feed-forward, Mamba, or feature reduction.
         residual: Residual override. Temporal layers default to enabled and
             reduction defaults to disabled.
+        bias: Optional attention/FFN linear-bias override. None inherits the
+            model-level setting.
         mode: Reduction implementation; currently only `"sum_pool"`.
         d_state: Optional per-layer Mamba state dimension.
         expand: Optional per-layer Mamba expansion factor.
@@ -100,6 +102,7 @@ class LayerConfig:
 
     kind: LayerKind
     residual: bool | ResidualConfig | None = None
+    bias: bool | None = None
     mode: Literal["sum_pool"] | None = None
     d_state: int | None = None
     expand: int | None = None
@@ -116,6 +119,8 @@ class LayerConfig:
             raise ValueError("reduce layers currently require mode='sum_pool'")
         if self.kind != "reduce" and self.mode is not None:
             raise ValueError("layer.mode is only valid for reduce layers")
+        if self.kind not in {"attention", "ffn"} and self.bias is not None:
+            raise ValueError("layer.bias is only valid for attention and ffn layers")
         if self.kind != "mamba" and any(
             value is not None
             for value in (
@@ -138,6 +143,10 @@ class LayerConfig:
         if self.residual is not None:
             return bool(self.residual)
         return self.kind != "reduce"
+
+    def linear_bias(self, *, default: bool) -> bool:
+        """Return the effective linear-bias setting for this layer."""
+        return default if self.bias is None else self.bias
 
     def mamba_config(self, default: MambaConfig) -> MambaConfig:
         """Merge per-layer Mamba overrides with model defaults.
@@ -184,6 +193,7 @@ class SequenceMixerConfig:
         n_heads: Attention head count; must divide `d_model`.
         mlp_ratio: Feed-forward hidden-width multiplier.
         dropout: Attention and feed-forward dropout probability.
+        bias: Default bias setting for Batgrad-owned linear projections.
         norm: Normalization implementation; currently RMSNorm only.
         causal_attention: Prevent attention to future sequence positions.
         num_bins: Categorical bins used to encode each scalar.
@@ -219,6 +229,7 @@ class SequenceMixerConfig:
     n_heads: int = 8
     mlp_ratio: float = 4.0
     dropout: float = 0.0
+    bias: bool = False
     norm: Literal["rmsnorm"] = "rmsnorm"
     causal_attention: bool = True
     num_bins: int = 64
@@ -265,14 +276,14 @@ def _validate_layer_topology(config: SequenceMixerConfig) -> None:
 
 
 class FeedForward(nn.Module):
-    def __init__(self, d_model: int, mlp_ratio: float, dropout: float) -> None:
+    def __init__(self, d_model: int, mlp_ratio: float, dropout: float, *, bias: bool) -> None:
         super().__init__()
         hidden = int(d_model * mlp_ratio)
         self.net = nn.Sequential(
             nn.RMSNorm(d_model),
-            nn.Linear(d_model, hidden, bias=False),
+            nn.Linear(d_model, hidden, bias=bias),
             nn.GELU(),
-            nn.Linear(hidden, d_model, bias=False),
+            nn.Linear(hidden, d_model, bias=bias),
             nn.Dropout(dropout),
         )
 
@@ -282,14 +293,15 @@ class FeedForward(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, config: SequenceMixerConfig) -> None:
+    def __init__(self, config: SequenceMixerConfig, layer: LayerConfig) -> None:
         super().__init__()
         self.n_heads = config.n_heads
         self.head_dim = config.d_model // config.n_heads
         self.causal = config.causal_attention
         self.norm = nn.RMSNorm(config.d_model)
-        self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
-        self.out = nn.Linear(config.d_model, config.d_model, bias=False)
+        bias = layer.linear_bias(default=config.bias)
+        self.qkv = nn.Linear(config.d_model, 3 * config.d_model, bias=bias)
+        self.out = nn.Linear(config.d_model, config.d_model, bias=bias)
         self.dropout = config.dropout
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -515,20 +527,25 @@ class SequenceMixer(nn.Module):
         self.output_dim = output_dim
         self.num_bins = config.num_bins
         self.feature_proj = nn.ModuleList(
-            [nn.Linear(config.num_bins, config.d_model, bias=False) for _ in range(input_dim)]
+            [nn.Linear(config.num_bins, config.d_model, bias=config.bias) for _ in range(input_dim)]
         )
         self.layers = nn.ModuleList([self._build_layer(layer, device) for layer in config.layers])
         self.head_layers = nn.ModuleList(
             [self._build_layer(layer, device) for layer in config.head_layers]
         )
         self.final_norm = nn.RMSNorm(config.d_model)
-        self.output = nn.Linear(config.d_model, output_dim * config.num_bins, bias=False)
+        self.output = nn.Linear(config.d_model, output_dim * config.num_bins, bias=config.bias)
 
     def _build_layer(self, layer: LayerConfig, device: torch.device) -> nn.Module:
         if layer.kind == "attention":
-            return SelfAttention(self.config)
+            return SelfAttention(self.config, layer)
         if layer.kind == "ffn":
-            return FeedForward(self.config.d_model, self.config.mlp_ratio, self.config.dropout)
+            return FeedForward(
+                self.config.d_model,
+                self.config.mlp_ratio,
+                self.config.dropout,
+                bias=layer.linear_bias(default=self.config.bias),
+            )
         if layer.kind == "mamba":
             return MambaBlock(self.config, layer, device)
         return nn.Identity()
