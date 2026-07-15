@@ -6,6 +6,8 @@ import torch
 
 from batgrad.ml.inference import InferencePrediction, InferenceResult
 from batgrad.viz.ml import (
+    _inference_input_col,
+    _inference_plot_frame,
     _inference_protocol,
     _rollout_target_time_axis,
     build_inference_widget,
@@ -55,12 +57,10 @@ def test_default_inference_colors_start_with_visible_roles() -> None:
         checkpoint_alias="checkpoint",
         checkpoint_path="checkpoint.pt",
         suffix_steps=0,
-        context_predictions=torch.empty(
-            (1, 0, len(config.data.target_columns)),
-        ),
-        predictions=torch.zeros((1, sequence_len, len(config.data.target_columns))),
+        context_predictions=torch.ones((1, sequence_len, len(config.data.target_columns))),
+        predictions=torch.zeros((1, 1, len(config.data.target_columns))),
         metrics=None,
-        target_start=0,
+        target_start=2,
     )
     result = InferenceResult(
         config=config,
@@ -79,3 +79,31 @@ def test_default_inference_colors_start_with_visible_roles() -> None:
     assert colors_by_name["ground truth"] == COLORWAY[0]
     prediction_name = next(name for name in colors_by_name if name.startswith("prediction"))
     assert colors_by_name[prediction_name] == COLORWAY[1]
+    assert {annotation.text for annotation in widget._fig.layout.annotations} >= {"rollout_pred"}
+
+
+def test_inference_plot_hides_future_feedback_inputs_but_keeps_controls() -> None:
+    config = make_config()
+    sequence_len = 4
+    inputs = torch.ones((1, sequence_len, len(config.data.input_columns)))
+    targets = torch.ones((1, sequence_len, len(config.data.target_columns)))
+    columns = tuple(dict.fromkeys((*config.data.input_columns, *config.data.target_columns)))
+
+    frame = _inference_plot_frame(
+        config,
+        inputs,
+        targets,
+        (),
+        0,
+        columns,
+        "sequence index",
+        index_axis=True,
+        feedback_input_end=2,
+    )
+
+    feedback_column = config.data.feedback_columns[0]
+    control_column = next(
+        column for column in config.data.input_columns if column not in config.data.feedback_columns
+    )
+    assert frame[_inference_input_col(feedback_column)].to_list() == [1.0, 1.0, None, None]
+    assert frame[_inference_input_col(control_column)].to_list() == [1.0] * sequence_len

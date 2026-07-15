@@ -160,7 +160,18 @@ def render_batch_result(result: InferenceResult | None, batch_index: int) -> obj
     if result.warning is not None:
         items.append(mo.callout(result.warning, kind="warn"))
     idx = min(max(0, int(batch_index)), int(result.inputs.shape[0]) - 1)
-    items.extend(wrap_anywidget_blocks((build_inference_widget(result, idx),)))
+    items.extend(
+        wrap_anywidget_blocks(
+            (
+                build_inference_widget(
+                    result,
+                    idx,
+                    include_inputs=True,
+                    feedback_input_end=result.context_len,
+                ),
+            )
+        )
+    )
     items.extend((mo.md("### Metrics"), mo.ui.table(inference_metrics_frame(result))))
     return mo.vstack(items)
 

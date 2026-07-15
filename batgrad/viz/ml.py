@@ -17,6 +17,7 @@ from batgrad.ml.data.preview import (
 from batgrad.ml.data.scaling import inverse_scale_tensor, scale_data
 from batgrad.ml.experiment import scaling_rules
 from batgrad.ml.metrics import loss_metric_payload
+from batgrad.ml.rollout import align_rollout_prediction
 from batgrad.storage.segments import SegmentSource, collect_segment_window_frames
 from batgrad.viz.plotting import (
     COLORWAY,
@@ -214,6 +215,7 @@ def build_inference_widget(
     include_inputs: bool = False,
     index_axis: bool = False,
     standard_role_labels: bool = False,
+    feedback_input_end: int | None = None,
 ) -> PlotlyTraceResampler:
     config = result.config
     columns = tuple(dict.fromkeys((*config.data.input_columns, *config.data.target_columns)))
@@ -246,6 +248,7 @@ def build_inference_widget(
         columns,
         axis_col,
         index_axis=index_axis,
+        feedback_input_end=feedback_input_end,
     )
     lf = frame.lazy()
     prediction_labels = tuple(
@@ -333,7 +336,43 @@ def build_inference_widget(
                 hovertemplate=axis_hovertemplate(series_label, axis_col, y_col),
                 row_count=frame.height,
             )
+    add_vertical_boundaries(
+        widget,
+        frame[axis_col].to_list(),
+        tuple(sorted({series.target_start for series in predictions if series.target_start > 0})),
+        label="rollout_pred",
+    )
     return widget
+
+
+def add_vertical_boundaries(
+    widget: PlotlyTraceResampler,
+    x_values: list[float],
+    boundaries: tuple[int, ...],
+    *,
+    label: str,
+) -> None:
+    """Add aligned vertical boundary lines and labels to a resampled plot."""
+    for boundary in boundaries:
+        if not x_values:
+            break
+        x_value = x_values[min(max(0, boundary), len(x_values) - 1)]
+        widget._fig.add_vline(
+            x=x_value,
+            line_dash="dot",
+            line_color="orange",
+            row="all",
+            col=1,
+        )
+        widget._fig.add_annotation(
+            x=x_value,
+            y=1.0,
+            xref="x",
+            yref="paper",
+            text=label,
+            showarrow=False,
+            yshift=8,
+        )
 
 
 def inference_metrics_frame(result: InferenceResult) -> pl.DataFrame:
@@ -368,6 +407,7 @@ def _inference_plot_frame(
     axis_col: str,
     *,
     index_axis: bool = False,
+    feedback_input_end: int | None = None,
 ) -> pl.DataFrame:
     x_values = (
         [float(idx) for idx in range(int(inputs.shape[1]))]
@@ -375,23 +415,36 @@ def _inference_plot_frame(
         else _rollout_target_time_axis(config, inputs[batch_index])
     )
     data: dict[str, list[float | None]] = {axis_col: [float(value) for value in x_values]}
+    aligned_predictions = tuple(
+        align_rollout_prediction(
+            series.context_predictions,
+            series.predictions,
+            target_start=series.target_start,
+            total_steps=len(x_values),
+        )
+        for series in predictions
+    )
     for column in columns:
         target_idx = _column_index(config.data.target_columns, column)
         input_idx = _column_index(config.data.input_columns, column)
         if input_idx is not None:
-            data[_inference_input_col(column)] = [
+            input_values: list[float | None] = [
                 float(value) for value in inputs[batch_index, :, input_idx].tolist()
             ]
+            if column in config.data.feedback_columns and feedback_input_end is not None:
+                cutoff = min(max(0, feedback_input_end), len(input_values))
+                input_values[cutoff:] = [None] * (len(input_values) - cutoff)
+            data[_inference_input_col(column)] = input_values
         if target_idx is not None:
             base = targets[batch_index, :, target_idx].tolist()
             data[_inference_target_col(column)] = [
                 None if value is None else float(value) for value in base
             ]
-            for series in predictions:
-                prediction = [None] * len(x_values)
-                values = series.predictions[batch_index, :, target_idx].tolist()
-                prediction[series.target_start : series.target_start + len(values)] = values
-                data[_inference_prediction_col(column, series)] = prediction
+            for series, aligned in zip(predictions, aligned_predictions, strict=True):
+                values = aligned[batch_index, :, target_idx]
+                data[_inference_prediction_col(column, series)] = [
+                    float(value) if torch.isfinite(value) else None for value in values
+                ]
         elif input_idx is not None:
             base = inputs[batch_index, :, input_idx].tolist()
         else:

@@ -14,7 +14,6 @@ from batgrad.ml.config import (
     ExperimentConfig,
     load_experiment_config,
     resolve_store_root,
-    resolved_validation_masked_suffix,
 )
 from batgrad.ml.data.scaling import inverse_scale_tensor
 from batgrad.ml.distributed import DistributedContext
@@ -24,11 +23,13 @@ from batgrad.ml.loggers import StdoutRunLogger
 from batgrad.ml.metrics import loss_metrics_to_cpu
 from batgrad.ml.nn import build_model
 from batgrad.ml.objective import ObjectiveTrace
+from batgrad.ml.rollout import align_rollout_prediction
 from batgrad.ml.validation import RolloutExample, ValidationResult, validate
 from batgrad.notebook_helpers import wrap_anywidget_blocks
 from batgrad.storage.local import LocalDataProcessingStore
 from batgrad.viz.ml import (
     _rollout_target_time_axis,
+    add_vertical_boundaries,
     build_inference_widget,
 )
 
@@ -397,27 +398,22 @@ def build_training_widget(
         None,
     )
     lane = min(max(0, int(batch_index)), int(trace.inputs.shape[0]) - 1)
+    feedback_input_end = (
+        trace.context_len
+        if record.phase == "validation rollout"
+        else min(trace.mask_boundaries)
+        if trace.mask_boundaries
+        else None
+    )
     widget = build_inference_widget(
         result,
         lane,
         include_inputs=True,
         index_axis=not rescale,
         standard_role_labels=True,
+        feedback_input_end=feedback_input_end,
     )
-    suffix = (
-        session.config.train.masked_suffix
-        if record.phase == "train"
-        else resolved_validation_masked_suffix(session.config)
-    )
-    suffix_steps = suffix.suffix_steps if suffix.enabled else 0
-    widget._fig.update_layout(
-        title=(
-            f"{record.phase} | step={record.step} | context={trace.context_len} | "
-            f"masked_suffix_steps={suffix_steps} | "
-            f"effective_seq_len={int(trace.inputs.shape[1])} | "
-            f"roll_forward_steps={trace.roll_forward_steps}"
-        )
-    )
+    widget._fig.update_layout(title=f"{record.phase} | step={record.step}")
     if rescale:
         display_inputs = inverse_scale_tensor(
             trace.inputs, session.config.data.input_columns, scaling_rules(session.config)
@@ -425,26 +421,12 @@ def build_training_widget(
         x_values = _rollout_target_time_axis(config, display_inputs[lane])
     else:
         x_values = [float(idx) for idx in range(int(trace.inputs.shape[1]))]
-    for boundary in trace.mask_boundaries:
-        if not x_values:
-            break
-        x_value = x_values[min(max(0, boundary), len(x_values) - 1)]
-        widget._fig.add_vline(
-            x=x_value,
-            line_dash="dot",
-            line_color="orange",
-            row="all",
-            col=1,
-        )
-        widget._fig.add_annotation(
-            x=x_value,
-            y=1.0,
-            xref="x",
-            yref="paper",
-            text=record.boundary_label,
-            showarrow=False,
-            yshift=8,
-        )
+    add_vertical_boundaries(
+        widget,
+        x_values,
+        trace.mask_boundaries,
+        label=record.boundary_label,
+    )
     return widget
 
 
@@ -477,17 +459,17 @@ def _rollout_plot_record(
 ) -> TrainingPlotRecord:
     inputs = example.inputs.unsqueeze(0)
     targets = example.target.unsqueeze(0)
-    predictions = torch.full_like(targets, float("nan"))
-    context_steps = min(int(example.context_prediction.shape[0]), int(targets.shape[1]))
-    predictions[:, :context_steps, :] = example.context_prediction[:context_steps].unsqueeze(0)
-    rollout_end = min(
-        example.target_start + int(example.prediction.shape[0]),
-        int(targets.shape[1]),
+    predictions = align_rollout_prediction(
+        example.context_prediction.unsqueeze(0),
+        example.prediction.unsqueeze(0),
+        target_start=example.target_start,
+        total_steps=int(targets.shape[1]),
     )
-    rollout_steps = max(0, rollout_end - example.target_start)
-    predictions[:, example.target_start : rollout_end, :] = example.prediction[
-        :rollout_steps
-    ].unsqueeze(0)
+    context_steps = min(int(example.context_prediction.shape[0]), int(targets.shape[1]))
+    rollout_steps = max(
+        0,
+        min(int(example.prediction.shape[0]), int(targets.shape[1]) - example.target_start),
+    )
     protocol = example.match.get("protocol", config.data.protocols[0])
     group_key = (
         example.match.get("dataset id", "validation"),
