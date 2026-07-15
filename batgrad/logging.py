@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, override
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 _PACKAGE_LOGGER_NAME = "batgrad"
 _RECENT_LOG_LIMIT = 2000
@@ -120,13 +120,20 @@ class _RecentLogHandler(logging.Handler):
 
 
 class ListHandler(logging.Handler):
-    def __init__(self, level: int = logging.NOTSET) -> None:
+    def __init__(
+        self,
+        level: int = logging.NOTSET,
+        record_callback: Callable[[logging.LogRecord], None] | None = None,
+    ) -> None:
         super().__init__(level=level)
         self.records: list[logging.LogRecord] = []
+        self.record_callback = record_callback
 
     @override
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
+        if self.record_callback is not None:
+            self.record_callback(record)
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -217,11 +224,13 @@ def clear_recent_logs() -> None:
 @contextmanager
 def capture_output(
     log_level: str | int = logging.DEBUG,
+    *,
+    record_callback: Callable[[logging.LogRecord], None] | None = None,
 ) -> Iterator[tuple[io.StringIO, io.StringIO, list[logging.LogRecord]]]:
     package_logger = _package_logger()
     out = io.StringIO()
     err = io.StringIO()
-    handler = ListHandler(_log_level_to_int(log_level))
+    handler = ListHandler(_log_level_to_int(log_level), record_callback)
 
     old_handlers = package_logger.handlers[:]
     old_propagate = package_logger.propagate

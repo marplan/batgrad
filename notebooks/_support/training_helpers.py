@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import logging
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
 
-from batgrad.logging import LogFormatter, capture_output
 from batgrad.ml import train as train_module
 from batgrad.ml.config import (
     ExperimentConfig,
@@ -32,9 +29,10 @@ from batgrad.viz.ml import (
     add_vertical_boundaries,
     build_inference_widget,
 )
+from notebooks._support.logging_helpers import capture_log_lines as _capture_logs
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
     from pathlib import Path
 
     from batgrad.ml.data.batch import Batch
@@ -67,17 +65,6 @@ class TrainingPlotRequest:
 class TrainingPlotDisplay:
     widget: PlotlyTraceResampler
     view: object
-
-
-@dataclass(frozen=True, slots=True)
-class TrainingRunState:
-    total_steps: int = 0
-    completed_steps: int = 0
-    status: str = "idle"
-
-    @property
-    def active(self) -> bool:
-        return self.status == "running"
 
 
 @dataclass(slots=True)
@@ -123,10 +110,14 @@ class InteractiveTrainingSession:
         if self.log_time == 0.0:
             self.log_time = time.perf_counter()
 
-    def train_steps(self, count: int) -> None:
+    def train_steps(
+        self,
+        count: int,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> None:
         if self.log_lines is None:
             self.log_lines = []
-        with _capture_logs(self.log_lines):
+        with _capture_logs(self.log_lines, progress_callback):
             self._train_steps(count)
 
     def _train_steps(self, count: int) -> None:
@@ -143,7 +134,12 @@ class InteractiveTrainingSession:
             next_step = self.step + 1
             self.log_token_count += train_module._model_compute_token_count(self.config, batch)
             if self.first_train_step:
-                train_module.logger.info("Running first training step")
+                if self.device.type == "cuda":
+                    train_module.logger.info(
+                        "Running first training step; Mamba/CUDA kernels may compile and warm up"
+                    )
+                else:
+                    train_module.logger.info("Running first training step")
             traces: list[ObjectiveTrace] = []
             initial_states = train_module._initial_mamba_states_for_batch(
                 batch,
@@ -217,10 +213,13 @@ class InteractiveTrainingSession:
                 epoch_pct=epoch_pct,
             )
 
-    def validate_now(self) -> None:
+    def validate_now(
+        self,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> None:
         if self.log_lines is None:
             self.log_lines = []
-        with _capture_logs(self.log_lines):
+        with _capture_logs(self.log_lines, progress_callback):
             self._validate_now()
 
     def _validate_now(self) -> None:
@@ -308,6 +307,7 @@ class InteractiveTrainingSession:
 def create_training_session(
     config_path: str | Path,
     device: torch.device,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> InteractiveTrainingSession:
     config = load_experiment_config(config_path)
     config = replace(
@@ -320,9 +320,11 @@ def create_training_session(
             output_dir=None,
             compile_model=False,
         ),
+        logging=replace(config.logging, backend="stdout"),
+        checkpoint=replace(config.checkpoint, save_latest=False, save_best=False, save_final=False),
     )
     log_lines: list[str] = []
-    with _capture_logs(log_lines):
+    with _capture_logs(log_lines, progress_callback):
         torch.manual_seed(config.run.seed)
         store = LocalDataProcessingStore(resolve_store_root(config.data.store_root))
         train_module.logger.info("Creating data loaders")
@@ -520,16 +522,3 @@ def _single_process_context(device: torch.device) -> DistributedContext:
         world_size=1,
         device=device,
     )
-
-
-@contextmanager
-def _capture_logs(destination: list[str]) -> Iterator[None]:
-    formatter = LogFormatter(use_colors=False)
-    with capture_output(logging.DEBUG) as (stdout, stderr, records):
-        try:
-            yield
-        finally:
-            destination.extend(formatter.format(record) for record in records)
-            destination.extend(line for line in stdout.getvalue().splitlines() if line)
-            destination.extend(line for line in stderr.getvalue().splitlines() if line)
-            del destination[:-2000]

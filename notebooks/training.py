@@ -6,7 +6,6 @@ __generated_with = "0.23.14"
 app = marimo.App(width="medium")
 
 with app.setup:
-    from html import escape
     from pathlib import Path
 
     import marimo as mo
@@ -14,11 +13,11 @@ with app.setup:
     from batgrad.ml.inference import available_devices, resolve_device
     from notebooks._support.training_helpers import (
         TrainingPlotRequest,
-        TrainingRunState,
         build_training_plot_display,
         close_training_plot,
         create_training_session,
     )
+    from notebooks._support.logging_helpers import log_view
 
 
 @app.cell
@@ -42,10 +41,7 @@ def _():
     get_training_error, set_training_error = mo.state(None)
     get_plot_request, set_plot_request = mo.state(None)
     get_plot_display, set_plot_display = mo.state(None)
-    get_training_run, set_training_run = mo.state(
-        TrainingRunState(),
-        allow_self_loops=True,
-    )
+    get_operation, set_operation = mo.state(None)
     get_batch_index, set_batch_index = mo.state(0)
     get_rescale, set_rescale = mo.state(True)
     get_steps_per_click, set_steps_per_click = mo.state(1)
@@ -53,23 +49,23 @@ def _():
     get_version, set_version = mo.state(0)
     return (
         get_batch_index,
+        get_operation,
         get_plot_display,
         get_plot_request,
         get_rescale,
         get_session,
         get_steps_per_click,
         get_training_error,
-        get_training_run,
         get_validation_label,
         get_version,
         set_batch_index,
+        set_operation,
         set_plot_display,
         set_plot_request,
         set_rescale,
         set_session,
         set_steps_per_click,
         set_training_error,
-        set_training_run,
         set_validation_label,
         set_version,
     )
@@ -77,54 +73,38 @@ def _():
 
 @app.cell
 def _(
-    config_path,
-    device_select,
+    get_plot_display,
+    set_operation,
+    set_plot_display,
     set_plot_request,
     set_session,
     set_training_error,
-    set_training_run,
-    set_version,
 ):
-    def initialize(value):
+    def prepare_initialize(value):
         next_value = int(value or 0) + 1
-        try:
-            device = resolve_device(str(device_select.value))
-            session = create_training_session(str(config_path.value), device)
-        except (
-            FileNotFoundError,
-            ImportError,
-            OSError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            set_training_error(str(exc))
-            return next_value
+        close_training_plot(get_plot_display())
+        set_plot_display(None)
         set_plot_request(None)
-        set_session(session)
+        set_session(None)
         set_training_error(None)
-        set_training_run(TrainingRunState())
-        set_version(lambda current: current + 1)
+        set_operation(("initialize", next_value))
         return next_value
 
-    initialize_training = mo.ui.button(value=0, on_click=initialize, label="Initialize / reset")
+    initialize_training = mo.ui.button(
+        value=0,
+        label="Initialize / reset",
+        on_click=prepare_initialize,
+    )
     return (initialize_training,)
 
 
 @app.cell
-def _(
-    get_session,
-    get_training_run,
-    get_validation_label,
-    get_version,
-    set_validation_label,
-):
+def _(get_session, get_validation_label, get_version, set_validation_label):
     get_version()
     current = get_session()
     validation_record = None
     if (
-        not get_training_run().active
-        and current is not None
+        current is not None
         and current.latest_record is not None
         and current.latest_record.phase.startswith("validation")
     ):
@@ -146,18 +126,18 @@ def _(
 @app.cell
 def _(
     get_batch_index,
+    get_plot_display,
     get_rescale,
     get_session,
     get_steps_per_click,
-    get_training_run,
     get_version,
     set_batch_index,
+    set_operation,
+    set_plot_display,
     set_plot_request,
     set_rescale,
     set_steps_per_click,
     set_training_error,
-    set_training_run,
-    set_version,
     validation_record,
 ):
     get_version()
@@ -189,46 +169,19 @@ def _(
     )
 
     def clear_plot():
+        close_training_plot(get_plot_display())
+        set_plot_display(None)
         set_plot_request(None)
 
-    def train(value):
-        next_value = int(value or 0) + 1
-        current = get_session()
-        if current is None:
-            set_training_error("Initialize training before stepping")
+    def prepare_run(kind):
+        def run(value):
+            next_value = int(value or 0) + 1
+            clear_plot()
+            set_training_error(None)
+            set_operation((kind, next_value))
             return next_value
-        if get_training_run().active:
-            set_training_error("Training is already running")
-            return next_value
-        requested_steps = int(steps_per_click.value)
-        available_steps = max(0, current.max_steps - current.step)
-        total_steps = min(requested_steps, available_steps)
-        clear_plot()
-        if total_steps <= 0:
-            set_training_error(f"Training complete at step {current.step}")
-            return next_value
-        set_training_error(None)
-        set_training_run(TrainingRunState(total_steps, 0, "running"))
-        return next_value
 
-    def validate_now(value):
-        next_value = int(value or 0) + 1
-        current = get_session()
-        if current is None:
-            set_training_error("Initialize training before validation")
-            return next_value
-        if get_training_run().active:
-            set_training_error("Stop training before validation")
-            return next_value
-        try:
-            current.validate_now()
-        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            set_training_error(str(exc))
-            return next_value
-        clear_plot()
-        set_training_error(None)
-        set_version(lambda version: version + 1)
-        return next_value
+        return run
 
     def plot_latest(value):
         next_value = int(value or 0) + 1
@@ -236,9 +189,6 @@ def _(
         selected = None if current is None else current.record(selected_label)
         if current is None or selected is None:
             set_training_error("No training or validation batch is available to plot")
-            return next_value
-        if get_training_run().active:
-            set_training_error("Stop training before plotting")
             return next_value
         set_plot_request(
             TrainingPlotRequest(
@@ -251,27 +201,18 @@ def _(
         set_training_error(None)
         return next_value
 
-    def stop_training(value):
-        next_value = int(value or 0) + 1
-        run = get_training_run()
-        if run.active:
-            set_training_run(TrainingRunState(run.total_steps, run.completed_steps, "stopped"))
-            set_version(lambda version: version + 1)
-        return next_value
-
-    train_steps = mo.ui.button(value=0, on_click=train, label="Train")
-    stop = mo.ui.button(value=0, on_click=stop_training, label="Stop")
-    validate = mo.ui.button(value=0, on_click=validate_now, label="Validate now")
-    plot = mo.ui.button(value=0, on_click=plot_latest, label="Plot latest")
-    return (
-        batch_index,
-        plot,
-        rescale,
-        steps_per_click,
-        stop,
-        train_steps,
-        validate,
+    train_steps = mo.ui.button(
+        value=0,
+        label="Train",
+        on_click=prepare_run("train"),
     )
+    validate = mo.ui.button(
+        value=0,
+        label="Validate now",
+        on_click=prepare_run("validate"),
+    )
+    plot = mo.ui.button(value=0, on_click=plot_latest, label="Plot latest")
+    return batch_index, plot, rescale, steps_per_click, train_steps, validate
 
 
 @app.cell
@@ -308,15 +249,8 @@ def _(
 
 
 @app.cell
-def _(
-    get_plot_display,
-    get_session,
-    get_training_error,
-    get_training_run,
-    get_version,
-):
+def _(get_plot_display, get_session, get_training_error, get_version):
     get_version()
-    _training_run = get_training_run()
     training_session = get_session()
     config = None if training_session is None else training_session.config
     device = None if training_session is None else training_session.device
@@ -340,19 +274,10 @@ def _(
     training_error = get_training_error()
     plot_display = get_plot_display()
     plot_view = None if plot_display is None else plot_display.view
-    log_text = (
-        "Not initialized"
-        if training_session is None
-        else "\n".join(training_session.log_lines or ())
-    )
-    session_log = mo.Html(
-        '<div style="font-size: 0.875rem;">'
-        '<div style="font-weight: 600; margin-bottom: 0.25rem;">Session log</div>'
-        '<div style="max-height: 420px; min-height: 180px; overflow-y: auto; '
-        "display: flex; flex-direction: column-reverse; border: 1px solid var(--slate-6); "
-        'border-radius: 4px; background: var(--slate-1);">'
-        '<pre style="flex: 0 0 auto; margin: 0; padding: 0.75rem; white-space: pre-wrap; '
-        f'overflow-wrap: anywhere;">{escape(log_text)}</pre></div></div>'
+    session_log = log_view(
+        () if training_session is None else (training_session.log_lines or ()),
+        title="Session log",
+        empty="Not initialized",
     )
     return (
         config,
@@ -385,6 +310,7 @@ def _(
     dataset_index,
     device,
     device_select,
+    get_operation,
     initialize_training,
     latest_batch,
     latest_loss,
@@ -398,9 +324,7 @@ def _(
     plot_view,
     rescale,
     scheduler,
-    session_log,
     steps_per_click,
-    stop,
     train_dataloader,
     train_steps,
     training_error,
@@ -410,6 +334,7 @@ def _(
     validation_record,
     validation_result,
 ):
+    operation_ready = get_operation()
     _ = (
         config,
         dataset_index,
@@ -436,58 +361,103 @@ def _(
         items.append(mo.callout(training_error, kind="danger"))
     items.extend(
         [
-            mo.hstack([steps_per_click, train_steps, stop, validate], justify="start"),
+            mo.hstack([steps_per_click, train_steps, validate], justify="start"),
         ]
     )
-    items.append(mo.hstack([batch_index, rescale, plot], justify="start"))
-    if validation_record is not None:
-        items.append(validation_record)
-    if plot_view is not None:
-        items.append(plot_view)
-    items.append(session_log)
+    if operation_ready is None:
+        items.append(mo.hstack([batch_index, rescale, plot], justify="start"))
+        if validation_record is not None:
+            items.append(validation_record)
+        if plot_view is not None:
+            items.append(plot_view)
     mo.vstack(items)
-    return
+    return (operation_ready,)
 
 
 @app.cell
 def _(
+    config_path,
+    device_select,
     get_session,
-    get_training_run,
+    operation_ready,
+    set_operation,
+    set_session,
     set_training_error,
-    set_training_run,
     set_version,
+    steps_per_click,
 ):
-    _run = get_training_run()
-    if _run.active:
-        _current = get_session()
-        if _current is None:
-            set_training_error("Initialize training before stepping")
-            _next_run = TrainingRunState(_run.total_steps, _run.completed_steps, "error")
+    if operation_ready is not None:
+        _operation_kind, _request_id = operation_ready
+        _ = _request_id
+        try:
+            if _operation_kind == "initialize":
+                with mo.status.spinner(
+                    title="Initializing training session",
+                ) as _spinner:
+                    _device = resolve_device(str(device_select.value))
+                    _session = create_training_session(
+                        str(config_path.value),
+                        _device,
+                        progress_callback=lambda message: _spinner.update(subtitle=message),
+                    )
+                set_session(_session)
+            elif _operation_kind == "train":
+                _current = get_session()
+                if _current is None:
+                    raise RuntimeError("Initialize training before stepping")
+                _requested_steps = int(steps_per_click.value)
+                _available_steps = max(0, _current.max_steps - _current.step)
+                _total_steps = min(_requested_steps, _available_steps)
+                if _total_steps <= 0:
+                    raise RuntimeError(f"Training complete at step {_current.step}")
+                with mo.status.progress_bar(
+                    total=_total_steps,
+                    title="Training model",
+                    completion_title="Training request complete",
+                    remove_on_exit=True,
+                ) as _progress:
+                    for _step_index in range(_total_steps):
+                        _ = _step_index
+                        _current.train_steps(
+                            1,
+                            progress_callback=lambda line: _progress.update(
+                                increment=0,
+                                subtitle=line,
+                            ),
+                        )
+                        _progress.update()
+            elif _operation_kind == "validate":
+                _current = get_session()
+                if _current is None:
+                    raise RuntimeError("Initialize training before validation")
+                with mo.status.spinner(
+                    title="Validating model",
+                ) as _spinner:
+                    _current.validate_now(
+                        progress_callback=lambda line: _spinner.update(subtitle=line)
+                    )
+            else:
+                raise ValueError(f"Unknown training operation: {_operation_kind}")
+        except (
+            FileNotFoundError,
+            ImportError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            set_training_error(str(exc))
         else:
-            try:
-                _previous_step = _current.step
-                _current.train_steps(1)
-                _completed_steps = _run.completed_steps + int(_current.step > _previous_step)
-                _status = (
-                    "completed"
-                    if _completed_steps >= _run.total_steps or _current.step >= _current.max_steps
-                    else "running"
-                )
-                _next_run = TrainingRunState(
-                    _run.total_steps,
-                    _completed_steps,
-                    _status,
-                )
-            except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as exc:
-                set_training_error(str(exc))
-                _next_run = TrainingRunState(
-                    _run.total_steps,
-                    _run.completed_steps,
-                    "error",
-                )
-        set_training_run(_next_run)
-        if not _next_run.active:
+            set_training_error(None)
+        finally:
+            set_operation(None)
             set_version(lambda version: version + 1)
+    return
+
+
+@app.cell
+def _(session_log):
+    session_log
     return
 
 

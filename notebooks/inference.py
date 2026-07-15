@@ -43,6 +43,7 @@ with app.setup:
         render_batch_result,
         selected_checkpoints_from_table,
     )
+    from notebooks._support.logging_helpers import capture_log_lines, log_view
     from notebooks._support.ml_data_helpers import (
         discover_normalized_manifest_status,
         selected_index_rows,
@@ -223,13 +224,19 @@ def _():
     get_inference_request, set_inference_request = mo.state(None)
     get_inference_submission_error, set_inference_submission_error = mo.state(None)
     get_inference_result, set_inference_result = mo.state(None)
+    get_inference_error, set_inference_error = mo.state(None)
+    get_inference_logs, set_inference_logs = mo.state(())
     return (
+        get_inference_error,
+        get_inference_logs,
         get_inference_request,
         get_inference_result,
         get_inference_submission_error,
         set_inference_request,
         set_inference_result,
         set_inference_submission_error,
+        set_inference_error,
+        set_inference_logs,
     )
 
 
@@ -238,7 +245,10 @@ def _(
     device_select,
     selected_checkpoints,
     selected_index_frame,
+    set_inference_error,
+    set_inference_logs,
     set_inference_request,
+    set_inference_result,
     set_inference_submission_error,
     store,
 ):
@@ -255,6 +265,9 @@ def _(
 
     def commit_inference(value):
         next_value = int(value or 0) + 1
+        set_inference_result(None)
+        set_inference_error(None)
+        set_inference_logs(())
         try:
             submission = make_inference_submission(
                 submit_id=next_value,
@@ -289,40 +302,8 @@ def _(
 
 
 @app.cell
-def _(get_inference_request, set_inference_result):
-    inference_request = get_inference_request()
-    device = None
-    inference_error = None
-    inference_result = None
-    inference_submission = None
-    if inference_request is not None:
-        try:
-            inference_submission = inference_request.submission
-            device = resolve_device(inference_submission.device)
-            inference_result = evaluate_checkpoints(
-                inference_request.store,
-                inference_request.selected_index_frame,
-                inference_submission.checkpoints,
-                device=device,
-                suffix_steps=inference_submission.masked_suffix_steps,
-                rollout_steps=inference_submission.rollout_steps,
-            )
-            set_inference_result(inference_result)
-        except (
-            FileNotFoundError,
-            OSError,
-            TypeError,
-            ValueError,
-            RuntimeError,
-            NotImplementedError,
-        ) as exc:
-            inference_error = str(exc)
-    return device, inference_error, inference_request, inference_result, inference_submission
-
-
-@app.cell
-def _(get_inference_result, inference_result):
-    result = inference_result or get_inference_result()
+def _(get_inference_result):
+    result = get_inference_result()
     row_options = (
         [
             f"{idx}: {inference_group_label(group_key)}"
@@ -350,10 +331,10 @@ def _(batch_row_select, result):
 
 
 @app.cell
-def _(batch_result_view, get_inference_submission_error, inference_error):
+def _(batch_result_view, get_inference_error, get_inference_submission_error):
     inference_view = render_inference_view(
         submission_error=get_inference_submission_error(),
-        inference_error=inference_error,
+        inference_error=get_inference_error(),
         result_view=batch_result_view,
     )
     return (inference_view,)
@@ -409,27 +390,83 @@ def _(
     checkpoint_root,
     checkpoint_table,
     device_select,
+    get_inference_request,
     inference_view,
     masked_suffix_steps,
     rollout_steps,
     run_inference,
 ):
+    inference_request_ready = get_inference_request()
     checkpoint_view = (
         mo.callout(checkpoint_error, kind="warn")
         if checkpoint_error is not None
         else checkpoint_table
     )
-    mo.vstack(
-        [
-            mo.md("## Batch inference"),
-            mo.hstack([checkpoint_root, device_select], justify="start"),
-            checkpoint_view,
-            mo.hstack([masked_suffix_steps, rollout_steps], justify="start"),
-            run_inference,
-            batch_row_select,
-            inference_view,
-        ]
+    items = [
+        mo.md("## Batch inference"),
+        mo.hstack([checkpoint_root, device_select], justify="start"),
+        checkpoint_view,
+        mo.hstack([masked_suffix_steps, rollout_steps], justify="start"),
+        run_inference,
+    ]
+    if inference_request_ready is None:
+        items.extend((batch_row_select, inference_view))
+    mo.vstack(items)
+    return (inference_request_ready,)
+
+
+@app.cell
+def _(
+    inference_request_ready,
+    set_inference_error,
+    set_inference_logs,
+    set_inference_request,
+    set_inference_result,
+):
+    if inference_request_ready is not None:
+        _log_lines = []
+        try:
+            with mo.status.spinner(title="Running inference") as _spinner:
+                with capture_log_lines(
+                    _log_lines,
+                    lambda line: _spinner.update(subtitle=line),
+                ):
+                    _submission = inference_request_ready.submission
+                    _device = resolve_device(_submission.device)
+                    _result = evaluate_checkpoints(
+                        inference_request_ready.store,
+                        inference_request_ready.selected_index_frame,
+                        _submission.checkpoints,
+                        device=_device,
+                        suffix_steps=_submission.masked_suffix_steps,
+                        rollout_steps=_submission.rollout_steps,
+                    )
+        except (
+            FileNotFoundError,
+            OSError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            NotImplementedError,
+        ) as exc:
+            set_inference_error(str(exc))
+        else:
+            set_inference_result(_result)
+            set_inference_error(None)
+        finally:
+            set_inference_logs(tuple(_log_lines))
+            set_inference_request(None)
+    return
+
+
+@app.cell
+def _(get_inference_logs):
+    inference_log = log_view(
+        get_inference_logs(),
+        title="Inference log",
+        empty="No inference run yet",
     )
+    inference_log
     return
 
 

@@ -55,6 +55,7 @@ def test_training_widget_includes_standard_traces_and_mask_boundaries() -> None:
 
     assert {trace.name for trace in widget._fig.data} == {"input", "target", "prediction"}
     assert {annotation.text for annotation in widget._fig.layout.annotations} >= {"mask_pred"}
+    assert widget._fig.layout.title.text == "train | step=5"
 
 
 def test_interactive_session_executes_steps_and_logs_each_one() -> None:
@@ -95,6 +96,17 @@ def test_interactive_session_executes_steps_and_logs_each_one() -> None:
     assert session.log_lines
     assert any("Running first training step" in line for line in session.log_lines)
     assert sum("train/loss_ce=" in line for line in session.log_lines or ()) == 2
+
+
+def test_capture_logs_reports_records_incrementally() -> None:
+    lines = []
+    updates = []
+
+    with training_helpers._capture_logs(lines, updates.append):
+        training_helpers.train_module.logger.info("Preparing test session")
+
+    assert any("Preparing test session" in line for line in lines)
+    assert updates == lines
 
 
 def test_validation_exposes_teacher_forced_batches_and_rollouts(monkeypatch) -> None:
