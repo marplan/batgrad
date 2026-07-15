@@ -55,6 +55,9 @@ def test_default_inference_colors_start_with_visible_roles() -> None:
         checkpoint_alias="checkpoint",
         checkpoint_path="checkpoint.pt",
         suffix_steps=0,
+        context_predictions=torch.empty(
+            (1, 0, len(config.data.target_columns)),
+        ),
         predictions=torch.zeros((1, sequence_len, len(config.data.target_columns))),
         metrics=None,
         target_start=0,

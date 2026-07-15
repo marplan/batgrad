@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId
+from batgrad.logging import get_logger
 from batgrad.ml.checkpoint import LoadedCheckpoint, load_checkpoint
 from batgrad.ml.config import ExperimentConfig, resolved_validation_masked_suffix
 from batgrad.ml.data.config import LoaderConfig, WindowConfig
@@ -15,12 +16,14 @@ from batgrad.ml.data.materialization import materialize_batch_plan
 from batgrad.ml.data.planning import BatchPlan, WindowRef, build_stream_plans
 from batgrad.ml.experiment import scaling_rules
 from batgrad.ml.metrics import LossMetrics, loss_metrics_to_cpu
-from batgrad.ml.rollout import rollout_batch
+from batgrad.ml.rollout import rollout_with_context
 
 if TYPE_CHECKING:
     import polars as pl
 
     from batgrad.storage.store import DatasetStoreReader
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +47,7 @@ class InferencePrediction:
         checkpoint_alias: User-provided checkpoint label.
         checkpoint_path: Loaded checkpoint path.
         suffix_steps: Requested suffix width; zero denotes classic one-step rollout.
+        context_predictions: CPU context predictions shaped `(B, context_len, C_out)`.
         predictions: CPU tensor shaped `(B, rollout_len, C_out)`.
         metrics: CPU count-weighted metrics for observed targets.
         target_start: Target offset aligned with prediction step zero.
@@ -52,6 +56,7 @@ class InferencePrediction:
     checkpoint_alias: str
     checkpoint_path: str
     suffix_steps: int
+    context_predictions: torch.Tensor
     predictions: torch.Tensor
     metrics: LossMetrics | None
     target_start: int
@@ -134,7 +139,7 @@ def discover_checkpoints(root: str | Path = ".") -> tuple[Path, ...]:
 
 
 @torch.no_grad()
-def evaluate_checkpoints(  # noqa: C901
+def evaluate_checkpoints(  # noqa: C901, PLR0912
     store: DatasetStoreReader,
     selected_index_frame: pl.DataFrame,
     selections: tuple[CheckpointSelection, ...],
@@ -180,7 +185,12 @@ def evaluate_checkpoints(  # noqa: C901
         raise ValueError("Rollout steps must be > 0")
     if not suffix_steps or any(step < 0 for step in suffix_steps):
         raise ValueError("Suffix steps must contain one or more non-negative values")
-    checkpoints = tuple(load_checkpoint(selection.path, device) for selection in selections)
+    checkpoints_list = []
+    for selection in selections:
+        logger.info("Loading checkpoint alias=%s path=%s", selection.alias, selection.path)
+        checkpoints_list.append(load_checkpoint(selection.path, device))
+    checkpoints = tuple(checkpoints_list)
+    logger.info("Loaded %d checkpoint(s)", len(checkpoints))
     _validate_compatible_checkpoints(checkpoints)
     reference = checkpoints[0].config
     context_len = reference.loader.seq_len
@@ -227,6 +237,12 @@ def evaluate_checkpoints(  # noqa: C901
             drop_incomplete=False,
         ),
     )
+    logger.info(
+        "Materializing inference batch streams=%d context_steps=%d rollout_steps=%d",
+        len(streams),
+        context_len,
+        effective_rollout,
+    )
     batch = materialize_batch_plan(
         store,
         BatchPlan(refs=tuple(WindowRef(stream, 0) for stream in streams)),
@@ -239,21 +255,30 @@ def evaluate_checkpoints(  # noqa: C901
     inputs = batch.inputs.to(device=device)
     targets = batch.targets.to(device=device)
     mask = batch.mask.to(device=device)
-    predictions = tuple(
-        _prediction_series(
-            selection,
-            checkpoint,
-            inputs,
-            targets,
-            mask,
-            context_len,
-            effective_rollout,
-            requested_suffix_steps,
-            device,
-        )
-        for selection, checkpoint in zip(selections, checkpoints, strict=True)
-        for requested_suffix_steps in suffix_steps
-    )
+    logger.info("Inference batch ready")
+    prediction_items = []
+    for selection, checkpoint in zip(selections, checkpoints, strict=True):
+        for requested_suffix_steps in suffix_steps:
+            logger.info(
+                "Evaluating checkpoint alias=%s suffix_steps=%d",
+                selection.alias,
+                requested_suffix_steps,
+            )
+            prediction_items.append(
+                _prediction_series(
+                    selection,
+                    checkpoint,
+                    inputs,
+                    targets,
+                    mask,
+                    context_len,
+                    effective_rollout,
+                    requested_suffix_steps,
+                    device,
+                )
+            )
+    predictions = tuple(prediction_items)
+    logger.info("Inference complete prediction_series=%d", len(predictions))
     return InferenceResult(
         config=reference,
         inputs=inputs.detach().cpu(),
@@ -282,7 +307,7 @@ def _prediction_series(
         enabled=suffix_steps > 0,
         suffix_steps=suffix_steps or checkpoint.config.train.masked_suffix.suffix_steps,
     )
-    result = rollout_batch(
+    result = rollout_with_context(
         checkpoint.config,
         checkpoint.model,
         inputs,
@@ -297,6 +322,7 @@ def _prediction_series(
         checkpoint_alias=selection.alias,
         checkpoint_path=selection.path,
         suffix_steps=suffix_steps,
+        context_predictions=result.context_prediction.detach().cpu(),
         predictions=result.prediction.detach().cpu(),
         metrics=loss_metrics_to_cpu(result.metrics),
         target_start=result.target_start,

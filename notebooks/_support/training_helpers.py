@@ -375,6 +375,7 @@ def build_training_widget(
         suffix_steps=session.config.train.masked_suffix.suffix_steps
         if session.config.train.masked_suffix.enabled
         else 0,
+        context_predictions=trace.predictions[:, :0],
         predictions=trace.predictions,
         metrics=None,
         target_start=0,

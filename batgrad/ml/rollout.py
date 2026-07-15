@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from batgrad.ml.nn import MambaCarryState
 
 ROLLOUT_INPUT_RANK = 3
+PREDICTION_MIN_RANK = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,16 @@ class RolloutResult:
             equal to `context_len - 1` under the next-row target contract.
     """
 
+    prediction: torch.Tensor
+    metrics: LossMetrics | None
+    target_start: int
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutEvaluation:
+    """Context and autoregressive predictions with shared target alignment."""
+
+    context_prediction: torch.Tensor
     prediction: torch.Tensor
     metrics: LossMetrics | None
     target_start: int
@@ -169,6 +180,69 @@ def predict_context(
     with model_autocast(config, device):
         logits = cast("torch.Tensor", model(encoded, mask=None))
     return decode_categorical_logits(logits, target_ranges(config, device))
+
+
+def rollout_with_context(
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    *,
+    context_len: int,
+    rollout_steps: int,
+    suffix: MaskedSuffixConfig,
+    device: torch.device,
+    targets: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+) -> RolloutEvaluation:
+    """Predict the observed context and autoregressive rollout with one contract."""
+    context_prediction = predict_context(config, model, inputs, context_len, device)
+    result = rollout_batch(
+        config,
+        model,
+        inputs,
+        context_len=context_len,
+        rollout_steps=rollout_steps,
+        suffix=suffix,
+        device=device,
+        targets=targets,
+        mask=mask,
+    )
+    return RolloutEvaluation(
+        context_prediction=context_prediction,
+        prediction=result.prediction,
+        metrics=result.metrics,
+        target_start=result.target_start,
+    )
+
+
+def align_rollout_prediction(
+    context_prediction: torch.Tensor,
+    prediction: torch.Tensor,
+    *,
+    target_start: int,
+    total_steps: int,
+) -> torch.Tensor:
+    """Align context and rollout predictions on the complete target sequence."""
+    if context_prediction.ndim < PREDICTION_MIN_RANK or prediction.ndim != context_prediction.ndim:
+        raise ValueError("context and rollout predictions must have matching rank >= 2")
+    if context_prediction.shape[:-2] != prediction.shape[:-2]:
+        raise ValueError("context and rollout predictions must have matching batch dimensions")
+    if context_prediction.shape[-1] != prediction.shape[-1]:
+        raise ValueError("context and rollout predictions must have matching output width")
+    if target_start < 0 or total_steps < 0:
+        raise ValueError("target_start and total_steps must be non-negative")
+    aligned = torch.full(
+        (*context_prediction.shape[:-2], total_steps, context_prediction.shape[-1]),
+        float("nan"),
+        dtype=context_prediction.dtype,
+        device=context_prediction.device,
+    )
+    context_steps = min(int(context_prediction.shape[-2]), total_steps)
+    aligned[..., :context_steps, :] = context_prediction[..., :context_steps, :]
+    rollout_end = min(target_start + int(prediction.shape[-2]), total_steps)
+    rollout_steps = max(0, rollout_end - target_start)
+    aligned[..., target_start:rollout_end, :] = prediction[..., :rollout_steps, :]
+    return aligned
 
 
 def _one_step_rollout(

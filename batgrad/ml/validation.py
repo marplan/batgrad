@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId
+from batgrad.logging import get_logger
 from batgrad.ml.config import resolved_validation_masked_suffix
 from batgrad.ml.data.config import GROUP_KEY_CELL_CYCLE_PROTOCOL, WindowConfig
 from batgrad.ml.data.materialization import materialize_window_ref
@@ -15,7 +16,7 @@ from batgrad.ml.distributed import all_reduce_loss_metrics, unwrap_model
 from batgrad.ml.experiment import loader_config, scaling_rules
 from batgrad.ml.metrics import LossMetrics, add_loss_metrics
 from batgrad.ml.objective import batch_loss_with_metrics
-from batgrad.ml.rollout import predict_context, rollout_batch
+from batgrad.ml.rollout import RolloutEvaluation, rollout_batch, rollout_with_context
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -26,6 +27,8 @@ if TYPE_CHECKING:
     from batgrad.ml.distributed import DistributedContext
     from batgrad.ml.objective import ObjectiveTrace
     from batgrad.storage.store import DatasetStoreReader
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +63,7 @@ def validate(
     model.eval()
     teacher_forced_metrics = None
     if config.validation.max_tf_batches > 0:
+        logger.info("Running teacher-forced validation")
         teacher_forced_metrics = _validate_batches(
             config,
             model,
@@ -67,9 +71,11 @@ def validate(
             device,
             trace_callback=trace_callback,
         )
+        logger.info("Teacher-forced validation ready")
     rollout_metrics = None
     rollout_examples: tuple[RolloutExample, ...] = ()
     if config.validation.rollout_steps > 0 and (dist_ctx is None or dist_ctx.is_main):
+        logger.info("Running rollout validation")
         rollout_result = run_rollouts(
             config,
             unwrap_model(model),
@@ -79,6 +85,7 @@ def validate(
         )
         rollout_metrics = rollout_result.rollout_metrics
         rollout_examples = rollout_result.rollout_examples
+        logger.info("Rollout validation ready")
     return ValidationResult(teacher_forced_metrics, rollout_metrics, rollout_examples)
 
 
@@ -187,7 +194,10 @@ def run_rollouts(
                     context_len,
                     stored_rollout_len,
                 )
-            result = rollout_batch(
+            rollout_fn = (
+                rollout_with_context if config.validation.log_rollout_plots else rollout_batch
+            )
+            result = rollout_fn(
                 config,
                 model,
                 inputs,
@@ -201,12 +211,14 @@ def run_rollouts(
             if result.metrics is not None:
                 metrics = add_loss_metrics(metrics, result.metrics)
             if result.prediction.shape[1] and config.validation.log_rollout_plots:
+                if not isinstance(result, RolloutEvaluation):
+                    raise RuntimeError(
+                        "rollout plot evaluation did not include context predictions"
+                    )
                 plot_series.append(
                     RolloutExample(
                         inputs=inputs[:, : context_len + result.prediction.shape[1], :].cpu()[0],
-                        context_prediction=predict_context(
-                            config, model, inputs, context_len, device
-                        ).cpu()[0],
+                        context_prediction=result.context_prediction.cpu()[0],
                         prediction=result.prediction.cpu()[0],
                         target=targets[:, : context_len + result.prediction.shape[1], :].cpu()[0],
                         target_start=result.target_start,
