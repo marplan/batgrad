@@ -61,17 +61,17 @@ target, start the instance, SSH as `ubuntu`, clone the repo, copy or mount data 
 ### Vast.ai
 
 ```sh
-docker buildx build --platform linux/amd64 --target remote-vastai \
+docker buildx build -f docker/Dockerfile --platform linux/amd64 --target remote-vastai \
   --build-arg BASE_IMAGE=vastai/base-image:cuda-13.0.2-cudnn-devel-ubuntu24.04-2026-03-26 \
-  -t marplan/batgrad:vastai --push .
+  -t <your-docker-registry> --push .
 ```
 
 ### RunPod
 
 ```sh
-docker buildx build --platform linux/amd64 --target remote-runpod \
+docker buildx build -f docker/Dockerfile --platform linux/amd64 --target remote-runpod \
   --build-arg BASE_IMAGE=runpod/base:1.0.6-dev-feat-sonarqube-cuda1300-ubuntu2404 \
-  -t marplan/batgrad:runpod --push .
+  -t <your-docker-registry> --push .
 ```
 
 ## Remote Instance Setup
