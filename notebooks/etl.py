@@ -20,7 +20,7 @@ with app.setup:
         sort_manifest,
         with_manifest_row_id,
     )
-    from batgrad.logging import configure_logger
+    from batgrad.logging import configure_logging
     from batgrad.notebook_helpers import make_plot_inspection_result, open_local_store_status
     from notebooks._support.etl_helpers import (
         EtlPlotResult,
@@ -31,7 +31,7 @@ with app.setup:
         stage_plot_columns,
     )
 
-    configure_logger(level="INFO")
+    configure_logging(level="INFO")
 
 
 @app.cell
@@ -247,6 +247,7 @@ def _(dataset_controls_view, etl_controls, inspection_result, plot_view):
             inspection_result.view,
         ]
     ).style(gap="0")
+    return
 
 
 if __name__ == "__main__":

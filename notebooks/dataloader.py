@@ -2,7 +2,7 @@
 
 import marimo
 
-__generated_with = "0.23.14"
+__generated_with = "0.23.13"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -12,7 +12,7 @@ with app.setup:
     import polars as pl
 
     from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId
-    from batgrad.logging import configure_logger
+    from batgrad.logging import configure_logging
     from batgrad.ml.data.config import LoaderConfig, ScalingRule, ValidationConfig, WindowConfig
     from batgrad.ml.data.index import MlDatasetIndex
     from batgrad.ml.data.loader import create_dataloader_from_index, create_index
@@ -50,7 +50,7 @@ with app.setup:
         selected_index_rows,
     )
 
-    configure_logger(level="INFO")
+    configure_logging(level="INFO")
 
 
 @app.cell
@@ -170,7 +170,7 @@ def _(
             ml_index = None
             index_error = str(exc)
             index_frame = pl.DataFrame()
-    return index_error, index_frame, ml_index
+    return index_error, index_frame
 
 
 @app.cell

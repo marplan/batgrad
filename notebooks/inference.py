@@ -11,7 +11,7 @@ with app.setup:
     import marimo as mo
     import polars as pl
 
-    from batgrad.logging import configure_logger
+    from batgrad.logging import configure_logging
     from batgrad.ml.data.config import ValidationConfig
     from batgrad.ml.data.index import MlDatasetIndex
     from batgrad.ml.data.loader import create_index
@@ -49,7 +49,7 @@ with app.setup:
         selected_index_rows,
     )
 
-    configure_logger(level="INFO")
+    configure_logging(level="INFO")
 
 
 @app.cell

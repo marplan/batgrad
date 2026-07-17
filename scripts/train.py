@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 
-from batgrad.logging import configure_logger
+from batgrad.logging import configure_logging
 from batgrad.ml.train import train_from_config
 
 
 def main() -> None:
-    configure_logger()
+    configure_logging()
     parser = argparse.ArgumentParser(description="Run a batgrad ML training job")
     parser.add_argument("--config", required=True)
     args = parser.parse_args()

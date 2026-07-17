@@ -21,15 +21,15 @@ _RECENT_LOG_LIMIT = 2000
 _DEFAULT_FORMAT = "%(asctime)s %(levelname)s %(location)s %(message)s"
 _DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-_CYAN = "\033[36m"
-_GREEN = "\033[32m"
-_YELLOW = "\033[33m"
-_RED = "\033[31m"
-_MAGENTA = "\033[35m"
-_BLUE = "\033[34m"
-_DIM = "\033[2m"
-_BOLD = "\033[1m"
-_RESET = "\033[0m"
+_ANSI_CYAN = "\033[36m"
+_ANSI_GREEN = "\033[32m"
+_ANSI_YELLOW = "\033[33m"
+_ANSI_RED = "\033[31m"
+_ANSI_MAGENTA = "\033[35m"
+_ANSI_BLUE = "\033[34m"
+_ANSI_DIM = "\033[2m"
+_ANSI_BOLD = "\033[1m"
+_ANSI_RESET = "\033[0m"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,11 +58,11 @@ _state = _LoggerState()
 
 class LogFormatter(logging.Formatter):
     LEVELS_COLOR: ClassVar[dict[str, str]] = {
-        "DEBUG": f"{_CYAN}{_BOLD}-DEBUG-{_RESET}",
-        "INFO": f"{_GREEN}{_BOLD}-INFO-{_RESET}",
-        "WARNING": f"{_YELLOW}{_BOLD}-WARNING-{_RESET}",
-        "ERROR": f"{_RED}{_BOLD}-ERROR-{_RESET}",
-        "CRITICAL": f"{_MAGENTA}{_BOLD}-CRITICAL-{_RESET}",
+        "DEBUG": f"{_ANSI_CYAN}{_ANSI_BOLD}-DEBUG-{_ANSI_RESET}",
+        "INFO": f"{_ANSI_GREEN}{_ANSI_BOLD}-INFO-{_ANSI_RESET}",
+        "WARNING": f"{_ANSI_YELLOW}{_ANSI_BOLD}-WARNING-{_ANSI_RESET}",
+        "ERROR": f"{_ANSI_RED}{_ANSI_BOLD}-ERROR-{_ANSI_RESET}",
+        "CRITICAL": f"{_ANSI_MAGENTA}{_ANSI_BOLD}-CRITICAL-{_ANSI_RESET}",
     }
     LEVELS_PLAIN: ClassVar[dict[str, str]] = {
         "DEBUG": "-DEBUG-",
@@ -89,8 +89,8 @@ class LogFormatter(logging.Formatter):
         plain_name = copied.name
         copied.levelname = self._levels.get(copied.levelname, copied.levelname)
         if self.use_colors:
-            copied.name = f"{_BLUE}{plain_name}{_RESET}"
-            copied.location = f"{copied.name}{_DIM}:{copied.lineno}:{_RESET}"
+            copied.name = f"{_ANSI_BLUE}{plain_name}{_ANSI_RESET}"
+            copied.location = f"{copied.name}{_ANSI_DIM}:{copied.lineno}:{_ANSI_RESET}"
         else:
             copied.location = f"{plain_name}:{copied.lineno}:"
         return super().format(copied)
@@ -100,7 +100,7 @@ class LogFormatter(logging.Formatter):
         dt = datetime.fromtimestamp(record.created, tz=UTC).astimezone()
         rendered = dt.strftime(datefmt) if datefmt is not None else dt.isoformat(timespec="seconds")
         if self.use_colors:
-            return f"{_DIM}{rendered}{_RESET}"
+            return f"{_ANSI_DIM}{rendered}{_ANSI_RESET}"
         return rendered
 
 
@@ -140,7 +140,7 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
-def configure_logger(
+def configure_logging(
     level: str | int = logging.INFO,
     *,
     console: bool = True,
