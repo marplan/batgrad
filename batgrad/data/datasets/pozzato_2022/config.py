@@ -182,7 +182,22 @@ DATASET_SPEC = DatasetSpec(
         name="Pozzato 2022",
         year=2022,
         author="Pozzato",
-        misc={"Chemistry": "NMC/graphite"},
+        misc={
+            "chemistry": "NMC/graphite",
+            "authors": (
+                "Gabriele Pozzato",
+                "Anirudh Allam",
+                "Simona Onori",
+            ),
+            "doi": "10.1016/j.dib.2022.107995",
+            "license": "CC BY 4.0",
+            "source_url": (
+                "https://osf.io/qsabn/overview?view_only=2a03b6c78ef14922a3e244f3d549de78"
+            ),
+            "download_url": (
+                "https://www.dropbox.com/scl/fo/3ss0age6ggfcm67okldhw/h?dl=0&e=1"
+            ),
+        },
     ),
     processing_stages={
         DatasetStageId.ingested: INGEST_STAGE_SPEC,
