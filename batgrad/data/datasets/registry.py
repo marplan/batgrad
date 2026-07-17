@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from batgrad.data.datasets.pozzato_2022.config import DATASET as POZZATO_2022
 from batgrad.data.datasets.synthetic_pozzato_2022.config import (
@@ -16,6 +16,11 @@ _DATASETS: dict[str, Dataset] = {
     POZZATO_2022.spec.dataset_id: POZZATO_2022,
     SYNTHETIC_POZZATO_2022.spec.dataset_id: SYNTHETIC_POZZATO_2022,
 }
+
+
+def dataset_ids() -> tuple[DatasetId, ...]:
+    """Return all registered dataset IDs in processing order."""
+    return cast("tuple[DatasetId, ...]", tuple(_DATASETS))
 
 
 def get_dataset(dataset_id: DatasetId) -> Dataset:
