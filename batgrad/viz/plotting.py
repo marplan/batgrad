@@ -25,8 +25,10 @@ DEFAULT_TRACE_MODE = "lines+markers"
 DEFAULT_MARKER_SIZE = 6
 DEFAULT_MAX_POINTS_PER_TRACE = 1_000
 DEFAULT_MAX_POINTS_PER_FIGURE = 100_000
+DEFAULT_AXIS_TITLE_FONT_SIZE = 14
 DEFAULT_TIMESERIES_ROW_HEIGHT = 240
 DEFAULT_TIMESERIES_MIN_HEIGHT = 350
+DEFAULT_Y_TITLE_SHIFT = -55
 DEFAULT_EIS_HEIGHT = 650
 EIS_NEG_IMAG = "__batgrad_neg_z_imag"
 EIS_COLUMNS = (
@@ -74,6 +76,28 @@ def eis_subplot_kwargs() -> dict[str, object]:
     }
 
 
+def _add_aligned_y_title(
+    fig: go.Figure,
+    title: str,
+    *,
+    xref: str,
+    yref: str,
+) -> None:
+    fig.add_annotation(
+        font={"size": DEFAULT_AXIS_TITLE_FONT_SIZE},
+        text=title,
+        textangle=-90,
+        x=0,
+        xanchor="center",
+        xref=xref,
+        xshift=DEFAULT_Y_TITLE_SHIFT,
+        y=0.5,
+        yanchor="middle",
+        yref=yref,
+        showarrow=False,
+    )
+
+
 def make_timeseries_figure(
     y_cols: tuple[str, ...],
     axis_col: str,
@@ -84,12 +108,24 @@ def make_timeseries_figure(
     fig.update_layout(
         height=height,
         hovermode="closest",
+        margin={"l": 110},
         paper_bgcolor="rgba(0,0,0,0)",
         title=title,
     )
-    fig.update_xaxes(title_text=str(axis_col), row=len(y_cols), col=1)
+    fig.update_xaxes(
+        title_font={"size": DEFAULT_AXIS_TITLE_FONT_SIZE},
+        title_text=str(axis_col),
+        row=len(y_cols),
+        col=1,
+    )
     for row_idx, y_col in enumerate(y_cols, start=1):
-        fig.update_yaxes(title_text=str(y_col), row=row_idx, col=1)
+        yref = "y domain" if row_idx == 1 else f"y{row_idx} domain"
+        _add_aligned_y_title(
+            fig,
+            str(y_col),
+            xref="paper",
+            yref=yref,
+        )
     return fig, height
 
 
@@ -98,15 +134,49 @@ def make_eis_figure(title: str | dict[str, object]) -> tuple[go.Figure, int]:
     fig.update_layout(
         height=DEFAULT_EIS_HEIGHT,
         hovermode="closest",
+        margin={"l": 110},
         paper_bgcolor="rgba(0,0,0,0)",
         title=title,
     )
-    fig.update_xaxes(title_text=str(BaseColumns.z_real), row=1, col=1)
-    fig.update_yaxes(title_text=f"-{BaseColumns.z_imag}", row=1, col=1)
-    fig.update_xaxes(title_text=str(BaseColumns.freq), type="log", row=1, col=2)
-    fig.update_yaxes(title_text=str(BaseColumns.z_mag), row=1, col=2)
-    fig.update_xaxes(title_text=str(BaseColumns.freq), type="log", row=2, col=2)
-    fig.update_yaxes(title_text=str(BaseColumns.z_phase), row=2, col=2)
+    axis_title_font = {"size": DEFAULT_AXIS_TITLE_FONT_SIZE}
+    fig.update_xaxes(
+        title_font=axis_title_font,
+        title_text=str(BaseColumns.z_real),
+        row=1,
+        col=1,
+    )
+    fig.update_xaxes(
+        title_font=axis_title_font,
+        title_text=str(BaseColumns.freq),
+        type="log",
+        row=1,
+        col=2,
+    )
+    fig.update_xaxes(
+        title_font=axis_title_font,
+        title_text=str(BaseColumns.freq),
+        type="log",
+        row=2,
+        col=2,
+    )
+    _add_aligned_y_title(
+        fig,
+        f"-{BaseColumns.z_imag}",
+        xref="x domain",
+        yref="y domain",
+    )
+    _add_aligned_y_title(
+        fig,
+        str(BaseColumns.z_mag),
+        xref="x2 domain",
+        yref="y2 domain",
+    )
+    _add_aligned_y_title(
+        fig,
+        str(BaseColumns.z_phase),
+        xref="x3 domain",
+        yref="y3 domain",
+    )
     return fig, DEFAULT_EIS_HEIGHT
 
 

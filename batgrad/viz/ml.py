@@ -60,7 +60,7 @@ class MlBatchPreview:
     spec: MlBatchPreviewSpec
 
 
-_TRACE_LABELS = ("input", "target", "prediction", "stream")
+_TRACE_LABELS = ("stream", "input", "target", "prediction")
 PLOT_SEQUENCE_RANK = 2
 
 
