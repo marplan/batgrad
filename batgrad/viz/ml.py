@@ -228,6 +228,11 @@ def build_inference_widget(
     predictions = tuple(
         replace(
             series,
+            context_predictions=inverse_scale_tensor(
+                series.context_predictions,
+                config.data.target_columns,
+                scaling,
+            ),
             predictions=inverse_scale_tensor(
                 series.predictions,
                 config.data.target_columns,

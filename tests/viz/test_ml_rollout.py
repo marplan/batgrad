@@ -79,6 +79,12 @@ def test_default_inference_colors_start_with_visible_roles() -> None:
     assert colors_by_name["ground truth"] == COLORWAY[0]
     prediction_name = next(name for name in colors_by_name if name.startswith("prediction"))
     assert colors_by_name[prediction_name] == COLORWAY[1]
+    prediction_idx = next(
+        idx for idx, trace in enumerate(widget._fig.data) if trace.name == prediction_name
+    )
+    prediction_source = widget._sources[prediction_idx]
+    prediction_values = prediction_source.lf.select(prediction_source.y_col).collect().to_series()
+    assert prediction_values.to_list() == [10.0, 10.0, 0.0]
     assert {annotation.text for annotation in widget._fig.layout.annotations} >= {"rollout_pred"}
 
 
