@@ -160,7 +160,7 @@
     "use_amp": true,
     "compile_model": true,
     "init_from": null,
-    "output_dir": "/workspace/ubuntu/batgrad/output/ml_baseline_runs",
+    "output_dir": "outputs/runs",
     "name": null
   },
   "logging": {
@@ -169,7 +169,7 @@
     "mirror_stdout": true,
     "wandb": {
       "project": "batgrad",
-      "entity": "personal_marplan",
+      "entity": null,
       "group": "batgrad-baseline",
       "name": null,
       "tags": []

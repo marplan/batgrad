@@ -1642,8 +1642,8 @@ def _(
     )
     run_output_dir = mo.ui.text(
         value=""
-        if _source_value("run.output_dir", "ml/runs") is None
-        else str(_source_value("run.output_dir", "ml/runs")),
+        if _source_value("run.output_dir", "outputs/runs") is None
+        else str(_source_value("run.output_dir", "outputs/runs")),
         label="",
         full_width=True,
         on_change=_remember("run.output_dir"),

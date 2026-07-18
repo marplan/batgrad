@@ -29,7 +29,7 @@ selected = index.frame.filter(pl.col(BaseColumns.proto) == "cycling").head(1)
 result = evaluate_checkpoints(
     store,
     selected,
-    (CheckpointSelection("baseline", "output/run/checkpoints/run/final.pt"),),
+    (CheckpointSelection("baseline", "outputs/runs/run/checkpoints/run/final.pt"),),
     device=torch.device("cuda:0"),
     suffix_steps=(0, config.train.masked_suffix.suffix_steps),
     rollout_steps=256,

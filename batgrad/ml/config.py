@@ -527,7 +527,7 @@ class RunConfig:
     use_amp: bool = True
     compile_model: bool = False
     init_from: str | None = None
-    output_dir: str | None = "ml/runs"
+    output_dir: str | None = "outputs/runs"
     name: str | None = None
 
 
@@ -938,4 +938,6 @@ def config_to_dict(value: object) -> object:
         return [config_to_dict(item) for item in value]
     if isinstance(value, dict):
         return {str(key): config_to_dict(item) for key, item in value.items()}
+    if isinstance(value, str):
+        return str(value)
     return value

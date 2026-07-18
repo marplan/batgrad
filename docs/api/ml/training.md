@@ -14,7 +14,7 @@ Distributed training is enabled by the environment that `torchrun` creates and
 currently requires CUDA and NCCL:
 
 ```sh
-torchrun --standalone --nproc_per_node=2 scripts/train.py \
+OMP_NUM_THREADS=1 uv run torchrun --standalone --nproc-per-node=2 scripts/train.py \
   --config configs/ml_baseline.json
 ```
 

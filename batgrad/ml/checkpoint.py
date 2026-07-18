@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -13,9 +14,9 @@ from batgrad.ml.nn import build_model
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from pathlib import Path
 
 logger = get_logger(__name__)
+CHECKPOINT_FORMAT_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,8 +37,10 @@ class LoadedCheckpoint:
 def load_checkpoint_payload(
     path: str | Path,
     device: torch.device | str = "cpu",
+    *,
+    trusted: bool = False,
 ) -> dict[str, object]:
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    checkpoint = torch.load(path, map_location=device, weights_only=not trusted)
     if not isinstance(checkpoint, dict):
         raise TypeError(f"Checkpoint must contain an object payload: {path}")
     return cast("dict[str, object]", checkpoint)
@@ -82,8 +85,8 @@ def load_checkpoint(path: str | Path, device: torch.device) -> LoadedCheckpoint:
         TypeError: If required configuration or model payloads are absent.
         RuntimeError: If model weights are incompatible with the configuration.
 
-    Warning:
-        Checkpoints use PyTorch object deserialization. Load only trusted files.
+    Note:
+        Checkpoints are loaded through PyTorch's restricted weights-only unpickler.
     """
     payload = load_checkpoint_payload(path, device)
     state_dict = payload.get("model")
@@ -161,6 +164,50 @@ def training_checkpoint_payload(
             "global_step": step,
         },
     }
+
+
+def export_checkpoint(
+    source: str | Path,
+    destination: str | Path,
+    *,
+    batgrad_commit: str,
+) -> Path:
+    """Export a compact checkpoint for inference and weight initialization.
+
+    The exported payload omits optimizer, scheduler, scaler, and cursor state. It
+    retains the validated experiment configuration needed to reconstruct the
+    model and check data compatibility.
+
+    Args:
+        source: Full or compact batgrad checkpoint.
+        destination: Output `.pt` path.
+        batgrad_commit: Full batgrad source revision used for the export.
+
+    Returns:
+        The created checkpoint path.
+    """
+    if not batgrad_commit.strip():
+        raise ValueError("batgrad_commit must not be empty")
+    payload = load_checkpoint_payload(source, trusted=True)
+    state_dict = payload.get("model")
+    if not isinstance(state_dict, dict) or not all(
+        isinstance(name, str) and isinstance(value, torch.Tensor)
+        for name, value in state_dict.items()
+    ):
+        raise TypeError(f"Checkpoint must contain a tensor 'model' state dict: {source}")
+    config = checkpoint_config(payload, source)
+    step = payload.get("step")
+    exported: dict[str, object] = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "model": state_dict,
+        "config": config_to_dict(config),
+        "step": step if isinstance(step, int) else None,
+        "batgrad_commit": batgrad_commit,
+    }
+    output = Path(destination)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(exported, output)
+    return output
 
 
 def checkpoint_dir(run_dir: Path | None, run_id: str | None) -> Path | None:
