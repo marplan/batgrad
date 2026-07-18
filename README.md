@@ -100,16 +100,10 @@ Configure `docker/dotfiles.env` if used, then run:
 
 ### Explore
 
-Download both normalized baseline datasets to `DATA_ROOT`:
+Download all published datasets to `DATA_ROOT` and checkpoints to `outputs/checkpoints/`:
 
 ```sh
 uv run scripts/hf_assets.py download
-```
-
-Download the example checkpoint to `outputs/checkpoints/` when available:
-
-```sh
-uv run scripts/hf_assets.py download --ckpt batgrad_init_baseline
 ```
 
 Start the Marimo development server:

@@ -169,8 +169,6 @@ def training_checkpoint_payload(
 def export_checkpoint(
     source: str | Path,
     destination: str | Path,
-    *,
-    batgrad_commit: str,
 ) -> Path:
     """Export a compact checkpoint for inference and weight initialization.
 
@@ -181,13 +179,10 @@ def export_checkpoint(
     Args:
         source: Full or compact batgrad checkpoint.
         destination: Output `.pt` path.
-        batgrad_commit: Full batgrad source revision used for the export.
 
     Returns:
         The created checkpoint path.
     """
-    if not batgrad_commit.strip():
-        raise ValueError("batgrad_commit must not be empty")
     payload = load_checkpoint_payload(source, trusted=True)
     state_dict = payload.get("model")
     if not isinstance(state_dict, dict) or not all(
@@ -202,7 +197,6 @@ def export_checkpoint(
         "model": state_dict,
         "config": config_to_dict(config),
         "step": step if isinstance(step, int) else None,
-        "batgrad_commit": batgrad_commit,
     }
     output = Path(destination)
     output.parent.mkdir(parents=True, exist_ok=True)

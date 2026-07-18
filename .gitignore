@@ -26,5 +26,4 @@ site/
 *.db
 .Trash*
 _packages/
-output/
 outputs/

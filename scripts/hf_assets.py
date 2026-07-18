@@ -12,7 +12,6 @@ from batgrad.contracts.mapping import BaseColumns, DatasetStageId
 from batgrad.contracts.segments import ParquetSegment, segment_values
 from batgrad.data.datasets.registry import DatasetId, dataset_ids, get_dataset
 from batgrad.data.processing.manifests import load_stage_manifest
-from batgrad.data.processing.metadata import git_state
 from batgrad.logging import configure_logging, get_logger
 from batgrad.ml.checkpoint import export_checkpoint
 from batgrad.storage.local import LocalDataProcessingStore
@@ -20,7 +19,7 @@ from batgrad.storage.local import LocalDataProcessingStore
 logger = get_logger("batgrad.scripts.hf_assets")
 
 HF_REPO_ID = "marplan6/batgrad"
-DEFAULT_CHECKPOINT = "batgrad_init_baseline"
+DEFAULT_CHECKPOINT = "init_baseline"
 CHECKPOINTS = (DEFAULT_CHECKPOINT,)
 BYTE_UNIT = 1024.0
 
@@ -31,13 +30,13 @@ def _add_selectors(parser: argparse.ArgumentParser) -> None:
         choices=dataset_ids(),
         metavar="DATASET_ID",
         nargs="+",
-        help="registered normalized datasets to transfer",
+        help="registered normalized datasets to transfer (download default: all)",
     )
     parser.add_argument(
         "--ckpt",
         choices=CHECKPOINTS,
         metavar="CHECKPOINT_ID",
-        help="checkpoint bundle to transfer",
+        help="checkpoint to transfer (download default: all)",
     )
     parser.add_argument(
         "--data-root",
@@ -149,6 +148,7 @@ def _download(
     parser: argparse.ArgumentParser,
 ) -> None:
     selected = _selected_datasets(args)
+    checkpoints = CHECKPOINTS if args.dataset is None and args.ckpt is None else (args.ckpt,)
     if selected:
         root = _data_root(args.data_root, parser)
         root.mkdir(parents=True, exist_ok=True)
@@ -159,11 +159,11 @@ def _download(
             local_dir=root,
             allow_patterns=list(_dataset_patterns(selected)),
         )
-    if args.ckpt is not None:
+    for checkpoint_id in (checkpoint for checkpoint in checkpoints if checkpoint is not None):
         outputs_root = args.outputs_root.expanduser()
         outputs_root.mkdir(parents=True, exist_ok=True)
-        pattern = f"checkpoints/{args.ckpt}/**"
-        logger.info("Downloading checkpoint=%s to %s", args.ckpt, outputs_root)
+        pattern = f"checkpoints/{checkpoint_id}.pt"
+        logger.info("Downloading checkpoint=%s to %s", checkpoint_id, outputs_root)
         snapshot_download(
             repo_id=HF_REPO_ID,
             repo_type="model",
@@ -203,16 +203,11 @@ def _upload_checkpoint(
 ) -> None:
     if not source.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {source}")
-    state = git_state()
-    if state.commit == "na":
-        raise RuntimeError("Cannot resolve the batgrad Git commit for checkpoint export")
-    if state.dirty != "clean":
-        raise RuntimeError("Refusing to export a checkpoint from a dirty Git worktree")
     with tempfile.TemporaryDirectory(prefix="batgrad-hf-") as directory:
         exported = Path(directory) / "final.pt"
-        export_checkpoint(source, exported, batgrad_commit=state.commit)
+        export_checkpoint(source, exported)
         size = exported.stat().st_size
-        location = f"checkpoints/{checkpoint_id}/final.pt"
+        location = f"checkpoints/{checkpoint_id}.pt"
         logger.info("asset path=%s size=%s", location, _format_bytes(size))
         if dry_run:
             return
