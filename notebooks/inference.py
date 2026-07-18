@@ -1,4 +1,4 @@
-# ruff: noqa: ANN001, ANN202, I002, INP001, PLR1711
+# ruff: noqa: ANN001, ANN202, B018, I002, INP001, PLR1711, S603, S607
 
 import marimo
 
@@ -7,10 +7,63 @@ app = marimo.App(width="medium")
 
 with app.setup:
     import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    def is_batgrad_root(root: Path) -> bool:
+        return (
+            (root / "pyproject.toml").is_file()
+            and (root / "batgrad" / "__init__.py").is_file()
+            and (root / "notebooks" / "_support" / "inference_helpers.py").is_file()
+        )
+
+    local_root = Path(__file__).resolve().parents[1]
+    if not is_batgrad_root(local_root):
+        local_root = Path("/marimo/batgrad")
+        if not is_batgrad_root(local_root):
+            local_root.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/marplan/batgrad.git",
+                    str(local_root),
+                ],
+                check=True,
+            )
+        # NOTE: Molab has no NVCC, so use the published Mamba wheel.
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                sys.executable,
+                "--editable",
+                str(local_root),
+                "--group",
+                "ml",
+                "torch>=2.10,<2.11",
+                "mamba-ssm==2.3.2.post1",
+            ],
+            check=True,
+            cwd=local_root,
+            env={**os.environ, "MAMBA_SKIP_CUDA_BUILD": "TRUE"},
+        )
+
+    project_root = local_root
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    os.chdir(project_root)
+    os.environ.setdefault("DATA_ROOT", "/marimo/data")
 
     import marimo as mo
     import polars as pl
 
+    from batgrad.data.datasets.registry import dataset_ids
     from batgrad.logging import configure_logging
     from batgrad.ml.data.config import ValidationConfig
     from batgrad.ml.data.index import MlDatasetIndex
@@ -48,21 +101,43 @@ with app.setup:
         discover_normalized_manifest_status,
         selected_index_rows,
     )
+    from scripts.hf_assets import CHECKPOINTS, download_checkpoints, download_datasets
 
     configure_logging(level="INFO")
 
 
 @app.cell
 def _():
+    download_examples = mo.ui.run_button(
+        label="Download example datasets and checkpoint (~7.2 GiB)"
+    )
     store_root = mo.ui.text(
         value=os.getenv("DATA_ROOT"),
         label="Store root",
     )
-    return (store_root,)
+    return download_examples, store_root
 
 
 @app.cell
-def _(store_root):
+def _(download_examples, store_root):
+    downloaded_assets = None
+    if download_examples.value:
+        _log_lines = []
+        with mo.status.spinner(
+            title="Downloading example datasets and checkpoint"
+        ) as _spinner, capture_log_lines(
+            _log_lines,
+            lambda line: _spinner.update(subtitle=line),
+        ):
+            _data_root = download_datasets(dataset_ids(), store_root.value)
+            _outputs_root = download_checkpoints(CHECKPOINTS, "outputs")
+            downloaded_assets = (_data_root, _outputs_root)
+    return (downloaded_assets,)
+
+
+@app.cell
+def _(downloaded_assets, store_root):
+    _ = downloaded_assets
     store, store_error = open_local_store_status(store_root.value)
     return store, store_error
 
@@ -196,7 +271,8 @@ def _():
 
 
 @app.cell
-def _(checkpoint_root):
+def _(checkpoint_root, downloaded_assets):
+    _ = downloaded_assets
     checkpoints, checkpoint_error = checkpoint_discovery_status(checkpoint_root.value)
     checkpoint_frame_ = checkpoint_frame(checkpoints)
     checkpoint_table = make_checkpoint_table(checkpoint_frame_) if checkpoints else None
@@ -342,6 +418,7 @@ def _(batch_result_view, get_inference_error, get_inference_submission_error):
 
 @app.cell
 def _(
+    download_examples,
     group_by,
     index_error,
     index_table,
@@ -365,6 +442,7 @@ def _(
     mo.vstack(
         [
             mo.md("# ML Inference"),
+            download_examples,
             mo.hstack([store_root], justify="start"),
             *messages,
             manifest_select,
@@ -426,21 +504,22 @@ def _(
     if inference_request_ready is not None:
         _log_lines = []
         try:
-            with mo.status.spinner(title="Running inference") as _spinner:
-                with capture_log_lines(
-                    _log_lines,
-                    lambda line: _spinner.update(subtitle=line),
-                ):
-                    _submission = inference_request_ready.submission
-                    _device = resolve_device(_submission.device)
-                    _result = evaluate_checkpoints(
-                        inference_request_ready.store,
-                        inference_request_ready.selected_index_frame,
-                        _submission.checkpoints,
-                        device=_device,
-                        suffix_steps=_submission.masked_suffix_steps,
-                        rollout_steps=_submission.rollout_steps,
-                    )
+            with mo.status.spinner(
+                title="Running inference"
+            ) as _spinner, capture_log_lines(
+                _log_lines,
+                lambda line: _spinner.update(subtitle=line),
+            ):
+                _submission = inference_request_ready.submission
+                _device = resolve_device(_submission.device)
+                _result = evaluate_checkpoints(
+                    inference_request_ready.store,
+                    inference_request_ready.selected_index_frame,
+                    _submission.checkpoints,
+                    device=_device,
+                    suffix_steps=_submission.masked_suffix_steps,
+                    rollout_steps=_submission.rollout_steps,
+                )
         except (
             FileNotFoundError,
             OSError,

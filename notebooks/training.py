@@ -1,4 +1,4 @@
-# ruff: noqa: ANN001, ANN202, C901, FBT003, I002, INP001, PLR0915, PLR1711
+# ruff: noqa: ANN001, ANN202, B018, C901, FBT003, I002, INP001, PLR1711, S603, S607, TRY301
 
 import marimo
 
@@ -6,22 +6,83 @@ __generated_with = "0.23.14"
 app = marimo.App(width="medium")
 
 with app.setup:
+    import os
+    import subprocess
+    import sys
     from pathlib import Path
+
+    def is_batgrad_root(root: Path) -> bool:
+        return (
+            (root / "pyproject.toml").is_file()
+            and (root / "batgrad" / "__init__.py").is_file()
+            and (root / "notebooks" / "_support" / "training_helpers.py").is_file()
+        )
+
+    local_root = Path(__file__).resolve().parents[1]
+    if not is_batgrad_root(local_root):
+        local_root = Path("/marimo/batgrad")
+        if not is_batgrad_root(local_root):
+            local_root.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/marplan/batgrad.git",
+                    str(local_root),
+                ],
+                check=True,
+            )
+        # NOTE: Molab has no NVCC, so use the published Mamba wheel.
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                sys.executable,
+                "--editable",
+                str(local_root),
+                "--group",
+                "ml",
+                "torch>=2.10,<2.11",
+                "mamba-ssm==2.3.2.post1",
+            ],
+            check=True,
+            cwd=local_root,
+            env={**os.environ, "MAMBA_SKIP_CUDA_BUILD": "TRUE"},
+        )
+
+    project_root = local_root
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    os.chdir(project_root)
+    os.environ.setdefault("DATA_ROOT", "/marimo/data")
 
     import marimo as mo
 
+    from batgrad.data.datasets.registry import dataset_ids
     from batgrad.ml.inference import available_devices, resolve_device
+    from notebooks._support.logging_helpers import capture_log_lines, log_view
     from notebooks._support.training_helpers import (
         TrainingPlotRequest,
         build_training_plot_display,
         close_training_plot,
         create_training_session,
     )
-    from notebooks._support.logging_helpers import log_view
+    from scripts.hf_assets import (
+        CHECKPOINTS,
+        download_checkpoints,
+        download_datasets,
+    )
 
 
 @app.cell
 def _():
+    download_examples = mo.ui.run_button(
+        label="Download example datasets and checkpoint (~7.2 GiB)"
+    )
     config_paths = tuple(str(path) for path in sorted(Path("configs").rglob("*.json")))
     default_config = "configs/ml_dry_run_cpu.json"
     config_options = config_paths or (default_config,)
@@ -32,7 +93,22 @@ def _():
     )
     devices = available_devices()
     device_select = mo.ui.dropdown(options=devices, value="cpu", label="Device")
-    return config_path, device_select
+    return config_path, device_select, download_examples
+
+
+@app.cell
+def _(download_examples):
+    if download_examples.value:
+        _log_lines = []
+        with mo.status.spinner(
+            title="Downloading example datasets and checkpoint"
+        ) as _spinner, capture_log_lines(
+            _log_lines,
+            lambda line: _spinner.update(subtitle=line),
+        ):
+            download_datasets(dataset_ids(), os.environ["DATA_ROOT"])
+            download_checkpoints(CHECKPOINTS, "outputs")
+    return
 
 
 @app.cell
@@ -310,6 +386,7 @@ def _(
     dataset_index,
     device,
     device_select,
+    download_examples,
     get_operation,
     initialize_training,
     latest_batch,
@@ -355,6 +432,7 @@ def _(
     )
     items = [
         mo.md("# Interactive ML Training"),
+        download_examples,
         mo.hstack([config_path, device_select, initialize_training], justify="start"),
     ]
     if training_error is not None:

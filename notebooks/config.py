@@ -1,4 +1,4 @@
-# ruff: noqa: ANN001, ANN202, I002, INP001, PLC0415, PLR1711
+# ruff: noqa: ANN001, ANN202, I002, INP001, PLC0415, PLR1711, S603, S607
 
 import marimo
 
@@ -6,6 +6,54 @@ __generated_with = "0.23.14"
 app = marimo.App(width="medium")
 
 with app.setup:
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    def is_batgrad_root(root: Path) -> bool:
+        return (
+            (root / "pyproject.toml").is_file()
+            and (root / "batgrad" / "__init__.py").is_file()
+            and (root / "notebooks" / "_support" / "config_editor.py").is_file()
+        )
+
+    local_root = Path(__file__).resolve().parents[1]
+    if not is_batgrad_root(local_root):
+        local_root = Path("/marimo/batgrad")
+        if not is_batgrad_root(local_root):
+            local_root.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/marplan/batgrad.git",
+                    str(local_root),
+                ],
+                check=True,
+            )
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                sys.executable,
+                "--editable",
+                str(local_root),
+            ],
+            check=True,
+            cwd=local_root,
+        )
+
+    project_root = local_root
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    os.chdir(project_root)
+    os.environ.setdefault("DATA_ROOT", "/marimo/data")
+
     import marimo as mo
 
 

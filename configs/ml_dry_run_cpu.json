@@ -1,7 +1,7 @@
 {
   "data": {
     "manifest_paths": {
-      "type=published/dataset=pozzato-2022/source=normalized/manifest.parquet": "82c1a3d"
+      "type=published/dataset=pozzato-2022/source=normalized/manifest.parquet": "0bf92de"
     },
     "protocols": ["cycling"],
     "input_columns": [

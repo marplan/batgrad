@@ -2,10 +2,18 @@
 
 ## Environment
 
-Start the local dev container and run the project setup script:
+Create the environment files:
 
 ```sh
 cp .env.example .env
+cp docker/dotfiles.env.example docker/dotfiles.env
+```
+
+Before starting Compose, replace `HOST_DATA_ROOT` in `.env` and optionally configure trusted
+dotfiles. File mode `600` is optional but recommended when either env file contains secrets. Then
+start the local dev container and run project setup:
+
+```sh
 docker compose up -d --build dev
 docker compose exec -it dev zsh
 ./scripts/setup_project.sh
@@ -14,10 +22,49 @@ docker compose exec -it dev zsh
 For remote containers, provider images, data mounts, and environment variables,
 see [Environment Setup](environment-setup.md).
 
+## Explore the Notebooks
+
+Download the released normalized datasets to `DATA_ROOT` and the inference checkpoint to
+`outputs/checkpoints/`:
+
+```sh
+uv run scripts/hf_assets.py download
+```
+
+Start the local Marimo editor:
+
+```sh
+uv run marimo edit notebooks \
+  --headless \
+  --host 0.0.0.0 \
+  --port 2718 \
+  --session-ttl 5
+```
+
+Open `http://localhost:2718`. On a remote instance, use the SSH tunnel from
+[Environment Setup](environment-setup.md) and open the same local URL.
+
+The five notebook entrypoints follow the workflow from data to evaluation:
+
+| Notebook | Use |
+| --- | --- |
+| `etl.py` | Inspect ingestion, transformations, resampling, and normalized data |
+| `dataloader.py` | Inspect manifests, splits, temporal windows, and batches |
+| `config.py` | Build and validate experiment configurations |
+| `training.py` | Step through optimization and validation traces |
+| `inference.py` | Compare checkpoints and multi-step rollouts |
+
+The released Mamba-3 checkpoint in `inference.py` requires CUDA. These notebooks are intended for
+interactive exploration rather than unattended long-running jobs.
+
 ## Data Processing
 
 The data flow is `raw files -> ingested parquet -> normalized parquet`. Interactive
 runs write scratch outputs for inspection without replacing persisted stage data.
+The public Pozzato source supports this full path. The released synthetic asset is
+normalized data; its raw Parquet inputs and generation pipeline are not public here.
+For large runs, place `scratch_store` on persistent storage with enough capacity for
+concurrent task outputs rather than relying on container `/tmp`.
 
 ### Add a Dataset
 
@@ -54,7 +101,7 @@ from batgrad.data.processing.raw import IngestStageConfig
 from batgrad.storage.local import LocalDataProcessingStore
 
 dataset = get_dataset("pozzato-2022")
-store = LocalDataProcessingStore(Path("/data/batgrad"), create=True)
+store = LocalDataProcessingStore(Path("/data"), create=True)
 
 dataset.ingest(
     input_store=store,
@@ -105,16 +152,9 @@ cycle, and `scratch_store` receives temporary outputs.
 
 ## Machine Learning
 
-The ML layer reads normalized manifests. Complete ingestion and normalization
-first, then choose a configuration whose manifest revision and selected columns
+The ML layer reads normalized manifests. Complete ingestion and normalization or download the
+released assets above, then choose a configuration whose manifest revision and selected columns
 match the normalized data.
-
-Download the bundled normalized datasets when you do not want to process the
-raw sources locally:
-
-```sh
-uv run scripts/hf_assets.py download
-```
 
 The bundled configurations provide useful starting points:
 
@@ -134,7 +174,17 @@ Set `data.store_root` in the selected configuration or ensure `DATA_ROOT` points
 to the data store, then run:
 
 ```sh
-python scripts/train.py --config configs/ml_dry_run_cpu.json
+uv run scripts/train.py --config configs/ml_dry_run_cpu.json
+uv run scripts/train.py --config configs/ml_dry_run_gpu.json
+uv run scripts/train.py --config configs/ml_baseline.json
+```
+
+The baseline logs online to the `batgrad` W&B project. Authenticate with `uv run wandb login`, or
+select stdout, JSONL, or offline W&B in the configuration. Run the baseline on two GPUs with DDP:
+
+```sh
+OMP_NUM_THREADS=1 uv run torchrun --standalone --nproc-per-node=2 \
+  scripts/train.py --config configs/ml_baseline.json
 ```
 
 For file-backed runs, `train_from_config` creates the configured
@@ -159,12 +209,3 @@ Only enabled logger and checkpoint outputs are created. See
 [ML Configuration](api/ml/configuration.md),
 [ML Data Loading](api/ml/data-loading.md), [ML Models](api/ml/models.md),
 [ML Training](api/ml/training.md), and [ML Inference](api/ml/inference.md).
-
-## Details
-
-Use the API Reference for implementation details:
-
-- API Reference > Data
-- API Reference > Contracts
-- API Reference > Datastore
-- API Reference > ML

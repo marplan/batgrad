@@ -10,10 +10,11 @@ required tools with `apt`, `mise`, or another native package manager.
 
 ## Shared Setup
 
-Create `.env` from the example:
+Create the project and optional-dotfiles environment files:
 
 ```sh
 cp .env.example .env
+cp docker/dotfiles.env.example docker/dotfiles.env
 ```
 
 Important values:
@@ -26,11 +27,9 @@ Important values:
 - `UV_ENV_FILE=.env` lets `uv run` load the project env file. Existing shell variables
   take precedence, so do not export `DATA_ROOT` manually unless you want to override `.env`.
 
-Optional dotfiles use a separate env file:
-
-```sh
-cp docker/dotfiles.env.example docker/dotfiles.env
-```
+Dotfiles remain disabled by default. If wanted, configure `docker/dotfiles.env` before running
+setup. Both env files are sourced as shell code, so only use trusted contents and restrict access
+with `chmod 600 .env docker/dotfiles.env` when they contain secrets.
 
 After entering the local container or remote instance, run the repo setup:
 
@@ -40,17 +39,30 @@ After entering the local container or remote instance, run the repo setup:
 
 This installs or updates Homebrew tools, optionally runs dotfiles setup, creates the
 `uv` environment, runs `uv sync --all-groups`, and installs Playwright Chromium when
-Playwright is present. Use `./scripts/setup_project.sh --help` for focused modes.
+Playwright is present. The no-flag command updates the image's Homebrew packages; enabled dotfiles
+should therefore use an idempotent setup command. Use `./scripts/setup_project.sh --help` for
+focused modes.
 
 ## Local Docker Compose
+
+Copy both files:
+
+```sh
+cp .env.example .env
+cp docker/dotfiles.env.example docker/dotfiles.env
+```
+
+Set `HOST_DATA_ROOT` in `.env` and optionally configure trusted dotfiles before starting Compose.
+File mode `600` is optional but recommended when either file contains secrets. Then continue:
 
 ```sh
 docker compose up -d --build dev
 docker compose exec -it dev zsh
-cp .env.example .env
-cp docker/dotfiles.env.example docker/dotfiles.env  # optional
 ./scripts/setup_project.sh
 ```
+
+When dotfiles are enabled before Compose starts, container initialization runs their setup once;
+the no-flag setup command runs the configured dotfiles command again, so it must be safe to rerun.
 
 ## Remote Providers
 
@@ -77,10 +89,27 @@ docker buildx build -f docker/Dockerfile --platform linux/amd64 --target remote-
 ## Remote Instance Setup
 
 ```sh
-ssh ubuntu@<host>
-git clone <repo-url> /workspace/ubuntu/batgrad
-cd /workspace/ubuntu/batgrad
+ssh -A -L 2718:localhost:2718 -p <port> ubuntu@<host>
+```
+
+Keep provider-supplied identity options and replace only `root@<host>` with `ubuntu@<host>`.
+Omit `-A` unless private dotfiles or dependencies require agent forwarding on a trusted instance.
+After connecting:
+
+```sh
+cd /workspace/ubuntu
+git clone https://github.com/marplan/batgrad.git
+cd batgrad
 cp .env.example .env
-cp docker/dotfiles.env.example docker/dotfiles.env  # optional
+cp docker/dotfiles.env.example docker/dotfiles.env
+```
+
+Review `.env` without changing `PROJECT_KEY=batgrad`. If wanted, enable and configure trusted
+dotfiles in `docker/dotfiles.env`. File mode `600` is optional but recommended if either file
+contains secrets. Then continue:
+
+```sh
 ./scripts/setup_project.sh
 ```
+
+Continue with the asset-download and Marimo commands in the [Quick Start](quick-start.md).

@@ -19,6 +19,10 @@ These five files are the standalone notebook entrypoints. Open them in Marimo ed
 mode to add investigation cells; modules under `notebooks/_support/` are shared
 implementation details rather than additional entrypoints.
 
+Released normalized data uses approximately 7.2 GiB, and the Mamba-3 checkpoint requires Linux and
+CUDA. Raw Pozzato processing needs much more storage; synthetic raw data and generation code are not
+public here.
+
 ## Data flow
 
 The data layer creates one canonical representation of each dataset, independent
@@ -31,6 +35,17 @@ raw source files -> ingested Parquet + manifest -> normalized Parquet + manifest
 The Parquet data is sharded by protocol. The accompanying manifest describes
 which streams exist, where their exact row segments live, and which metadata and
 provenance belong to them.
+
+### Included datasets
+
+| Dataset | Conditions | Protocols | Availability |
+| --- | --- | --- | --- |
+| `pozzato-2022` | CC-CV charging and dynamic discharge cycling at 23 °C | Cycling, HPPC, RPT, EIS | Raw and normalized |
+| `synthetic-pozzato-2022-m50t` | 10–30 °C, five cooling settings, four dynamic profile scales | Cycling, RPT, EIS | Normalized only |
+
+Pozzato's source chamber was 23 °C; its normalized ambient temperature and cooling alpha are fixed
+to 20 °C and 20 W·m⁻²·K⁻¹. The synthetic release carries its varied ambient and cooling conditions
+in the time-series inputs.
 
 ### Define a dataset
 
@@ -180,6 +195,11 @@ datasets to participate in the same run.
 - **Feedback columns** are targets that are also inputs and can be replaced by
   model predictions during rollout.
 
+In the baseline, time difference, current, ambient temperature, and cooling alpha are known
+controls. Terminal voltage and surface temperature are observed in the context, predicted as
+targets, and fed back during rollout. Held-out rollouts retain recorded future controls; rollout
+extensions can supply new values, while omitted controls repeat their final observed value.
+
 The selected manifests are checked against requested protocols, columns, and
 scaling ranges before training. Splits are formed from manifest task metadata
 rather than random rows, keeping related streams together and reducing leakage
@@ -200,48 +220,119 @@ inputs:  (B, T, C_in)
 targets: (B, T, C_out)
 ```
 
-Consequently, `logits[k]` predict output-scaled target values corresponding to
-`inputs[k + 1]` for feedback channels. Predictions are converted back to
-physical units only by inverse scaling. This next-row contract is used
-consistently by training, rollouts, loss masks, and feedback writes below.
+Consequently, `logits[k]` correspond to `targets[k]`, whose values come from source row
+`k + 1`. For a paired feedback column, that is also the same-column value in
+`inputs[k + 1]` when the next input row is present in the materialized sequence.
+Predictions are converted back to physical units only by inverse scaling. This
+next-row contract is used consistently by training, rollouts, loss masks, and
+feedback writes below.
 
 Loader strategies determine how windows are ordered and shuffled. Stateful
 groups can retain consecutive windows from one stream when a model needs
 continuity beyond one context. Dataset, cell, cycle, and protocol metadata
 remain available for grouping and validation selection.
 
-Null input values use the `-2.0` sentinel. Null targets remain `NaN` and are
-excluded by the finite-target loss mask. The row mask separately identifies
+Null input values use the `-2.0` sentinel before categorical encoding. Encoding clamps
+finite values to each configured input range, so the sentinel becomes the lowest-bin
+representation rather than a dedicated missing-value token. Null targets remain `NaN`
+and are excluded by the finite-target loss mask. The row mask separately identifies
 positions backed by real source rows rather than padded tail rows.
 
 ### Encode and mix features
 
-The model diagram follows the tensor path from top to bottom. The main and head
-layer sequences are configured per experiment rather than fixed by the model.
+The diagram shows the architecture in `configs/ml_baseline.json`. Its zero-sigma
+encoding uses adjacent-bin interpolation, and it applies four temporal blocks followed
+by one repetition of the same block in the head layers.
 
 ```mermaid
-flowchart TB
-    A["Scalar inputs | masked suffix"]
-    E["Encode each scalar over K bins"]
-    P["Per-feature linear projections"]
-    M["Configured main layers<br/>feature reduction / attention / FFN / Mamba-3"]
-    H["Configured head layers<br/>attention / FFN / Mamba-3"]
-    N["Final norm"]
-    L["Linear output<br/>target-bin logits"]
+%%{init: {
+  "flowchart": {
+    "defaultRenderer": "elk"
+  }
+}}%%
 
-    A --> E --> P --> M --> H --> N --> L
+flowchart TB
+
+    A["Scalar inputs<br/>Two-hot encoding"]
+    I["Binned inputs<br/>Per-feature linear<br/>Feature reduction"]
+    Z["Masked suffix"]
+    FBI[" "]
+
+    subgraph T["Temporal blocks × N"]
+        direction TB
+
+        subgraph AT["Attention block"]
+            direction TB
+            TA["Norm → Attention → residual add"]
+            TF["Norm → FFN → residual add"]
+            TA --> TF
+        end
+
+        subgraph MB["Mamba block"]
+            direction TB
+            TM["Norm → Mamba-3 → residual add"]
+            MF["Norm → FFN → residual add"]
+            TM --> MF
+        end
+
+        TF --> TM
+    end
+
+    subgraph H["Head layers × 1"]
+        direction TB
+        HA["Attention block"]
+        HM["Mamba block"]
+        HA --> HM
+    end
+
+    N["Final norm<br/>Linear output projection<br/>Target-bin logits<br/>(B, T, C_out, K)"]
+    S["Softmax over K bins"]
+    D["Detach"]
+    FB[" "]
+    DECODE["Expected-bin decode<br/>(B, T, C_out)<br/>Inverse scaling"]
+    LOSS["CE loss"]
+
+    A -- "#8203;" --> I
+    Z -- "override feedback channels" --> I
+    FBI -- "Autoregressive feedback" --> I
+    I --> TA
+    MF --> HA
+    HM --> N
+    N --> LOSS
+    N --> S
+    S --> D
+    D -- "Autoregressive feedback" --> FB
+    S --> DECODE
+
+    style FBI fill:none,stroke:none
+    style FB fill:none,stroke:none
 ```
 
 Each scalar is represented as a distribution over `K` bins. Feature-wise linear
 projections map those distributions into learned embeddings, then pooling merges
 the feature axis into one token per time step. This is feature pooling, not
-temporal pooling. Temporal layers preserve the time axis while mixing
-information from available context.
+temporal pooling. Temporal layers preserve the time axis while mixing information
+from available context. The diagram's Attention and Mamba blocks are shorthand for
+the corresponding configured layer followed by its FFN; implementation layers remain
+independently configurable and execute in JSON order.
 
-The configured main path must perform this feature reduction before operations
-that expect one temporal token per step, such as attention or Mamba. Reduction
-is the shape transition from `(B, T, C_in, D)` to `(B, T, D)`; the remaining
-main layers and all head layers operate on the reduced temporal sequence.
+New masked feedback positions use all-zero, non-normalized bin vectors for every
+configured feedback channel. Available detached predictions are applied afterward and
+can replace those vectors directly without decoding and re-encoding a scalar. The two
+autoregressive-feedback arrows show the write and reuse ends of the same runtime path
+without closing the diagram loop; reuse occurs in a later model call, not recursively
+within one parallel suffix forward.
+
+Target-bin logits feed categorical cross-entropy directly. The loss also consumes an
+encoded target distribution and finite row/channel selection masks, omitted from the
+diagram for clarity. Expected-bin decoding first returns values in configured
+output-scaled model units. The diagram's inverse-scaling step is the optional
+presentation or inference conversion to physical units and is never applied before
+feedback reuse.
+
+Feature reduction is the shape transition from `(B, T, C_in, D)` to `(B, T, D)`.
+Temporal and head layer sequences remain configurable, but all operate on the
+reduced temporal sequence.
 
 ```text
 scalar inputs              (B, T, C_in)
@@ -257,6 +348,7 @@ target-bin logits          (B, T, C_out, K)
 ```text
 # x: (B, T, C_in)
 x_bins = encode_bins(x)                            # (B, T, C_in, K)
+x_bins = apply_feedback_bin_overrides(x_bins)      # zeros or detached predictions
 
 feature_h = stack([
     feature_linear[c](x_bins[:, :, c, :])
@@ -284,11 +376,19 @@ Normalization occurs before each temporal operation. When a layer has a
 residual, its update is added to the unchanged input state. Input feature
 pooling and final output projection do not have a residual path.
 
+The baseline's attention layers are causal. During objective evaluation, row validity
+masks gate attention queries and keys; FFN and Mamba layers still compute all rows.
+Rollout execution relies on constructed context windows and does not pass that row
+validity mask into attention.
+
 ### Produce distributions and calculate loss
 
 The final values are unnormalized logits, one vector of length `K` for every
-time step and target feature. Target scalars are encoded into the same bin space.
-With unsmoothed encoding, a value can contribute to its two neighboring bins:
+time step and target feature. Axis `C_out` follows configured `target_columns` order.
+Target scalars are encoded into the same bin space. Values outside configured ranges
+are clamped to the nearest endpoint before encoding. With the baseline's zero sigma,
+a value can contribute to its two neighboring bins; positive sigma instead produces a
+normalized Gaussian over all bin centers:
 
 ```text
 position = normalize_to_unit_range(value) * (K - 1)
@@ -308,6 +408,9 @@ log_probabilities = log_softmax(logits, axis=bins)
 loss_per_value = -sum(target_distribution * log_probabilities, axis=bins)
 loss = mean(loss_per_value at valid, selected positions)
 ```
+
+A selection with no finite valid target values contributes differentiable zero loss and
+zero count rather than `NaN`.
 
 For interpretation, logits become probabilities and are decoded by their
 expected bin location:
@@ -329,8 +432,8 @@ produces logits, and calculates categorical cross-entropy over all valid target
 values. This is the teacher-forced path.
 
 Masked-suffix training reserves the final `S` input positions of a context for
-prediction. Feedback inputs in that destination suffix are encoded as all-zero
-bin vectors, while supplied controls remain available.
+prediction. Every configured feedback channel in that destination suffix is encoded as
+an all-zero bin vector, while supplied controls remain available.
 
 ```text
 input_suffix      = [T - S : T]        # input rows to replace with predictions
@@ -344,7 +447,7 @@ if loss_on_masked_only:
     loss = categorical_cross_entropy(
         logits[prediction_slice],
         window_targets[prediction_slice],
-        selected feedback targets,
+        configured feedback targets,
     )
 else:
     loss = categorical_cross_entropy(logits, window_targets, all valid targets)
@@ -353,9 +456,13 @@ prediction = detach(softmax or decode(logits[prediction_slice]))
 write prediction into paired feedback inputs at input_suffix
 ```
 
-The preceding-logit slice is required by the shifted target contract: logit
-`k` predicts input row `k + 1`. Generated feedback is detached, so gradients do
-not flow through a generated value after it becomes a later input.
+All selected suffix positions are predicted together in this model call, and feedback
+is written only after the full logits tensor exists. The preceding-logit slice follows
+the shifted target contract: `logits[k]` correspond to the target sourced from row
+`k + 1`. Generated feedback is detached, so gradients do not flow through a generated
+value after it becomes a later input. The baseline sets `roll_forward_steps` to zero,
+so its training objective does not consume those writes in another internal window;
+rollout evaluation does.
 
 #### Roll training forward
 
@@ -386,6 +493,10 @@ Target validity always combines the row/channel loss mask with finite target
 values. The same count is used for ordinary backward, detached per-window
 backward, reported metrics, and global count weighting under distributed
 training.
+
+When `loss_on_masked_only` is false, every overlapping training window scores all of
+its valid targets, so values in an overlap are intentionally counted once per window
+that contains them. Rollout scoring instead selects only newly generated destinations.
 
 If the final shift is shorter than `S`, only that many newly encountered tail
 positions are masked and predicted. Earlier generated values remain visible in
@@ -501,6 +612,9 @@ for held-out window, up to the configured batch limit:
 report globally count-weighted loss, per-target loss, and RMSE
 ```
 
+Aggregate RMSE is micro-averaged over all valid target values; per-target RMSE remains
+available separately. Decoded values are still in output-scaled model units here.
+
 Validation can inherit or override suffix settings, but training roll-forward is
 disabled for this pass. Recurrent state is not carried between validation-loader
 batches.
@@ -599,8 +713,9 @@ Feedback can be reused in two forms:
 
 - **Probability feedback** places the detached bin distribution directly into
   the next paired input-bin channel.
-- **Decoded feedback** decodes the detached distribution to a scalar and
-  encodes that value again for the next model call.
+- **Decoded feedback** decodes the detached distribution to an output-scaled scalar and
+  encodes that value again for the next model call; it is not inverse-scaled to physical
+  units before reuse.
 
 Stateful layers use the same alignment rule as training. One-step rollout
 advances state with the single input row leaving the sliding window. Suffix

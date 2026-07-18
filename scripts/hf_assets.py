@@ -13,7 +13,6 @@ from batgrad.contracts.segments import ParquetSegment, segment_values
 from batgrad.data.datasets.registry import DatasetId, dataset_ids, get_dataset
 from batgrad.data.processing.manifests import load_stage_manifest
 from batgrad.logging import configure_logging, get_logger
-from batgrad.ml.checkpoint import export_checkpoint
 from batgrad.storage.local import LocalDataProcessingStore
 
 logger = get_logger("batgrad.scripts.hf_assets")
@@ -143,6 +142,36 @@ def _warn_without_xet() -> None:
         logger.warning("hf_xet is unavailable; Hugging Face transfers will use the legacy backend")
 
 
+def download_datasets(selected: tuple[DatasetId, ...], data_root: str | Path) -> Path:
+    """Download normalized datasets from the shared Hugging Face repository."""
+    root = Path(data_root).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    logger.info("Downloading datasets=%s to %s", ",".join(selected), root)
+    snapshot_download(
+        repo_id=HF_REPO_ID,
+        repo_type="dataset",
+        local_dir=root,
+        allow_patterns=list(_dataset_patterns(selected)),
+    )
+    return root
+
+
+def download_checkpoints(selected: tuple[str, ...], outputs_root: str | Path) -> Path:
+    """Download compact checkpoints from the shared Hugging Face repository."""
+    root = Path(outputs_root).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    for checkpoint_id in selected:
+        pattern = f"checkpoints/{checkpoint_id}.pt"
+        logger.info("Downloading checkpoint=%s to %s", checkpoint_id, root)
+        snapshot_download(
+            repo_id=HF_REPO_ID,
+            repo_type="model",
+            local_dir=root,
+            allow_patterns=[pattern],
+        )
+    return root
+
+
 def _download(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -151,25 +180,10 @@ def _download(
     checkpoints = CHECKPOINTS if args.dataset is None and args.ckpt is None else (args.ckpt,)
     if selected:
         root = _data_root(args.data_root, parser)
-        root.mkdir(parents=True, exist_ok=True)
-        logger.info("Downloading datasets=%s to %s", ",".join(selected), root)
-        snapshot_download(
-            repo_id=HF_REPO_ID,
-            repo_type="dataset",
-            local_dir=root,
-            allow_patterns=list(_dataset_patterns(selected)),
-        )
-    for checkpoint_id in (checkpoint for checkpoint in checkpoints if checkpoint is not None):
-        outputs_root = args.outputs_root.expanduser()
-        outputs_root.mkdir(parents=True, exist_ok=True)
-        pattern = f"checkpoints/{checkpoint_id}.pt"
-        logger.info("Downloading checkpoint=%s to %s", checkpoint_id, outputs_root)
-        snapshot_download(
-            repo_id=HF_REPO_ID,
-            repo_type="model",
-            local_dir=outputs_root,
-            allow_patterns=[pattern],
-        )
+        download_datasets(selected, root)
+    selected_checkpoints = tuple(checkpoint for checkpoint in checkpoints if checkpoint is not None)
+    if selected_checkpoints:
+        download_checkpoints(selected_checkpoints, args.outputs_root)
 
 
 def _upload_datasets(
@@ -201,6 +215,8 @@ def _upload_checkpoint(
     *,
     dry_run: bool,
 ) -> None:
+    from batgrad.ml.checkpoint import export_checkpoint  # noqa: PLC0415
+
     if not source.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {source}")
     with tempfile.TemporaryDirectory(prefix="batgrad-hf-") as directory:

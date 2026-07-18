@@ -1,4 +1,4 @@
-# ruff: noqa: ANN001, ANN202, I002, INP001, PLR1711
+# ruff: noqa: ANN001, ANN202, I002, INP001, PLR1711, S603, S607
 
 import marimo
 
@@ -7,13 +7,67 @@ app = marimo.App(width="medium")
 
 with app.setup:
     import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    def is_batgrad_root(root: Path) -> bool:
+        return (
+            (root / "pyproject.toml").is_file()
+            and (root / "batgrad" / "__init__.py").is_file()
+            and (root / "notebooks" / "_support" / "dataloader_helpers.py").is_file()
+        )
+
+    local_root = Path(__file__).resolve().parents[1]
+    if not is_batgrad_root(local_root):
+        local_root = Path("/marimo/batgrad")
+        if not is_batgrad_root(local_root):
+            local_root.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/marplan/batgrad.git",
+                    str(local_root),
+                ],
+                check=True,
+            )
+        # NOTE: Molab has no NVCC, so keep this notebook on the Torch-only runtime.
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                sys.executable,
+                "--editable",
+                str(local_root),
+                "torch>=2.10,<2.11",
+            ],
+            check=True,
+            cwd=local_root,
+        )
+
+    project_root = local_root
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    os.chdir(project_root)
+    os.environ.setdefault("DATA_ROOT", "/marimo/data")
 
     import marimo as mo
     import polars as pl
 
     from batgrad.contracts.mapping import BaseColumns, DatasetProtocolId
+    from batgrad.data.datasets.registry import dataset_ids
     from batgrad.logging import configure_logging
-    from batgrad.ml.data.config import LoaderConfig, ScalingRule, ValidationConfig, WindowConfig
+    from batgrad.ml.data.config import (
+        LoaderConfig,
+        ScalingRule,
+        ValidationConfig,
+        WindowConfig,
+    )
     from batgrad.ml.data.index import MlDatasetIndex
     from batgrad.ml.data.loader import create_dataloader_from_index, create_index
     from batgrad.ml.data.preview import (
@@ -45,25 +99,44 @@ with app.setup:
         update_batch_preview,
         updated_batch_preview_display,
     )
+    from notebooks._support.logging_helpers import capture_log_lines
     from notebooks._support.ml_data_helpers import (
         discover_normalized_manifest_status,
         selected_index_rows,
     )
+    from scripts.hf_assets import download_datasets
 
     configure_logging(level="INFO")
 
 
 @app.cell
 def _():
+    download_examples = mo.ui.run_button(label="Download example datasets (~7.2 GiB)")
     store_root = mo.ui.text(
         value=os.getenv("DATA_ROOT"),
         label="Store root",
     )
-    return (store_root,)
+    return download_examples, store_root
 
 
 @app.cell
-def _(store_root):
+def _(download_examples, store_root):
+    downloaded_root = None
+    if download_examples.value:
+        _log_lines = []
+        with mo.status.spinner(
+            title="Downloading example datasets"
+        ) as _spinner, capture_log_lines(
+            _log_lines,
+            lambda line: _spinner.update(subtitle=line),
+        ):
+            downloaded_root = download_datasets(dataset_ids(), store_root.value)
+    return (downloaded_root,)
+
+
+@app.cell
+def _(downloaded_root, store_root):
+    _ = downloaded_root
     store, store_error = open_local_store_status(store_root.value)
     return store, store_error
 
@@ -541,6 +614,7 @@ def _(
 
 @app.cell
 def _(
+    download_examples,
     group_by,
     index_error,
     index_table,
@@ -562,6 +636,7 @@ def _(
     mo.vstack(
         [
             mo.md("# ML Data Loader"),
+            download_examples,
             mo.hstack([store_root], justify="start"),
             *messages,
             manifest_select,
