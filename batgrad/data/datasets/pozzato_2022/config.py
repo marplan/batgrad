@@ -195,7 +195,8 @@ DATASET_SPEC = DatasetSpec(
                 "https://osf.io/qsabn/overview?view_only=2a03b6c78ef14922a3e244f3d549de78"
             ),
             "download_url": (
-                "https://www.dropbox.com/scl/fo/3ss0age6ggfcm67okldhw/h?dl=0&e=1"
+                "https://www.dropbox.com/scl/fo/3ss0age6ggfcm67okldhw/h?"
+                "rlkey=tnczvb82gukfe2n4gol2uyo7x&dl=0"
             ),
         },
     ),

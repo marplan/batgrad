@@ -96,7 +96,7 @@ def _(dataset_id, input_store, store_error, store_root):
             ),
         ]
     )
-    return dataset, dataset_controls_view, stage_id
+    return available_stages, dataset, dataset_controls_view, stage_id
 
 
 @app.cell
@@ -146,6 +146,7 @@ def _(interactive_normalization):
 
 @app.cell
 def _(
+    available_stages,
     default_widget_columns_by_stage,
     group_manifest,
     interactive_normalization,
@@ -164,6 +165,7 @@ def _(
         stage_widget_columns=stage_widget_columns,
         stage_x_columns=stage_x_columns,
         default_widget_columns_by_stage=default_widget_columns_by_stage,
+        ingested_available=DatasetStageId.ingested in available_stages,
     )
     default_widget_columns = etl_controls.default_widget_columns
     return default_widget_columns, etl_controls

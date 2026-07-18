@@ -201,6 +201,7 @@ def make_controls(
     stage_widget_columns: dict[str, tuple[MappingSpec, ...]],
     stage_x_columns: dict[str, tuple[MappingSpec, ...]],
     default_widget_columns_by_stage: dict[str, tuple[str, ...]],
+    ingested_available: bool,
 ) -> EtlControls:
     table_data = (
         grouped_manifest(manifest) if group_manifest.value and manifest.height else manifest
@@ -214,8 +215,12 @@ def make_controls(
     )
     overlay_ingested = mo.ui.checkbox(
         value=False,
-        label="Overlay ingested data",
-        disabled=effective_stage != DatasetStageId.normalized,
+        label=(
+            "Overlay ingested data"
+            if ingested_available
+            else "Overlay ingested data (ingested stage unavailable)"
+        ),
+        disabled=effective_stage != DatasetStageId.normalized or not ingested_available,
     )
     widget_columns = stage_widget_columns.get(str(effective_stage), ())
     default_widget_columns = default_widget_columns_by_stage.get(str(effective_stage), ())

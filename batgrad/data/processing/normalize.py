@@ -142,7 +142,7 @@ class NormalizeStageConfig:
     worker_polars_max_threads: int | None = -1
     chunk_rows: int = 500_000
     compression: str = "zstd"
-    use_content_defined_chunking: bool = False
+    use_content_defined_chunking: bool = True
     row_group_size: int = 262_144
     max_shard_size_bytes: int = 2 * 1024 * 1024 * 1024
     max_batch_rows: int | None = 500_000

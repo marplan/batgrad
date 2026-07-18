@@ -9,11 +9,12 @@ from batgrad.data.datasets.registry import dataset_ids
 from scripts import data_processing
 
 
-def test_processing_parser_defaults_and_all_expansion() -> None:
+def test_processing_parser_defaults_and_all_expansion(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATA_ROOT", "/data/configured")
     parser = data_processing._parser()
     args = parser.parse_args(["--ingest", "all"])
 
-    assert args.store == Path("/data")
+    assert args.store == Path("/data/configured")
     assert args.scratch_store == Path(tempfile.gettempdir())
     assert args.n_jobs == -1
     assert data_processing._expand_selectors(args.ingest, parser, "--ingest") == dataset_ids()
@@ -44,6 +45,8 @@ def test_main_runs_all_ingest_stages_before_normalize(monkeypatch: pytest.Monkey
             events.append(("normalize", self.dataset_id))
 
     monkeypatch.setattr(data_processing, "configure_logging", lambda: None)
+    monkeypatch.setattr(data_processing, "_require_ingest_tasks", lambda *_args: ())
+    monkeypatch.setattr(data_processing, "_require_ingested_manifest", lambda *_args: None)
     monkeypatch.setattr(
         data_processing,
         "LocalDataProcessingStore",
