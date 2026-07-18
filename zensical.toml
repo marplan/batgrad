@@ -1,5 +1,6 @@
 [project]
 site_name = "batgrad docs"
+site_url = "https://marplan.github.io/batgrad/"
 site_description = "Data processing and machine-learning tools for battery degradation datasets."
 site_author = "batgrad contributors"
 copyright = "Copyright &copy; 2026 The authors"

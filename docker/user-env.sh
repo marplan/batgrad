@@ -9,6 +9,7 @@ fi
 export HOME
 export XDG_CONFIG_HOME="$HOME/.config"
 export XDG_CACHE_HOME="$HOME/.cache"
+export HF_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/huggingface"
 export XDG_DATA_HOME="$HOME/.local/share"
 export UV_PYTHON_INSTALL_DIR="$XDG_DATA_HOME/uv/python"
 

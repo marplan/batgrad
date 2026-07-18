@@ -1,70 +1,68 @@
-# batgrad
+<h1 align="center">batgrad</h1>
 
-`batgrad` is an opinionated, hackable template for battery time-series foundation models.
+<p align="center">
+  <strong>An opinionated, hackable template for battery time-series models.</strong>
+</p>
 
-It provides:
+`batgrad` brings heterogeneous experimental and synthetic battery data into one pipeline: from
+messy raw files, through canonical and traceable datasets, to configurable neural-network training
+and multi-step evaluation.
 
-- Parquet datasets for consistent schemas and efficient I/O.
-- Per-stage manifests indexing Parquet shards, stream metadata, and provenance.
-- A local-first workflow designed for fast iteration within CPU, GPU, and memory constraints.
-- Revision-pinned manifests and saved experiment configurations for traceable, reproducible runs.
-- Interactive [Marimo](https://marimo.io/) notebooks for exploring, demonstrating, and debugging the pipeline. They are a playground, not a production UI or experiment runner.
+## Why batgrad?
+
+- **Onboard messy datasets once.** A small adapter handles source files, column mappings, and
+  protocol metadata; shared ingestion, normalization, notebook, and ML pipelines take over from
+  there.
+- **Process large datasets locally.** Bounded-memory normalization, protocol-level parallelism,
+  and sharded Parquet keep hundreds of gigabytes manageable on ordinary CPU machines.
+- **Mix datasets without losing identity.** Published and synthetic sources share canonical
+  columns while retaining dataset, cell, cycle, protocol, source, and revision provenance.
+- **Split by battery structure, not random rows.** Training and validation groups preserve
+  dataset, cell, cycle, and protocol boundaries to reduce leakage.
+- **Model more than the next sample.** The hybrid Attention-FFN-Mamba-3 model can predict several
+  future steps in parallel and validate behavior through recursive rollouts.
+- **Inspect the real pipeline.** Five reactive Marimo workbenches expose ETL, manifests, loaders,
+  configuration, training, and inference.
+
+**Compact baseline:** approximately 10M parameters and 4 GB VRAM for inference on a single
+CUDA-capable GPU.
+
+Normalized datasets are available from the
+[batgrad dataset repository](https://huggingface.co/datasets/marplan6/batgrad), with a compact
+checkpoint in the [batgrad model repository](https://huggingface.co/marplan6/batgrad).
+
+## Explore in Molab
+
+[Molab](https://molab.marimo.io/) runs Marimo notebooks in the browser. Each notebook below is a
+reactive Python file backed by the same library code used by the command-line workflows.
+
+| Notebook | Purpose | Launch |
+| --- | --- | --- |
+| ETL | Inspect stages, transforms, resampling, and source rows | [![Open in Molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/marplan/batgrad/blob/main/notebooks/etl.py) |
+| Data loader | Inspect manifests, splits, temporal windows, and batches | [![Open in Molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/marplan/batgrad/blob/main/notebooks/dataloader.py) |
+| Configuration | Build and validate experiment configurations | [![Open in Molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/marplan/batgrad/blob/main/notebooks/config.py) |
+| Training | Step through real optimization and validation traces | [![Open in Molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/marplan/batgrad/blob/main/notebooks/training.py) |
+| Inference | Compare checkpoints and multi-step rollouts | [![Open in Molab](https://marimo.io/molab-shield.svg)](https://molab.marimo.io/github/marplan/batgrad/blob/main/notebooks/inference.py) |
 
 ## Quickstart
 
-Run the hosted notebooks on [Molab](https://molab.marimo.io/<tbd>). Molab is Marimo's hosted notebook environment, similar to Colab but backed by reactive Python files rather than order-dependent cells.
+> [!IMPORTANT]
+> **Requirements:** Docker with Docker Compose and a Linux environment. Data processing is
+> CPU-only and uses approximately 3 GB RAM per worker for the included Pozzato pipeline. Mamba-3
+> requires Linux and CUDA; one CUDA GPU is sufficient for the baseline workflow. W&B is only
+> required for online logging.
 
-Normalized datasets are provided through the
-[batgrad dataset repository](https://huggingface.co/datasets/marplan6/batgrad), with example
-checkpoints in the [batgrad model repository](https://huggingface.co/marplan6/batgrad).
-
-Hosted notebooks:
-
-- [Data processing](https://molab.marimo.io/<tbd>)
-- [Training](https://molab.marimo.io/<tbd>)
-- [Inference](https://molab.marimo.io/<tbd>)
-
-## Development
-
-Using the provided Docker image as a development container is strongly recommended. The environment targets Linux; Windows is unsupported and macOS is untested. The container runs as the non-root `ubuntu` user.
-
-The baseline architecture uses Mamba and requires a CUDA-capable GPU (~10M params, ~4GB VRAM inference). Data processing is CPU-only, and `configs/ml_dry_run_cpu.json` provides a CPU-compatible training configuration without Mamba layers.
-
-Container layout:
-
-```text
-/workspace/ubuntu/batgrad/           # project
-/workspace/ubuntu/batgrad/outputs/   # runs and checkpoints
-/data/                               # DATA_ROOT
-```
-
-### Local Setup
-
-Local setup requires Docker with Docker Compose. A CUDA-capable GPU is required to run the baseline model; it has been tested on Blackwell and is expected to support Ampere and Hopper.
+Clone the repository and configure the host directory mounted at `/data`:
 
 ```sh
 git clone https://github.com/marplan/batgrad.git
 cd batgrad
 cp .env.example .env
+cp docker/dotfiles.env.example docker/dotfiles.env  # optional
 ```
 
-Set `HOST_DATA_ROOT` in `.env` to the host directory mounted at `/data` in the container:
-
-```text
-~/my_projects/
-├── batgrad/
-└── my_data/       # HOST_DATA_ROOT, mounted at /data
-```
-
-Personal dotfiles are optional:
-
-```sh
-cp docker/dotfiles.env.example docker/dotfiles.env
-```
-
-Configure `docker/dotfiles.env` if used. Additional system tools can be added to `docker/Dockerfile` or `docker/brew-packages.txt` before building.
-
-Build and enter the development container, then set up the project:
+Set `HOST_DATA_ROOT` in `.env`. If used, configure `docker/dotfiles.env` before building the
+non-root development container and installing the project:
 
 ```sh
 docker compose up -d dev --build
@@ -72,43 +70,11 @@ docker compose exec dev zsh
 ./scripts/setup_project.sh
 ```
 
-### Remote Setup
-
-The full environment can run on [Vast.ai](https://cloud.vast.ai?ref_id=140701&template_id=122905af35856f2e6e6ab6d925bebd06) or [RunPod](https://console.runpod.io/deploy?template=7npkwu4zr5&ref=7z0qtxil) using the published `batgrad` template.
-
-The image provides direct access as the non-root `ubuntu` user. Replace the provider's default `root@<host>` with `ubuntu@<host>`. Agent forwarding with `-A` is recommended, and `-L 2718:localhost:2718` exposes Marimo locally.
-
-```sh
-ssh -A -p <port> ubuntu@<host> -L 2718:localhost:2718
-```
-
-On the remote host:
-
-```sh
-cd /workspace/ubuntu
-git clone git@github.com:marplan/batgrad.git
-cd batgrad
-cp .env.example .env
-cp docker/dotfiles.env.example docker/dotfiles.env  # optional
-```
-
-Configure `docker/dotfiles.env` if used, then run:
-
-```sh
-./scripts/setup_project.sh
-```
-
-### Explore
-
-Download all published datasets to `DATA_ROOT` and checkpoints to `outputs/checkpoints/`:
+Download all released datasets to `DATA_ROOT` and checkpoints to `outputs/checkpoints/`, then
+start Marimo:
 
 ```sh
 uv run scripts/hf_assets.py download
-```
-
-Start the Marimo development server:
-
-```sh
 uv run marimo edit notebooks \
   --headless \
   --host 0.0.0.0 \
@@ -116,37 +82,34 @@ uv run marimo edit notebooks \
   --session-ttl 5
 ```
 
-On a remote host, forward port `2718` to your local machine. `--session-ttl` terminates notebook sessions after the browser disconnects.
+Open `http://localhost:2718`. Personal dotfiles and additional container tools are documented in
+the [environment setup guide](docs/environment-setup.md).
 
 ## How It Works
 
-`batgrad` separates dataset-specific ingestion from reusable data processing and ML:
-
 ```text
-raw sources
-  -> dataset adapter and canonical mappings
-  -> ingested Parquet + manifest
-  -> transforms, checks, and resampling
+messy source files
+  -> dataset adapter: discovery, mappings, parsers, metadata
+  -> canonical ingested Parquet + manifest
+  -> shared transforms, checks, resampling, and sharding
   -> normalized Parquet + manifest
-  -> ML index, loaders, training, and inference
+  -> notebooks, ML loaders, training, and inference
 ```
 
-The main directories reflect these boundaries:
+Manifests are the handoff between stages. They index exact row segments in protocol-sharded
+Parquet files and retain source paths, stream metadata, dataset identity, and producer Git
+provenance. Experiment configurations declare expected manifest revisions, and ML loading rejects
+revision mismatches before constructing windows.
 
-```text
-batgrad/contracts/       Shared columns, protocols, and metadata contracts
-batgrad/data/            Dataset adapters and processing stages
-batgrad/ml/              Data loading, models, training, and inference
-configs/                 Reproducible experiment configurations
-notebooks/               Interactive exploration and debugging
-scripts/                 Data-processing and training entry points
-```
+This is a traceability guardrail rather than immutable data versioning: revisions identify the
+producer code, not the content of every source file.
 
-See the [documentation](docs/index.md) for a more complete reference.
+## Data Pipeline
 
-### Datasets
-
-Published battery datasets commonly mix Excel, CSV, Parquet, and dataset-specific naming conventions. `batgrad` keeps those irregularities inside each dataset adapter and converts them into canonical, protocol-sharded Parquet data.
+Published battery datasets commonly mix Excel, CSV, Parquet, inconsistent column names, and
+source-specific layouts. A dataset adapter contains those irregularities at the edge of the
+system. Once data reaches the ingested stage, downstream processing no longer needs to know how
+the source was packaged.
 
 The persisted stages are:
 
@@ -154,131 +117,100 @@ The persisted stages are:
 raw -> ingested -> normalized
 ```
 
-- **Ingested** data uses canonical column names and dtypes while retaining source paths and task metadata.
-- **Normalized** data applies configured transformations, checks, and resampling for analysis and ML.
-- Each processed stage includes a `manifest.parquet` describing its streams, exact shard segments, metadata, and Git provenance.
+- **Ingested** data has canonical columns and dtypes while retaining source paths and task
+  metadata.
+- **Normalized** data applies configured transformations, checks, derived features, and
+  protocol-specific resampling for analysis and ML.
+- Both stages write compressed Parquet with content-defined chunking and manifests with exact
+  segment references.
 
-#### Included Datasets
+### Included Datasets
 
-- **`pozzato-2022`**: the published NMC/graphite battery-aging dataset by Pozzato, Allam, and Onori, with cycling, HPPC, RPT, and EIS data.
-- **`synthetic-pozzato-2022-m50t`**: a pre-generated synthetic LG INR21700 M50T dataset associated with `pozzato-2022`.
+| Dataset ID | Source | Protocols |
+| --- | --- | --- |
+| `pozzato-2022` | Published NMC/graphite battery-aging measurements | Cycling, HPPC, RPT, EIS |
+| `synthetic-pozzato-2022-m50t` | PyBaMM-generated LG INR21700 M50T profiles | Cycling, RPT, EIS |
 
-Pozzato 2022 resources:
+Pozzato 2022 resources: [dataset overview](https://osf.io/qsabn/overview?view_only=2a03b6c78ef14922a3e244f3d549de78),
+[raw data](https://www.dropbox.com/scl/fo/3ss0age6ggfcm67okldhw/h?rlkey=tnczvb82gukfe2n4gol2uyo7x&dl=0),
+and [publication](https://doi.org/10.1016/j.dib.2022.107995). The source and processed derivative
+are licensed under CC BY 4.0.
 
-- [Dataset overview](https://osf.io/qsabn/overview?view_only=2a03b6c78ef14922a3e244f3d549de78)
-- [Raw dataset download](https://www.dropbox.com/scl/fo/3ss0age6ggfcm67okldhw/h?rlkey=tnczvb82gukfe2n4gol2uyo7x&dl=0)
-- [Publication](https://doi.org/10.1016/j.dib.2022.107995)
-- License: CC BY 4.0
+Indicative Pozzato 2022 footprint with three workers:
 
-Approximate Pozzato 2022 footprint with the current processing configuration:
+| Stage | Size | Processing |
+| --- | ---: | ---: |
+| Raw Excel | ~300 GB | - |
+| Ingested Parquet | ~60 GB | ~1 hour |
+| Normalized Parquet | ~2 GB | ~3 minutes |
 
-| Stage              |    Size |                Processing |
-| ------------------ | ------: | ------------------------: |
-| Raw Excel          | ~300 GB |                         - |
-| Ingested Parquet   |  ~60 GB |    ~1 hour with 3 workers |
-| Normalized Parquet |   ~2 GB | ~3 minutes with 3 workers |
+Actual time, memory, and storage depend on hardware and processing configuration.
 
-Peak memory remains below approximately 3 GB per worker with the default settings. These figures are indicative and depend on the machine and processing configuration.
+### Process Raw Data
 
-#### Process Datasets
-
-Place the raw files under the dataset's raw stage, for example:
+Place raw files under each dataset's canonical raw root, for example:
 
 ```text
 /data/type=published/dataset=pozzato-2022/source=raw/
+/data/type=synthetic/dataset=synthetic-pozzato-2022-m50t/source=raw/
 ```
 
-Run ingestion and normalization from the command line:
+> [!WARNING]
+> Ingestion and normalization replace the selected dataset stage output. Use a separate store or
+> preserve existing outputs before rerunning a stage.
 
-```sh
-uv run scripts/data_processing.py --ingest pozzato-2022
-uv run scripts/data_processing.py --normalize pozzato-2022
-```
-
-Both stages can be run in one invocation:
+Run both datasets end to end:
 
 ```sh
 uv run scripts/data_processing.py \
-  --ingest pozzato-2022 \
-  --normalize pozzato-2022 \
+  --ingest pozzato-2022 synthetic-pozzato-2022-m50t \
+  --normalize pozzato-2022 synthetic-pozzato-2022-m50t \
   --n-jobs 3
 ```
 
-`--ingest` and `--normalize` accept one or more registered dataset IDs or `all`. When both are supplied, all ingestion jobs complete before normalization begins. `--store` selects the data root, `--scratch-store` selects temporary storage, and `--n-jobs` controls stage parallelism.
+`--store` selects the data root, `--scratch-store` selects temporary storage, and `--n-jobs`
+controls stage parallelism. Use `all` instead of explicit dataset IDs to process every registered
+dataset.
 
-The same pipeline is available from Python:
+### Add a Dataset
 
-```python
-from batgrad.data.datasets.registry import get_dataset
-from batgrad.data.processing.normalize import NormalizeStageConfig
-from batgrad.data.processing.raw import IngestStageConfig
-from batgrad.storage.local import LocalDataProcessingStore
+A new source implements its file discovery and loading in `raw.py`, canonical mappings in
+`mapping.py`, and protocol processing policy in `config.py`. Register it once and the shared ETL,
+manifest, notebook, and ML workflows become available. See
+[Adding a dataset](docs/quick-start.md#add-a-dataset) for the adapter contract.
 
-dataset = get_dataset("pozzato-2022")
-store = LocalDataProcessingStore("/data")
+## Machine Learning
 
-dataset.ingest(
-    input_store=store,
-    output_store=store,
-    config=IngestStageConfig(n_jobs=3),
-)
+The ML pipeline consumes normalized manifests rather than raw files. It combines compatible
+datasets without physically merging them, forms train and validation groups from battery metadata,
+and materializes one-row-ahead temporal windows directly from manifest segments.
 
-dataset.normalize(
-    input_store=store,
-    output_store=store,
-    config=NormalizeStageConfig(n_jobs=3),
-)
-```
+The baseline encodes continuous inputs into bounded categorical representations, projects each
+feature independently, and mixes them through configurable Attention, FFN, and Mamba-3 layers.
+Outputs are categorical distributions over each target. Future feedback channels can be hidden so
+the model predicts several future steps from one context; recursive validation then feeds
+predictions back into the model to test longer closed-loop rollouts with optional known future
+controls.
 
-The registered dataset supplies its raw adapter and stage definitions. The runtime configurations control execution and Parquet-writing behavior.
+One strict JSON configuration defines data revisions, protocols, columns, scaling, loader behavior,
+model structure, optimization, validation, logging, and checkpoints. The validated configuration is
+saved with file-backed runs and embedded in checkpoints.
 
-#### Add a Dataset
-
-A dataset implementation keeps source-specific behavior in four files:
-
-```text
-batgrad/data/datasets/<dataset_id>/
-├── __init__.py
-├── mapping.py
-├── raw.py
-└── config.py
-```
-
-- `mapping.py` maps source columns and aliases to canonical contracts.
-- `raw.py` discovers source files and yields ingestion batches.
-- `config.py` defines protocols, columns, transformations, checks, resampling, and dataset metadata.
-- `registry.py` exposes the dataset to the CLI and Python API.
-
-See [Adding a dataset](docs/quick-start.md#add-a-dataset) for the complete adapter contract.
-
-### Machine Learning
-
-The ML pipeline consumes normalized manifests rather than raw files. It validates their schemas and expected Git revisions, combines selected manifest rows into an in-memory index, creates group-aware train and validation streams, and materializes fixed-length input and target windows.
-
-Each experiment is defined by one strict JSON configuration covering:
-
-- Manifests, expected producer revisions, and protocols
-- Input, target, feedback, and scaling columns
-- Loader and state-carry behavior
-- Attention, FFN, and optional Mamba layers
-- Optimization, validation, logging, and checkpoints
-
-The validated configuration is saved with file-backed runs. Logging supports stdout, JSONL, and W&B, while checkpoints contain the model and training state together with the complete experiment configuration.
-
-Run the bundled configurations with:
+Run the bundled configurations:
 
 ```sh
-# Short attention/FFN smoke test on CPU
+# Short Attention/FFN smoke test on CPU
 uv run scripts/train.py --config configs/ml_dry_run_cpu.json
 
-# Short Mamba smoke test on CUDA
+# Short Mamba-3 smoke test on CUDA
 uv run scripts/train.py --config configs/ml_dry_run_gpu.json
 
 # Full CUDA/W&B baseline
 uv run scripts/train.py --config configs/ml_baseline.json
 ```
 
-The baseline logs online to the `batgrad` W&B project under the logged-in account. Authenticate once with `uv run wandb login`, or edit `logging` in the JSON config to use a different project, group, mode, or backend.
+The baseline logs online to the `batgrad` W&B project. Authenticate with `uv run wandb login`, or
+change the logging backend or mode in the configuration.
 
 Run the baseline on two GPUs with DDP:
 
@@ -287,6 +219,49 @@ OMP_NUM_THREADS=1 uv run torchrun --standalone --nproc-per-node=2 \
   scripts/train.py --config configs/ml_baseline.json
 ```
 
-Use `notebooks/config.py` to create and validate configurations interactively. The notebooks are intended for exploration and debugging; `scripts/train.py` is the experiment entry point.
+> [!WARNING]
+> Reusing an explicit `run.name` replaces its existing run directory. `run.init_from` initializes
+> compatible model weights only; it does not resume optimizer, scheduler, scaler, or training
+> cursor state.
 
-See the [ML documentation](docs/index.md#ml-flow) for configuration, data loading, models, training, and inference details.
+Full run checkpoints contain training state and the complete configuration. The compact Hugging
+Face checkpoint contains model weights, configuration, step, and format version for inference and
+weight initialization.
+
+See the [ML documentation](docs/index.md#ml-flow) for the architecture, data loading, training,
+validation, and inference contracts.
+
+## Run Locally or Remotely
+
+The non-root Docker environment is shared across local development,
+[Vast.ai](https://cloud.vast.ai?ref_id=140701&template_id=122905af35856f2e6e6ab6d925bebd06)
+and [RunPod](https://console.runpod.io/deploy?template=7npkwu4zr5&ref=7z0qtxil). Remote development
+uses the same local-filesystem workflow on storage attached to the GPU host.
+
+> [!IMPORTANT]
+> Vast.ai and RunPod commonly provide an SSH command using `root@<host>`. The batgrad image uses
+> the non-root `ubuntu` user instead. Keep the provider's port and identity options, but replace
+> `root@<host>` with `ubuntu@<host>`.
+
+Forward SSH credentials and the Marimo port when connecting:
+
+```sh
+ssh -A -L 2718:localhost:2718 -p <port> ubuntu@<host>
+```
+
+See the [environment setup guide](docs/environment-setup.md) for provider setup, paths, dotfiles,
+and image customization.
+
+## Deliberate Scope
+
+- EIS is treated as a data-processing example in this template; it is not part of the bundled
+  training or inference workflows.
+- The released synthetic dataset is included, but its PyBaMM generation pipeline is intentionally
+  omitted to keep the codebase focused.
+- Hyperparameter sweeps and the broader training and validation experiments used to select the
+  baseline architecture are not included; the repository keeps one compact reference workflow.
+- The development image uses Linuxbrew for convenience, not as a production packaging
+  recommendation. Production deployments should derive a pinned, hardened image with their
+  preferred system-package strategy.
+- Blackwell is tested; Ampere and Hopper are expected but currently unverified. Windows is
+  unsupported and macOS is untested.
