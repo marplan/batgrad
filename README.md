@@ -5,16 +5,20 @@
 It provides:
 
 - Parquet datasets for consistent schemas and efficient I/O.
-- Central metadata decoupled from the data.
+- Per-stage manifests indexing Parquet shards, stream metadata, and provenance.
 - A local-first workflow designed for fast iteration within CPU, GPU, and memory constraints.
-- Reproducible environments, datasets, experiments, and checkpoints.
+- Revision-pinned manifests and saved experiment configurations for traceable, reproducible runs.
 - Interactive [Marimo](https://marimo.io/) notebooks for exploring, demonstrating, and debugging the pipeline. They are a playground, not a production UI or experiment runner.
 
 ## Quickstart
 
 Run the hosted notebooks on [Molab](https://molab.marimo.io/<tbd>). Molab is Marimo's hosted notebook environment, similar to Colab but backed by reactive Python files rather than order-dependent cells.
 
-Datasets and checkpoints are provided through [Hugging Face](https://huggingface.co/datasets/marimo/batgrad):
+Normalized datasets are provided through the
+[batgrad dataset repository](https://huggingface.co/datasets/marplan6/batgrad), with example
+checkpoints in the [batgrad model repository](https://huggingface.co/marplan6/batgrad).
+
+Hosted notebooks:
 
 - [Data processing](https://molab.marimo.io/<tbd>)
 - [Training](https://molab.marimo.io/<tbd>)
@@ -22,56 +26,45 @@ Datasets and checkpoints are provided through [Hugging Face](https://huggingface
 
 ## Development
 
-Using the provided Docker image as a development container is strongly recommended. The environment targets Linux; Windows is unsupported and macOS is untested.
+Using the provided Docker image as a development container is strongly recommended. The environment targets Linux; Windows is unsupported and macOS is untested. The container runs as the non-root `ubuntu` user.
 
-The baseline architecture uses Mamba and requires a CUDA-capable GPU. Data processing is CPU-only, and `configs/ml_dry_run_cpu.json` provides a CPU-compatible training configuration without Mamba layers.
-
-### Requirements
-
-- Docker with Docker Compose
-- A CUDA-capable GPU for the baseline model (tested on Blackwell, should also support Ampere, Hopper)
-- A free [Weights & Biases](https://wandb.ai/) account for online logging; offline and stdout logging are also supported
-
-The container runs as the non-root `ubuntu` user.
-
-### Configuration
-
-Copy and edit the environment files before setup:
-
-```sh
-cp .env.example .env
-cp docker/dotfiles.env.example docker/dotfiles.env
-```
-
-Set `HOST_DATA_ROOT` in `.env` to the host directory mounted at `/data` in the container.
-
-Personal dotfiles are optional. To install them, configure their repository and setup command in `docker/dotfiles.env`.
-
-Example host layout:
-
-```text
-~/my_projects/
-├── batgrad/
-└── my_data/       # HOST_DATA_ROOT
-```
+The baseline architecture uses Mamba and requires a CUDA-capable GPU (~10M params, ~4GB VRAM inference). Data processing is CPU-only, and `configs/ml_dry_run_cpu.json` provides a CPU-compatible training configuration without Mamba layers.
 
 Container layout:
 
 ```text
-/workspace/ubuntu/batgrad/
-/data/                         # DATA_ROOT (under root for file system perf on remote hosts)
+/workspace/ubuntu/batgrad/           # project
+/workspace/ubuntu/batgrad/outputs/   # runs and checkpoints
+/data/                               # DATA_ROOT
 ```
 
 ### Local Setup
+
+Local setup requires Docker with Docker Compose. A CUDA-capable GPU is required to run the baseline model; it has been tested on Blackwell and is expected to support Ampere and Hopper.
 
 ```sh
 git clone https://github.com/marplan/batgrad.git
 cd batgrad
 cp .env.example .env
+```
+
+Set `HOST_DATA_ROOT` in `.env` to the host directory mounted at `/data` in the container:
+
+```text
+~/my_projects/
+├── batgrad/
+└── my_data/       # HOST_DATA_ROOT, mounted at /data
+```
+
+Personal dotfiles are optional:
+
+```sh
 cp docker/dotfiles.env.example docker/dotfiles.env
 ```
 
-Edit `.env` and, optionally, `docker/dotfiles.env`, then build and enter the development container:
+Configure `docker/dotfiles.env` if used. Additional system tools can be added to `docker/Dockerfile` or `docker/brew-packages.txt` before building.
+
+Build and enter the development container, then set up the project:
 
 ```sh
 docker compose up -d dev --build
@@ -96,10 +89,10 @@ cd /workspace/ubuntu
 git clone git@github.com:marplan/batgrad.git
 cd batgrad
 cp .env.example .env
-cp docker/dotfiles.env.example docker/dotfiles.env
+cp docker/dotfiles.env.example docker/dotfiles.env  # optional
 ```
 
-Edit/enable optionally `docker/dotfiles.env`, then run:
+Configure `docker/dotfiles.env` if used, then run:
 
 ```sh
 ./scripts/setup_project.sh
@@ -107,17 +100,16 @@ Edit/enable optionally `docker/dotfiles.env`, then run:
 
 ### Explore
 
-Download the baseline data and checkpoints:
+Download both normalized baseline datasets to `DATA_ROOT`:
 
 ```sh
-# Destination directories: <tbd>
-uv run scripts/hf_assets.py --data init_baseline --ckpt init_baseline
+uv run scripts/hf_assets.py download
 ```
 
-Initialize W&B if you use online logging:
+Download the example checkpoint to `outputs/checkpoints/` when available:
 
 ```sh
-uv run wandb init
+uv run scripts/hf_assets.py download --ckpt batgrad_init_baseline
 ```
 
 Start the Marimo development server:
@@ -131,13 +123,6 @@ uv run marimo edit notebooks \
 ```
 
 On a remote host, forward port `2718` to your local machine. `--session-ttl` terminates notebook sessions after the browser disconnects.
-
-Run a CPU smoke test or the GPU baseline:
-
-```sh
-uv run scripts/train.py --config configs/ml_dry_run_cpu.json
-uv run scripts/train.py --config configs/ml_baseline.json
-```
 
 ## How It Works
 
@@ -163,7 +148,7 @@ notebooks/               Interactive exploration and debugging
 scripts/                 Data-processing and training entry points
 ```
 
-See the [documentation](tbd) for a more complete reference.
+See the [documentation](docs/index.md) for a more complete reference.
 
 ### Datasets
 
@@ -187,11 +172,11 @@ raw -> ingested -> normalized
 Pozzato 2022 resources:
 
 - [Dataset overview](https://osf.io/qsabn/overview?view_only=2a03b6c78ef14922a3e244f3d549de78)
-- [Raw dataset download](https://www.dropbox.com/scl/fo/3ss0age6ggfcm67okldhw/h?dl=0&e=1)
+- [Raw dataset download](https://www.dropbox.com/scl/fo/3ss0age6ggfcm67okldhw/h?rlkey=tnczvb82gukfe2n4gol2uyo7x&dl=0)
 - [Publication](https://doi.org/10.1016/j.dib.2022.107995)
 - License: CC BY 4.0
 
-Approximate footprint with the current processing configuration:
+Approximate Pozzato 2022 footprint with the current processing configuration:
 
 | Stage              |    Size |                Processing |
 | ------------------ | ------: | ------------------------: |
@@ -200,8 +185,6 @@ Approximate footprint with the current processing configuration:
 | Normalized Parquet |   ~2 GB | ~3 minutes with 3 workers |
 
 Peak memory remains below approximately 3 GB per worker with the default settings. These figures are indicative and depend on the machine and processing configuration.
-
-Normalized datasets are also available from [Hugging Face](https://huggingface.co/datasets/marimo/batgrad).
 
 #### Process Datasets
 
@@ -272,7 +255,7 @@ batgrad/data/datasets/<dataset_id>/
 - `config.py` defines protocols, columns, transformations, checks, resampling, and dataset metadata.
 - `registry.py` exposes the dataset to the CLI and Python API.
 
-See [Adding a dataset](tbd) for the complete adapter contract.
+See [Adding a dataset](docs/quick-start.md#add-a-dataset) for the complete adapter contract.
 
 ### Machine Learning
 
@@ -301,8 +284,15 @@ uv run scripts/train.py --config configs/ml_dry_run_gpu.json
 uv run scripts/train.py --config configs/ml_baseline.json
 ```
 
+The baseline logs online to the `batgrad` W&B project under the logged-in account. Authenticate once with `uv run wandb login`, or edit `logging` in the JSON config to use a different project, group, mode, or backend.
+
+Run the baseline on two GPUs with DDP:
+
+```sh
+OMP_NUM_THREADS=1 uv run torchrun --standalone --nproc-per-node=2 \
+  scripts/train.py --config configs/ml_baseline.json
+```
+
 Use `notebooks/config.py` to create and validate configurations interactively. The notebooks are intended for exploration and debugging; `scripts/train.py` is the experiment entry point.
 
-See the [ML documentation](tbd) for data loading, configuration, models, training, and inference details.
-
-## Notes
+See the [ML documentation](docs/index.md#ml-flow) for configuration, data loading, models, training, and inference details.
