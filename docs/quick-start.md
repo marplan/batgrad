@@ -109,6 +109,13 @@ The ML layer reads normalized manifests. Complete ingestion and normalization
 first, then choose a configuration whose manifest revision and selected columns
 match the normalized data.
 
+Download the bundled normalized datasets when you do not want to process the
+raw sources locally:
+
+```sh
+uv run scripts/hf_assets.py download
+```
+
 The bundled configurations provide useful starting points:
 
 - `configs/ml_dry_run_cpu.json` runs a short
