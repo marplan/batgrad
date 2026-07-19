@@ -1,7 +1,7 @@
 [project]
 name = "batgrad"
 version = "0.0.1"
-description = "Get started with foundational models for battery time-series data."
+description = "A template for training neural networks on battery data."
 readme = "README.md"
 requires-python = "==3.12.*"
 license = 'MIT'

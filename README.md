@@ -2,10 +2,12 @@
 
 <p align="center">
   <a href="https://marplan.github.io/batgrad/">Docs</a>
+  |
+  <a href="https://markusplandowski.com/writing/Building_my_own_end-to-end_ML_system_for_battery_data/">Blog</a>
 </p>
 
 <p align="center">
-  <strong>An opinionated, hackable template for battery time-series models.</strong>
+  <strong>An opinionated, hackable template for battery neural networks.</strong>
 </p>
 
 `batgrad` turns experimental and synthetic battery data into traceable datasets for configurable
@@ -24,12 +26,54 @@ neural-network training and multi-step evaluation.
 
 **Baseline model:** approximately 10M parameters.
 
+<details>
+<summary>ETL demo</summary>
+
+https://github.com/user-attachments/assets/15efb23f-0a1e-49c7-a260-f93d9076c5b5
+
+</details>
+
+<details>
+<summary>Loader demo</summary>
+
+https://github.com/user-attachments/assets/31a66c37-5cef-4513-8a03-7dade35d9895
+
+</details>
+
+<details>
+<summary>Config demo</summary>
+
+https://github.com/user-attachments/assets/3e6e5495-290d-4962-843e-cff0aa2c9843
+
+</details>
+
+<details>
+<summary>Train demo</summary>
+
+https://github.com/user-attachments/assets/fa3a41d9-7812-47c4-aaaf-98649190e627
+
+</details>
+
+<details>
+<summary>Inference demo</summary>
+
+https://github.com/user-attachments/assets/7d06b972-2d9b-4f6b-90ca-6d5477e737c6
+
+</details>
+
+<details>
+<summary>Checkpoint demo</summary>
+
+https://github.com/user-attachments/assets/e40fd752-d4bb-46fc-8a90-5b4167138130
+
+</details>
+
 Released [normalized datasets](https://huggingface.co/datasets/marplan6/batgrad) and the
 [inference checkpoint](https://huggingface.co/marplan6/batgrad) are available on Hugging Face.
 
 ## Explore in Molab
 
-[Molab](https://molab.marimo.io/) runs the same Marimo notebooks in the browser.
+[Molab](https://molab.marimo.io/) runs the same Marimo notebooks in the cloud (similar to Jupyter and Google Colab).
 
 > [!NOTE]
 >
